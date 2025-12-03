@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+seen_listings.json
+
+# Node
+node_modules/
+build/
+.env.local
+
+# OS
+.DS_Store

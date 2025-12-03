@@ -1,0 +1,24 @@
+{
+  "platforms": {
+    "craigslist": true,
+    "offerup": true,
+    "mercari": true
+  },
+  "zip_code": "95212",
+  "distance": 25,
+  "check_interval": 10,
+  "thresholds": {
+    "game boy": 30,
+    "gameboy": 30,
+    "gba": 40,
+    "gba sp": 80,
+    "nintendo ds": 30,
+    "3ds": 110,
+    "3ds xl": 150,
+    "2ds": 100,
+    "2ds xl": 150
+  },
+  "ai_detection": true,
+  "description_scan": true,
+  "strictness": 2
+}

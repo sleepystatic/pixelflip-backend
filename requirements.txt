@@ -1,0 +1,19 @@
+# Web scraping
+requests==2.31.0
+beautifulsoup4==4.12.2
+selenium==4.15.2
+undetected-chromedriver==3.5.4
+webdriver-manager==4.0.1
+
+# Database
+psycopg2-binary==2.9.9
+
+# Flask API
+flask==3.0.0
+flask-cors==4.0.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Utilities
+lxml==4.9.3
