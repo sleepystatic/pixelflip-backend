@@ -7,6 +7,17 @@ import json
 import os
 import psycopg2
 
+from scraper import (
+    scrape_craigslist,
+    scrape_offerup,
+    scrape_mercari,
+    send_email_alert,
+    load_seen_listings,
+    save_seen_listings,
+    ZIP_CODE
+)
+
+
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 def get_db():
@@ -72,10 +83,12 @@ if saved:
 scraper_thread = None
 
 
-
 def run_scraper_loop():
     """Background thread that runs the scraper"""
     global scraper_state
+
+    # Load seen listings to avoid duplicates
+    seen_listings = load_seen_listings()
 
     while scraper_state["running"]:
         try:
@@ -91,26 +104,63 @@ def run_scraper_loop():
             # Keep only last 50 activities
             scraper_state["recent_activity"] = scraper_state["recent_activity"][:50]
 
-            # TODO: Actually call your scraper functions here
-            # For now, simulate with dummy data
-            time.sleep(5)  # Simulate scraping time
+            # ACTUALLY CALL THE SCRAPER!
+            all_listings = []
 
-            # Simulate finding items
-            import random
-            items_found = random.randint(0, 3)
-            scraper_state["items_scanned_today"] += random.randint(10, 50)
-            scraper_state["matches_found_today"] += items_found
+            # Get settings from scraper_state
+            platforms = scraper_state["settings"]["platforms"]
 
-            if items_found > 0:
+            # Scrape enabled platforms
+            if platforms.get("craigslist", True):
                 scraper_state["recent_activity"].insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
-                    "message": f"Found {items_found} match(es)!",
+                    "message": "Checking Craigslist..."
+                })
+                craigslist_listings = scrape_craigslist(ZIP_CODE, debug=False)
+                all_listings.extend(craigslist_listings)
+                scraper_state["items_scanned_today"] += len(craigslist_listings)
+
+            if platforms.get("offerup", True):
+                scraper_state["recent_activity"].insert(0, {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "message": "Checking OfferUp..."
+                })
+                offerup_listings = scrape_offerup(debug=False)
+                all_listings.extend(offerup_listings)
+                scraper_state["items_scanned_today"] += len(offerup_listings)
+
+            if platforms.get("mercari", True):
+                scraper_state["recent_activity"].insert(0, {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "message": "Checking Mercari..."
+                })
+                mercari_listings = scrape_mercari(debug=False)
+                all_listings.extend(mercari_listings)
+                scraper_state["items_scanned_today"] += len(mercari_listings)
+
+            # Filter out already seen listings
+            new_listings = []
+            for listing in all_listings:
+                listing_id = f"{listing['platform']}_{listing['link']}"
+                if listing_id not in seen_listings:
+                    new_listings.append(listing)
+                    seen_listings.append(listing_id)
+
+            # Update matches found
+            scraper_state["matches_found_today"] += len(new_listings)
+
+            if new_listings:
+                scraper_state["recent_activity"].insert(0, {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "message": f"Found {len(new_listings)} new match(es)!",
                     "type": "success"
                 })
+                send_email_alert(new_listings)
+                save_seen_listings(seen_listings)
             else:
                 scraper_state["recent_activity"].insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
-                    "message": "Scan complete. No matches found.",
+                    "message": "Scan complete. No new matches found.",
                     "type": "info"
                 })
 
@@ -190,7 +240,16 @@ def handle_settings():
 
 
 if __name__ == '__main__':
-    print("🎮 GameBoy Retreat API Server Starting...")
-    print("📍 Running on http://localhost:5000")
-    print("🔗 React app should connect to this server")
-    app.run(debug=True, port=5000)
+    import os
+    port = int(os.getenv('PORT', 5000))
+
+    print("PixelFlip API Server Starting...")
+    print(f"Running on port {port}")
+
+    is_production = os.getenv('FLASK_ENV') == 'production'
+
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=not is_production
+    )

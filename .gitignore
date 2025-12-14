@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 seen_listings.json
+user_settings.json
 
 # Node
 node_modules/
