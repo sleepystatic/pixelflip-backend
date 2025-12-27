@@ -245,8 +245,8 @@ if __name__ == '__main__':
 
     print("PixelFlip API Server Starting...")
     print(f"Running on port {port}")
+    print(f"🌍 Environment: {'Production' if is_production else 'Development'}")
 
-    is_production = os.getenv('FLASK_ENV') == 'production'
 
     app.run(
         host='0.0.0.0',
