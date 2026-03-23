@@ -1,13 +1,24 @@
+# Environment
+.env
+.env.local
+
+# Python
 __pycache__/
 *.pyc
-.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Data files
 seen_listings.json
 user_settings.json
 
-# Node
-node_modules/
-build/
-.env.local
+# Separate projects
+frontend/
+.vercel/
 
-# OS
+# System
 .DS_Store
