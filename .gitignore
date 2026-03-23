@@ -12,10 +12,6 @@ venv/
 .idea/
 .vscode/
 
-# Data files
-seen_listings.json
-user_settings.json
-
 # Separate projects
 frontend/
 .vercel/

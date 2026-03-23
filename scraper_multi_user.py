@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()
 
 print("✅ Multi-user scraper loaded", flush=True)
 
@@ -212,10 +215,119 @@ def is_excluded(title, price, exclusions):
 
 
 # ===========================
+# AI IMAGE DETECTION
+# ===========================
+
+GOOGLE_VISION_API_KEY = os.getenv('GOOGLE_VISION_API_KEY')
+
+
+def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False):
+    """Check if image shows a console (not games/accessories) using Google Vision API"""
+
+    # Skip if AI disabled
+    if not ai_enabled:
+        if debug:
+            print(f"              AI: Disabled", flush=True)
+        return True
+
+    # Skip if no API key
+    if not GOOGLE_VISION_API_KEY:
+        if debug:
+            print(f"              AI: No API key", flush=True)
+        return True
+
+    # Skip if no image
+    if not image_url:
+        if debug:
+            print(f"              AI: No image URL", flush=True)
+        return True
+
+    try:
+        if debug:
+            print(f"              AI: Checking image...", flush=True)
+
+        # Call Google Vision API
+        url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+
+        payload = {
+            "requests": [{
+                "image": {"source": {"imageUri": image_url}},
+                "features": [
+                    {"type": "LABEL_DETECTION", "maxResults": 10},
+                    {"type": "OBJECT_LOCALIZATION", "maxResults": 5}
+                ]
+            }]
+        }
+
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code != 200:
+            if debug:
+                print(f"              AI: API error {response.status_code}", flush=True)
+            return True  # Pass on error (don't reject listing)
+
+        result = response.json()
+
+        if 'responses' not in result or not result['responses']:
+            return True
+
+        data = result['responses'][0]
+
+        # Extract labels and objects
+        labels = [label['description'].lower() for label in data.get('labelAnnotations', [])]
+        objects = [obj['name'].lower() for obj in data.get('localizedObjectAnnotations', [])]
+        all_detected = labels + objects
+
+        if debug:
+            print(f"              AI detected: {', '.join(all_detected[:5])}", flush=True)
+
+        # Console indicators
+        console_keywords = [
+            'handheld game console', 'game console', 'gaming console',
+            'portable game console', 'video game console', 'electronics'
+        ]
+
+        # Non-console indicators
+        non_console_keywords = [
+            'game cartridge', 'cartridge', 'game case', 'cd', 'dvd',
+            'disc', 'box', 'packaging', 'charger', 'cable', 'paper',
+            'book', 'document'
+        ]
+
+        has_console = any(kw in all_detected for kw in console_keywords)
+        has_non_console = any(kw in all_detected for kw in non_console_keywords)
+
+        # Strictness logic
+        if ai_strictness == 'strict':
+            # Must have console AND no non-console items
+            passed = has_console and not has_non_console
+        elif ai_strictness == 'balanced':
+            # Reject if clearly non-console, otherwise pass
+            if has_non_console and not has_console:
+                passed = False
+            else:
+                passed = True
+        else:  # lenient
+            # Only reject if definitely non-console
+            passed = not (has_non_console and not has_console)
+
+        if debug:
+            status = "✅ PASS" if passed else "❌ REJECT"
+            print(f"              AI: {status} (console:{has_console}, non-console:{has_non_console})", flush=True)
+
+        return passed
+
+    except Exception as e:
+        if debug:
+            print(f"              AI error: {e}", flush=True)
+        return True  # Pass on error
+
+
+# ===========================
 # CRAIGSLIST SCRAPER
 # ===========================
 
-def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, exclusions, debug=False):
+def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness, debug=False):
     """Scrape Craigslist for specific user"""
     listings = []
     subdomain = "stockton"  # TODO: Map zip code to subdomain
@@ -258,6 +370,21 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                     if is_excluded(title, price, exclusions):
                         continue
 
+                    # Get image URL for AI check
+                    image_url = None
+                    try:
+                        img_elem = item.find('img')
+                        if img_elem and 'src' in img_elem.attrs:
+                            image_url = img_elem['src']
+                    except:
+                        pass
+
+                    # AI image check
+                    if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug):
+                        if debug:
+                            print(f"              ❌ AI rejected: {title[:40]}", flush=True)
+                        continue
+
                     listings.append({
                         'title': title,
                         'price': price,
@@ -283,7 +410,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
 # OFFERUP SCRAPER
 # ===========================
 
-def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, exclusions, debug=False):
+def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness, debug=False):
     """Scrape OfferUp for specific user"""
     listings = []
     driver = None
@@ -302,15 +429,23 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        chrome_options.add_argument('--log-level=3')
+        chrome_options.add_argument('--silent')
 
-        # Try system ChromeDriver first (Render), fallback to webdriver-manager (local)
-        try:
+        # Detect environment and use appropriate ChromeDriver
+        is_render = os.path.exists('/usr/bin/chromium')  # Check if we're on Render
+
+        if is_render:
             # Render deployment
+            if debug:
+                print(f"      Using Render ChromeDriver", flush=True)
             chrome_options.binary_location = '/usr/bin/chromium'
             service = Service('/usr/bin/chromedriver')
             driver = webdriver.Chrome(service=service, options=chrome_options)
-        except:
-            # Local development
+        else:
+            # Local development - use webdriver-manager
+            if debug:
+                print(f"      Using local ChromeDriver", flush=True)
             from webdriver_manager.chrome import ChromeDriverManager
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -335,7 +470,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 if debug:
                     print(f"        {len(items)} items", flush=True)
 
-                for item in items[:15]:  # Limit to first 15
+                for item in items[:15]:
                     try:
                         link = item.get_attribute('href')
                         title = item.get_attribute('aria-label') or item.text
@@ -345,13 +480,25 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         if not price or not link or not title:
                             continue
 
-                        # Check price threshold
                         meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
                         if not meets_threshold:
                             continue
 
-                        # Check exclusions
                         if is_excluded(title, price, exclusions):
+                            continue
+
+                        # Get image URL for AI check
+                        image_url = None
+                        try:
+                            img_elem = item.find_element(By.TAG_NAME, 'img')
+                            image_url = img_elem.get_attribute('src')
+                        except:
+                            pass
+
+                        # AI image check
+                        if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug):
+                            if debug:
+                                print(f"              ❌ AI rejected: {title[:40]}", flush=True)
                             continue
 
                         listings.append({
@@ -366,7 +513,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                     except Exception as e:
                         continue
 
-                time.sleep(3)  # Rate limiting
+                time.sleep(3)
 
             except Exception as e:
                 if debug:
@@ -384,6 +531,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 pass
 
     return listings
+
 
 # ===========================
 # USER SCRAPER
@@ -410,23 +558,6 @@ def scrape_for_user(user_config, debug=False):
         print(f"      Terms: {len(search_terms)}, Exclusions: {len(exclusions)}, Seen: {len(seen_listings)}",
               flush=True)
 
-    # Scrape enabled platforms
-    all_listings = []
-
-    if user_config['platforms'].get('craigslist'):
-        if debug:
-            print(f"      Craigslist...", flush=True)
-
-        listings = scrape_craigslist_for_user(
-            user_id,
-            zip_code,
-            user_config['search_radius'],
-            search_terms,
-            exclusions,
-            debug
-        )
-        all_listings.extend(listings)
-
         # Scrape enabled platforms
         all_listings = []
 
@@ -440,6 +571,8 @@ def scrape_for_user(user_config, debug=False):
                 user_config['search_radius'],
                 search_terms,
                 exclusions,
+                user_config['ai_enabled'],
+                user_config['ai_strictness'],
                 debug
             )
             all_listings.extend(listings)
@@ -454,6 +587,8 @@ def scrape_for_user(user_config, debug=False):
                 user_config['search_radius'],
                 search_terms,
                 exclusions,
+                user_config['ai_enabled'],
+                user_config['ai_strictness'],
                 debug
             )
             all_listings.extend(listings)
@@ -466,6 +601,9 @@ def scrape_for_user(user_config, debug=False):
         if listing['link'] not in seen_listings:
             if save_listing(user_id, listing):
                 new_listings.append(listing)
+                if debug:
+                    print(f"        💾 {listing['title'][:40]} - ${listing['price']}", flush=True)
+                    print(f"           {listing['link']}", flush=True)
 
     if debug:
         print(f"      ✅ {len(new_listings)} new listings", flush=True)
