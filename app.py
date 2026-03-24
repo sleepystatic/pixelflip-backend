@@ -15,7 +15,25 @@ load_dotenv()
 
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+# Wildcard origin + supports_credentials=True is invalid per CORS; browsers drop Allow-Origin on preflight.
+# List explicit origins (comma-separated in CORS_ORIGINS on Render) or default to Vercel + local dev.
+_default_origins = (
+    "https://pixelflipdashboard.vercel.app,"
+    "http://localhost:3000,http://127.0.0.1:3000"
+)
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", _default_origins).split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/*": {"origins": _cors_origins}},
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    supports_credentials=False,
+)
 
 # ==========================================
 # DATABASE & AUTH SETUP
@@ -170,7 +188,7 @@ def get_status(user_id):
         conn.close()
 
 
-@app.route('/api/settings', methods=['GET', 'POST'])
+@app.route('/api/settings', methods=['GET', 'POST', 'OPTIONS'])
 @require_auth
 def handle_settings(user_id):
     """Fetch or update settings directly from Supabase PostgreSQL"""
