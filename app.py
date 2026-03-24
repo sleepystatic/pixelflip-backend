@@ -3,11 +3,15 @@ from flask_cors import CORS
 import threading
 import time
 import os
-import jwt
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from functools import wraps
+import requests
+from datetime import datetime
+
+from dotenv import load_dotenv
+load_dotenv()
 
 
 app = Flask(__name__)
@@ -17,8 +21,8 @@ CORS(app)
 # DATABASE & AUTH SETUP
 # ==========================================
 DATABASE_URL = os.getenv('DATABASE_URL')
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "your-super-secret-jwt-key")
-
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY')
 
 def get_db_connection():
     try:
@@ -27,28 +31,68 @@ def get_db_connection():
         print(f"Database connection error: {e}", flush=True)
         return None
 
-
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # NEW: Allow browser preflight checks to pass without a token
+        # Allow browser preflight checks to pass without a token
         if request.method == 'OPTIONS':
             return '', 200
 
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "Missing or invalid token"}), 401
+            return jsonify({"error": "Missing token"}), 401
 
         token = auth_header.split(" ")[1]
         try:
-            decoded = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-            user_id = decoded['sub']
+            # Ask Supabase directly if the token is valid
+            verify_url = f"{SUPABASE_URL}/auth/v1/user"
+            response = requests.get(
+                verify_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY
+                }
+            )
+
+            if response.status_code != 200:
+                print(f"🔒 Supabase Auth Rejected: {response.text}", flush=True)
+                return jsonify({"error": "Invalid or expired token"}), 401
+
+            user_data = response.json()
+            user_id = user_data.get('id')
+
+            if not user_id:
+                return jsonify({"error": "User ID not found in token"}), 401
+
         except Exception as e:
-            return jsonify({"error": str(e)}), 401
+            print(f"🔒 Auth Server Error: {str(e)}", flush=True)
+            return jsonify({"error": f"Server auth error: {str(e)}"}), 500
 
         return f(user_id, *args, **kwargs)
 
     return decorated
+
+
+from datetime import datetime
+
+# ==========================================
+# IN-MEMORY LOG BUFFER (User-Specific)
+# ==========================================
+# Looks like: { "user_id_123": [{"time": "10:00:00 AM", "message": "Scraping...", "type": "info"}] }
+user_logs = {}
+
+
+def add_log(user_id, message, log_type="info"):
+    """Saves a log to the specific user's buffer to be sent to React"""
+    if user_id not in user_logs:
+        user_logs[user_id] = []
+
+    timestamp = datetime.now().strftime("%I:%M:%S %p")
+    user_logs[user_id].append({"time": timestamp, "message": message, "type": log_type})
+
+    # Keep only the last 50 logs so we don't run out of server memory
+    if len(user_logs[user_id]) > 50:
+        user_logs[user_id].pop(0)
 
 
 # ==========================================
@@ -67,7 +111,10 @@ def start_background_scraper():
         print("🚀 Starting multi-user scraper...", flush=True)
         from scraper_multi_user import main as run_scraper
         scraper_status['running'] = True
-        run_scraper()
+
+        # We pass our log function directly into the scraper!
+        run_scraper(log_callback=add_log)
+
     except Exception as e:
         scraper_status['running'] = False
         scraper_status['error'] = str(e)
@@ -82,17 +129,32 @@ def health_check():
     return jsonify({"status": "running", "scraper_active": scraper_status['running']})
 
 
-@app.route('/api/status', methods=['GET'])
+@app.route('/api/status', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_status(user_id):
-    # In the future, we will query the DB for this specific user's stats
-    return jsonify({
-        "status": "running" if scraper_status['running'] else "stopped",
-        "running": scraper_status['running'],
-        "items_scanned_today": 0,
-        "matches_found_today": 0,
-        "recent_activity": []
-    })
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    conn = get_db_connection()
+    if not conn: return jsonify({"error": "DB error"}), 500
+
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT is_active FROM user_settings WHERE user_id = %s;", (user_id,))
+        us = cursor.fetchone()
+
+        is_running = us['is_active'] if us else False
+
+        return jsonify({
+            "status": "running" if is_running else "stopped",
+            "running": is_running,
+            "items_scanned_today": 0,  # We will wire these up later
+            "matches_found_today": 0,
+            "recent_activity": user_logs.get(user_id, [])
+        })
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route('/api/settings', methods=['GET', 'POST'])
@@ -111,7 +173,7 @@ def handle_settings(user_id):
             us = cursor.fetchone()
 
             cursor.execute("SELECT search_term, max_price FROM user_search_terms WHERE user_id = %s;", (user_id,))
-            terms = {row['search_term']: float(row['max_price']) for row in cursor.fetchall()}
+            terms = {row['search_term']: {'max': float(row['max_price']), 'min': float(row['min_price'])} for row in cursor.fetchall()}
 
             cursor.execute("SELECT keyword FROM user_exclusions WHERE user_id = %s;", (user_id,))
             exclusions = [row['keyword'] for row in cursor.fetchall()]
@@ -125,7 +187,8 @@ def handle_settings(user_id):
                     "thresholds": terms,
                     "excluded_keywords": exclusions,
                     "ai_detection": True,
-                    "strictness": 2
+                    "strictness": 3,
+                    "subscription_status": "inactive"
                 })
 
             strict_map = {'lenient': 1, 'balanced': 2, 'strict': 3}
@@ -159,11 +222,13 @@ def handle_settings(user_id):
             data.get('ai_detection', True), data.get('check_interval', 10), strict_text))
 
             # REPLACE Search Terms
+            # POST: Save both max and min to the database
             cursor.execute("DELETE FROM user_search_terms WHERE user_id = %s;", (user_id,))
-            for term, max_price in data.get('thresholds', {}).items():
+            for term, prices in data.get('thresholds', {}).items():
                 cursor.execute(
                     "INSERT INTO user_search_terms (user_id, search_term, max_price, min_price) VALUES (%s, %s, %s, %s);",
-                    (user_id, term, max_price, 10))
+                    (user_id, term, prices.get('max', 0), prices.get('min', 0))
+                )
 
             # REPLACE Exclusions
             cursor.execute("DELETE FROM user_exclusions WHERE user_id = %s;", (user_id,))
@@ -178,6 +243,47 @@ def handle_settings(user_id):
         return jsonify({"error": str(e)}), 500
     finally:
         cursor.close()
+        conn.close()
+
+
+@app.route('/api/start', methods=['POST', 'OPTIONS'])
+@require_auth
+def start_scraper(user_id):
+    """Enable the scraper for this specific user"""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    conn = get_db_connection()
+    if not conn: return jsonify({"error": "DB error"}), 500
+    try:
+        cursor = conn.cursor()
+        # WE NOW FLIP THE CORRECT SWITCH
+        cursor.execute("UPDATE user_settings SET is_active = TRUE WHERE user_id = %s;", (user_id,))
+        conn.commit()
+        return jsonify({"success": True, "status": "running"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/stop', methods=['POST', 'OPTIONS'])
+@require_auth
+def stop_scraper(user_id):
+    """Disable the scraper for this specific user"""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    conn = get_db_connection()
+    if not conn: return jsonify({"error": "DB error"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE user_settings SET is_active = FALSE WHERE user_id = %s;", (user_id,))
+        conn.commit()
+        return jsonify({"success": True, "status": "stopped"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
         conn.close()
 
 

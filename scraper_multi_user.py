@@ -470,7 +470,18 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 if debug:
                     print(f"        {len(items)} items", flush=True)
 
-                for item in items[:15]:
+                # Scroll multiple times to load more items
+                for scroll in range(3):  # Scroll 3 times
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+
+                # Now get all items (not just first 15)
+                items = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
+
+                if debug:
+                    print(f"        {len(items)} items (after scrolling)", flush=True)
+
+                for item in items[:50]:  # Process up to 50 items instead of 15
                     try:
                         link = item.get_attribute('href')
                         title = item.get_attribute('aria-label') or item.text
