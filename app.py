@@ -31,6 +31,8 @@ def get_db_connection():
         print(f"Database connection error: {e}", flush=True)
         return None
 
+
+
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -140,16 +142,27 @@ def get_status(user_id):
 
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT is_active FROM user_settings WHERE user_id = %s;", (user_id,))
+        # Pull the time they were last scraped
+        cursor.execute(
+            "SELECT is_active, check_interval_minutes, EXTRACT(EPOCH FROM last_scraped_at) as last_scraped_ts FROM user_settings WHERE user_id = %s;",
+            (user_id,))
         us = cursor.fetchone()
 
+        # Ensure it is a whole number (strips decimals)
         is_running = us['is_active'] if us else False
+        interval_secs = int(us['check_interval_minutes'] if us else 10) * 60
+
+        # If they've never been scraped, default to 0 so the timer hits 0:00 immediately
+        last_scraped = int(us['last_scraped_ts']) if us and us['last_scraped_ts'] else 0
+
+        next_check_timestamp = last_scraped + interval_secs
 
         return jsonify({
             "status": "running" if is_running else "stopped",
             "running": is_running,
-            "items_scanned_today": 0,  # We will wire these up later
+            "items_scanned_today": 0,
             "matches_found_today": 0,
+            "next_check_timestamp": next_check_timestamp,  # SEND TO REACT
             "recent_activity": user_logs.get(user_id, [])
         })
     finally:
@@ -172,8 +185,15 @@ def handle_settings(user_id):
             cursor.execute("SELECT * FROM user_settings WHERE user_id = %s;", (user_id,))
             us = cursor.fetchone()
 
-            cursor.execute("SELECT search_term, max_price FROM user_search_terms WHERE user_id = %s;", (user_id,))
-            terms = {row['search_term']: {'max': float(row['max_price']), 'min': float(row['min_price'])} for row in cursor.fetchall()}
+            # THE FIX: Added min_price to the SELECT statement and added 'None' safety nets
+            cursor.execute("SELECT search_term, max_price, min_price FROM user_search_terms WHERE user_id = %s;",
+                           (user_id,))
+            terms = {
+                row['search_term']: {
+                    'max': float(row['max_price'] if row['max_price'] is not None else 0),
+                    'min': float(row['min_price'] if row['min_price'] is not None else 0)
+                } for row in cursor.fetchall()
+            }
 
             cursor.execute("SELECT keyword FROM user_exclusions WHERE user_id = %s;", (user_id,))
             exclusions = [row['keyword'] for row in cursor.fetchall()]
