@@ -281,10 +281,14 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument('--log-level=3')
         chrome_options.add_argument('--silent')
 
-        if os.path.exists('/usr/bin/chromium'):
-            chrome_options.binary_location = '/usr/bin/chromium'
+        if os.path.exists('/usr/bin/chromium-browser'):
+            chrome_options.binary_location = '/usr/bin/chromium-browser'
             service = Service('/usr/bin/chromedriver')
             driver = webdriver.Chrome(service=service, options=chrome_options)
+        elif os.path.exists('/usr/bin/google-chrome'):
+            chrome_options.binary_location = '/usr/bin/google-chrome'
+            # Render usually needs this binary location explicitly
+            driver = webdriver.Chrome(options=chrome_options)
         else:
             from webdriver_manager.chrome import ChromeDriverManager
             service = Service(ChromeDriverManager().install())
