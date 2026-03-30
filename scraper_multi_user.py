@@ -9,6 +9,10 @@ from urllib.parse import urlparse
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 load_dotenv()
 
@@ -281,15 +285,29 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument('--log-level=3')
         chrome_options.add_argument('--silent')
 
-        if os.path.exists('/usr/bin/chromium-browser'):
-            chrome_options.binary_location = '/usr/bin/chromium-browser'
-            service = Service('/usr/bin/chromedriver')
+        # Try common Linux paths first (Render/Docker images vary)
+        chrome_bin_candidates = [
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+        ]
+        chromedriver_candidates = [
+            '/usr/bin/chromedriver',
+            '/usr/local/bin/chromedriver',
+        ]
+
+        chrome_bin = next((p for p in chrome_bin_candidates if os.path.exists(p)), None)
+        chromedriver_bin = next((p for p in chromedriver_candidates if os.path.exists(p)), None)
+
+        if chrome_bin:
+            chrome_options.binary_location = chrome_bin
+
+        if chromedriver_bin:
+            service = Service(chromedriver_bin)
             driver = webdriver.Chrome(service=service, options=chrome_options)
-        elif os.path.exists('/usr/bin/google-chrome'):
-            chrome_options.binary_location = '/usr/bin/google-chrome'
-            # Render usually needs this binary location explicitly
-            driver = webdriver.Chrome(options=chrome_options)
         else:
+            # Fallback for local dev; may fail on locked-down hosts.
             from webdriver_manager.chrome import ChromeDriverManager
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -337,7 +355,12 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
             except:
                 pass
     except Exception as e:
-        if log_callback: log_callback(user_id, "OfferUp robot failed to start.", "error")
+        if log_callback:
+            log_callback(
+                user_id,
+                f"OfferUp robot failed to start: {e.__class__.__name__}: {e}",
+                "error"
+            )
     finally:
         if driver:
             try:

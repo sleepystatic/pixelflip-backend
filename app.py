@@ -20,7 +20,9 @@ app = Flask(__name__)
 # List explicit origins (comma-separated in CORS_ORIGINS on Render) or default to Vercel + local dev.
 _default_origins = (
     "https://pixelflipdashboard.vercel.app,"
-    "http://localhost:3000,http://127.0.0.1:3000"
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:3001,http://127.0.0.1:3001,"
+    "http://localhost:3002,http://127.0.0.1:3002"
 )
 _cors_origins = [
     o.strip()
@@ -140,6 +142,27 @@ def start_background_scraper():
         scraper_status['error'] = str(e)
         print(f"❌ Scraper error: {e}", flush=True)
 
+_scraper_thread = None
+_scraper_thread_started = False
+
+def ensure_scraper_thread_started():
+    """
+    When running under gunicorn, __main__ doesn't execute.
+    We optionally start the background scraper thread on import.
+
+    Set ENABLE_SCRAPER_THREAD=1 on Render if this web service should also run the scraper loop.
+    """
+    global _scraper_thread, _scraper_thread_started
+    if _scraper_thread_started:
+        return
+    if os.getenv("ENABLE_SCRAPER_THREAD", "0") != "1":
+        return
+    _scraper_thread = threading.Thread(target=start_background_scraper, daemon=True)
+    _scraper_thread.start()
+    _scraper_thread_started = True
+
+ensure_scraper_thread_started()
+
 
 # ==========================================
 # API ENDPOINTS
@@ -150,6 +173,9 @@ def health_check():
 
 
 @app.route('/api/status', methods=['GET', 'OPTIONS'])
+@app.route('/api/status/', methods=['GET', 'OPTIONS'])
+@app.route('/status', methods=['GET', 'OPTIONS'])
+@app.route('/status/', methods=['GET', 'OPTIONS'])
 @require_auth
 def get_status(user_id):
     if request.method == 'OPTIONS':
@@ -189,6 +215,9 @@ def get_status(user_id):
 
 
 @app.route('/api/settings', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/api/settings/', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/settings', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/settings/', methods=['GET', 'POST', 'OPTIONS'])
 @require_auth
 def handle_settings(user_id):
     """Fetch or update settings directly from Supabase PostgreSQL"""
@@ -285,6 +314,9 @@ def handle_settings(user_id):
 
 
 @app.route('/api/start', methods=['POST', 'OPTIONS'])
+@app.route('/api/start/', methods=['POST', 'OPTIONS'])
+@app.route('/start', methods=['POST', 'OPTIONS'])
+@app.route('/start/', methods=['POST', 'OPTIONS'])
 @require_auth
 def start_scraper(user_id):
     """Enable the scraper for this specific user"""
@@ -306,6 +338,9 @@ def start_scraper(user_id):
 
 
 @app.route('/api/stop', methods=['POST', 'OPTIONS'])
+@app.route('/api/stop/', methods=['POST', 'OPTIONS'])
+@app.route('/stop', methods=['POST', 'OPTIONS'])
+@app.route('/stop/', methods=['POST', 'OPTIONS'])
 @require_auth
 def stop_scraper(user_id):
     """Disable the scraper for this specific user"""
