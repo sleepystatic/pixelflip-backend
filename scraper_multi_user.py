@@ -2,6 +2,7 @@ import time
 import os
 import sys
 import re
+import json
 import hashlib
 import shutil
 import requests
@@ -230,7 +231,17 @@ def _is_recent_timestamp(dt_text, max_age_days):
 GOOGLE_VISION_API_KEY = os.getenv('GOOGLE_VISION_API_KEY')
 
 
-def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_callback=None, user_id=None):
+def _ai_enabled_for_platform(platform_name):
+    """Comma list in AI_IMAGE_FILTER_PLATFORMS, e.g. offerup,craigslist,mercari (lowercase).
+    Default: offerup only — Vision console heuristics often reject couches/phones on CL/Mercari."""
+    raw = os.getenv('AI_IMAGE_FILTER_PLATFORMS', 'offerup').lower()
+    allowed = {p.strip() for p in raw.split(',') if p.strip()}
+    return platform_name.lower() in allowed
+
+
+def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_callback=None, user_id=None, platform_name=''):
+    if not _ai_enabled_for_platform(platform_name or 'offerup'):
+        return True
     if not ai_enabled or not GOOGLE_VISION_API_KEY or not image_url: return True
 
     try:
@@ -282,13 +293,15 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     listings = []
     sites_env = os.getenv('CRAIGSLIST_SITES', 'stockton,sacramento,sfbay,modesto')
     subdomains = [s.strip() for s in sites_env.split(',') if s.strip()]
+    # sss = all for sale (couches, phones, games). vga = video games only — too narrow for mixed search terms.
+    cl_cat = os.getenv('CRAIGSLIST_SEARCH_CAT', 3 * 's').strip() or (3 * 's')
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
 
     if log_callback: log_callback(user_id, "Waking up Craigslist scraper...", "info")
 
     for subdomain in subdomains:
         for term in search_terms.keys():
-            url = f"https://{subdomain}.craigslist.org/search/vga?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
+            url = f"https://{subdomain}.craigslist.org/search/{cl_cat}?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
             try:
                 response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -315,6 +328,8 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
 
                         price_elem = item.find('div', class_='price')
                         price = extract_price(price_elem.text if price_elem else None)
+                        if not price:
+                            price = extract_price(item.get_text(" ", strip=True))
                         if not price or not link:
                             continue
 
@@ -332,7 +347,9 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         except:
                             pass
 
-                        if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback, user_id):
+                        if not check_image_with_ai(
+                            image_url, ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='craigslist'
+                        ):
                             continue
 
                         listings.append({
@@ -351,6 +368,57 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     return listings
 
 
+def _mercari_items_from_next_data(html_text):
+    """Pull listing cards from Next.js __NEXT_DATA__ when present (SSR/hydration)."""
+    out = []
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        tag = soup.find('script', id='__NEXT_DATA__')
+        if not tag or not tag.string:
+            return out
+        data = json.loads(tag.string)
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                if 'id' in obj and 'name' in obj and 'price' in obj:
+                    pid = str(obj.get('id', ''))
+                    name = obj.get('name') or ''
+                    price_obj = obj.get('price')
+                    if isinstance(price_obj, dict):
+                        amt = price_obj.get('amount') or price_obj.get('value')
+                    else:
+                        amt = price_obj
+                    if pid and name and amt is not None:
+                        try:
+                            a = float(amt)
+                            # Mercari often stores price in cents as a whole number
+                            price = (a / 100.0) if (a >= 100 and a == int(a) and a < 1000000) else a
+                        except (TypeError, ValueError):
+                            price = extract_price(str(amt))
+                        if price:
+                            thumb = None
+                            photos = obj.get('photos') or obj.get('thumbnails') or []
+                            if photos and isinstance(photos[0], dict):
+                                thumb = photos[0].get('url') or photos[0].get('imageUrl')
+                            link = f"https://www.mercari.com/us/item/{pid}/"
+                            out.append({
+                                'title': str(name).strip(),
+                                'price': price,
+                                'link': link,
+                                'image_url': thumb,
+                            })
+                for v in obj.values():
+                    walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    walk(v)
+
+        walk(data)
+    except Exception:
+        pass
+    return out
+
+
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
                             debug=False, log_callback=None):
     listings = []
@@ -358,41 +426,57 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
         log_callback(user_id, "Waking up Mercari scraper...", "info")
 
     headers = {
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
 
     for term in search_terms.keys():
-        # Mercari's public search page markup changes frequently; keep selectors flexible.
         url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            anchors = soup.select("a[href*='/item/m']")
+            response = requests.get(url, headers=headers, timeout=20)
+            raw_items = _mercari_items_from_next_data(response.text)
+            if not raw_items:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                anchors = soup.select("a[href*='/item/']")
+                for a in anchors[:80]:
+                    try:
+                        href = a.get('href') or ''
+                        if not href or '/item/' not in href:
+                            continue
+                        link = href if href.startswith('http') else f"https://www.mercari.com{href}"
+                        title = (a.get('aria-label') or a.get_text(" ", strip=True) or '').strip()
+                        full_text = a.get_text(" ", strip=True)
+                        price = extract_price(full_text)
+                        if title and price:
+                            _img = a.find('img')
+                            raw_items.append({
+                                'title': title, 'price': price, 'link': link,
+                                'image_url': _img.get('src') or _img.get('data-src') if _img else None,
+                            })
+                    except Exception:
+                        continue
+
+            seen_links = set()
+            deduped = []
+            for r in raw_items:
+                lk = r.get('link')
+                if not lk or lk in seen_links:
+                    continue
+                seen_links.add(lk)
+                deduped.append(r)
+            raw_items = deduped
+
             if debug and log_callback:
-                log_callback(user_id, f"Mercari '{term}': scanned {min(len(anchors), 80)} rows", "info")
+                log_callback(user_id, f"Mercari '{term}': scanned {len(raw_items)} rows", "info")
 
-            for a in anchors[:80]:
+            for row in raw_items[:80]:
                 try:
-                    href = a.get('href') or ''
-                    if not href:
-                        continue
-                    link = href if href.startswith('http') else f"https://www.mercari.com{href}"
-
-                    title = (a.get('aria-label') or a.get_text(" ", strip=True) or '').strip()
-                    if not title:
-                        continue
-
-                    full_text = a.get_text(" ", strip=True)
-                    price = extract_price(full_text)
-                    if not price:
-                        continue
-
-                    # If Mercari exposes a timestamp attribute in future markup, use it.
-                    dt_text = a.get('datetime') or a.get('data-created-at')
-                    if dt_text and not _is_recent_timestamp(dt_text, max_age_days):
-                        continue
+                    title = row['title']
+                    price = row['price']
+                    link = row['link']
+                    image_url = row.get('image_url')
 
                     meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
                     if not meets_threshold:
@@ -400,12 +484,9 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     if is_excluded(title, price, exclusions):
                         continue
 
-                    image_url = None
-                    img = a.find('img')
-                    if img:
-                        image_url = img.get('src') or img.get('data-src')
-
-                    if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback, user_id):
+                    if not check_image_with_ai(
+                        image_url, ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='mercari'
+                    ):
                         continue
 
                     listings.append({
@@ -418,10 +499,10 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                         'image_url': image_url,
                         'location': f'Mercari · {zip_code} ({search_radius} mi)'
                     })
-                except:
+                except Exception:
                     continue
             time.sleep(1)
-        except:
+        except Exception:
             pass
     if debug and log_callback:
         log_callback(user_id, f"Mercari complete: {len(listings)} candidate matches", "info")
@@ -515,7 +596,9 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
 
         for term in search_terms.keys():
             try:
-                url = f"https://offerup.com/search/?q={term.replace(' ', '%20')}&radius={search_radius}"
+                # Newest first (matches OfferUp "Recent" sort intent)
+                sort_param = os.getenv('OFFERUP_SORT', '-created_at')
+                url = f"https://offerup.com/search/?q={term.replace(' ', '%20')}&radius={search_radius}&sort={sort_param}"
                 if log_callback: log_callback(user_id, f"Scanning OfferUp for '{term}'...", "info")
 
                 driver.get(url)
@@ -547,8 +630,10 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         except:
                             pass
 
-                        if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback,
-                                                   user_id): continue
+                        if not check_image_with_ai(
+                            image_url, ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='offerup'
+                        ):
+                            continue
 
                         listings.append({
                             'title': title, 'price': price, 'link': link, 'platform': 'OfferUp',
