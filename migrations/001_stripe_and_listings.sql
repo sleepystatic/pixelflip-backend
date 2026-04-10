@@ -34,3 +34,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_user_link_unique
   ON listings_feedback (user_id, link);
 CREATE INDEX IF NOT EXISTS idx_feedback_user_fingerprint
   ON listings_feedback (user_id, title_fingerprint);
+
+CREATE TABLE IF NOT EXISTS email_change_requests (
+  user_id TEXT PRIMARY KEY,
+  new_email TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

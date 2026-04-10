@@ -3,11 +3,12 @@ import os
 import sys
 import re
 import hashlib
+import shutil
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -209,6 +210,20 @@ def is_excluded(title, price, exclusions):
     return False
 
 
+def _is_recent_timestamp(dt_text, max_age_days):
+    if not dt_text:
+        return True
+    try:
+        # Craigslist usually emits ISO-like datetimes
+        dt = datetime.fromisoformat(dt_text.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - dt
+        return age.total_seconds() <= max_age_days * 86400
+    except Exception:
+        return True
+
+
 # ===========================
 # AI IMAGE DETECTION
 # ===========================
@@ -265,56 +280,151 @@ def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_c
 def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
                                debug=False, log_callback=None):
     listings = []
-    subdomain = "stockton"
+    sites_env = os.getenv('CRAIGSLIST_SITES', 'stockton,sacramento,sfbay,modesto')
+    subdomains = [s.strip() for s in sites_env.split(',') if s.strip()]
+    max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
 
     if log_callback: log_callback(user_id, "Waking up Craigslist scraper...", "info")
 
+    for subdomain in subdomains:
+        for term in search_terms.keys():
+            url = f"https://{subdomain}.craigslist.org/search/vga?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
+            try:
+                response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                soup = BeautifulSoup(response.content, 'html.parser')
+                items = soup.find_all('li', class_='cl-static-search-result')
+                if debug and log_callback:
+                    log_callback(user_id, f"Craigslist {subdomain} '{term}': scanned {len(items)} rows", "info")
+
+                for item in items:
+                    try:
+                        title_elem = item.find('div', class_='title')
+                        title = title_elem.text.strip() if title_elem else None
+                        if not title:
+                            continue
+
+                        time_elem = item.find('time')
+                        dt_text = time_elem.get('datetime') if time_elem else None
+                        if not _is_recent_timestamp(dt_text, max_age_days):
+                            continue
+
+                        link_elem = item.find('a')
+                        link = link_elem['href'] if link_elem else None
+                        if link and not link.startswith('http'):
+                            link = f'https://{subdomain}.craigslist.org' + link
+
+                        price_elem = item.find('div', class_='price')
+                        price = extract_price(price_elem.text if price_elem else None)
+                        if not price or not link:
+                            continue
+
+                        meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
+                        if not meets_threshold:
+                            continue
+                        if is_excluded(title, price, exclusions):
+                            continue
+
+                        image_url = None
+                        try:
+                            img_elem = item.find('img')
+                            if img_elem and 'src' in img_elem.attrs:
+                                image_url = img_elem['src']
+                        except:
+                            pass
+
+                        if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback, user_id):
+                            continue
+
+                        listings.append({
+                            'title': title, 'price': price, 'link': link, 'platform': 'Craigslist',
+                            'console_type': console_type, 'threshold': max_price,
+                            'image_url': image_url,
+                            'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)'
+                        })
+                    except:
+                        continue
+                time.sleep(1)
+            except:
+                pass
+    if debug and log_callback:
+        log_callback(user_id, f"Craigslist complete: {len(listings)} candidate matches", "info")
+    return listings
+
+
+def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
+                            debug=False, log_callback=None):
+    listings = []
+    if log_callback:
+        log_callback(user_id, "Waking up Mercari scraper...", "info")
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
+
     for term in search_terms.keys():
-        url = f"https://{subdomain}.craigslist.org/search/vga?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
+        # Mercari's public search page markup changes frequently; keep selectors flexible.
+        url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
         try:
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            items = soup.find_all('li', class_='cl-static-search-result')
+            response = requests.get(url, headers=headers, timeout=15)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            anchors = soup.select("a[href*='/item/m']")
+            if debug and log_callback:
+                log_callback(user_id, f"Mercari '{term}': scanned {min(len(anchors), 80)} rows", "info")
 
-            for item in items:
+            for a in anchors[:80]:
                 try:
-                    title_elem = item.find('div', class_='title')
-                    title = title_elem.text.strip() if title_elem else None
-                    if not title: continue
+                    href = a.get('href') or ''
+                    if not href:
+                        continue
+                    link = href if href.startswith('http') else f"https://www.mercari.com{href}"
 
-                    link_elem = item.find('a')
-                    link = link_elem['href'] if link_elem else None
-                    if link and not link.startswith('http'): link = f'https://{subdomain}.craigslist.org' + link
+                    title = (a.get('aria-label') or a.get_text(" ", strip=True) or '').strip()
+                    if not title:
+                        continue
 
-                    price_elem = item.find('div', class_='price')
-                    price = extract_price(price_elem.text if price_elem else None)
-                    if not price or not link: continue
+                    full_text = a.get_text(" ", strip=True)
+                    price = extract_price(full_text)
+                    if not price:
+                        continue
+
+                    # If Mercari exposes a timestamp attribute in future markup, use it.
+                    dt_text = a.get('datetime') or a.get('data-created-at')
+                    if dt_text and not _is_recent_timestamp(dt_text, max_age_days):
+                        continue
 
                     meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
-                    if not meets_threshold: continue
-                    if is_excluded(title, price, exclusions): continue
+                    if not meets_threshold:
+                        continue
+                    if is_excluded(title, price, exclusions):
+                        continue
 
                     image_url = None
-                    try:
-                        img_elem = item.find('img')
-                        if img_elem and 'src' in img_elem.attrs: image_url = img_elem['src']
-                    except:
-                        pass
+                    img = a.find('img')
+                    if img:
+                        image_url = img.get('src') or img.get('data-src')
 
-                    if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback,
-                                               user_id): continue
+                    if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback, user_id):
+                        continue
 
                     listings.append({
-                        'title': title, 'price': price, 'link': link, 'platform': 'Craigslist',
-                        'console_type': console_type, 'threshold': max_price,
+                        'title': title,
+                        'price': price,
+                        'link': link,
+                        'platform': 'Mercari',
+                        'console_type': console_type,
+                        'threshold': max_price,
                         'image_url': image_url,
-                        'location': f'Craigslist · {zip_code} ({search_radius} mi)'
+                        'location': f'Mercari · {zip_code} ({search_radius} mi)'
                     })
                 except:
                     continue
             time.sleep(1)
         except:
             pass
+    if debug and log_callback:
+        log_callback(user_id, f"Mercari complete: {len(listings)} candidate matches", "info")
     return listings
 
 
@@ -345,15 +455,58 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
 
-        # FIND BINARY
-        chrome_bin = next((p for p in ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'] if
-                           os.path.exists(p)), None)
-        if chrome_bin:
-            chrome_options.binary_location = chrome_bin
+        remote_url = os.getenv('SELENIUM_REMOTE_URL')
+        if remote_url:
+            # SaaS-friendly path: use remote browser infrastructure (Browserless/Selenium Grid).
+            if debug and log_callback:
+                log_callback(user_id, "OfferUp using remote browser endpoint", "info")
+            driver = webdriver.Remote(command_executor=remote_url, options=chrome_options)
+        else:
+            # FIND BINARY (env override first) for local/self-hosted installs.
+            chrome_bin = os.getenv('CHROME_BINARY')
+            if chrome_bin and not os.path.exists(chrome_bin):
+                chrome_bin = None
+            if not chrome_bin:
+                windows_candidates = [
+                    os.path.join(os.getenv("PROGRAMFILES", r"C:\Program Files"), r"Google\Chrome\Application\chrome.exe"),
+                    os.path.join(os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), r"Google\Chrome\Application\chrome.exe"),
+                    os.path.join(os.getenv("LOCALAPPDATA", r"C:\Users\Default\AppData\Local"), r"Google\Chrome\Application\chrome.exe"),
+                    os.path.join(os.getenv("PROGRAMFILES", r"C:\Program Files"), r"Microsoft\Edge\Application\msedge.exe"),
+                ]
+                chrome_bin = next(
+                    (p for p in [
+                        *windows_candidates,
+                        '/usr/bin/google-chrome',
+                        '/usr/bin/google-chrome-stable',
+                        '/usr/bin/chromium',
+                        '/usr/bin/chromium-browser',
+                        '/opt/google/chrome/chrome',
+                    ] if os.path.exists(p)),
+                    None
+                )
+            if not chrome_bin:
+                chrome_bin = (
+                    shutil.which("google-chrome")
+                    or shutil.which("chrome")
+                    or shutil.which("chromium")
+                    or shutil.which("msedge")
+                )
+            if chrome_bin:
+                chrome_options.binary_location = chrome_bin
+                if debug and log_callback:
+                    log_callback(user_id, f"OfferUp browser: {chrome_bin}", "info")
+            else:
+                if log_callback:
+                    log_callback(
+                        user_id,
+                        "OfferUp skipped: no browser runtime. Set SELENIUM_REMOTE_URL (recommended for SaaS) or CHROME_BINARY.",
+                        "error"
+                    )
+                return listings
 
-        # INITIALIZE ONCE
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+            # INITIALIZE ONCE (local mode)
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
 
         # STEALTH HANDSHAKE
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -373,6 +526,8 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                     time.sleep(2)
 
                 items = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
+                if debug and log_callback:
+                    log_callback(user_id, f"OfferUp '{term}': scanned {len(items[:50])} rows", "info")
 
                 for item in items[:50]:
                     try:
@@ -410,7 +565,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         if log_callback:
             log_callback(
                 user_id,
-                f"OfferUp robot failed to start: {e.__class__.__name__}: {e}",
+                f"OfferUp unavailable: {e.__class__.__name__}. Check Chrome/driver install on server.",
                 "error"
             )
     finally:
@@ -419,6 +574,8 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 driver.quit()
             except:
                 pass
+    if debug and log_callback:
+        log_callback(user_id, f"OfferUp complete: {len(listings)} candidate matches", "info")
     return listings
 
 
@@ -458,6 +615,11 @@ def scrape_for_user(user_config, log_callback=None, debug=False):
     if user_config['platforms'].get('offerup'):
         all_listings.extend(
             scrape_offerup_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
+                                    user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback))
+
+    if user_config['platforms'].get('mercari'):
+        all_listings.extend(
+            scrape_mercari_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                     user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback))
 
     new_listings = []
