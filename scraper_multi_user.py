@@ -2,6 +2,7 @@ import time
 import os
 import sys
 import re
+import hashlib
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -103,17 +104,71 @@ def get_seen_listings(user_id):
     return seen
 
 
+def _title_fingerprint(title):
+    cleaned = re.sub(r'[^a-z0-9\s]', ' ', (title or '').lower())
+    tokens = [t for t in cleaned.split() if len(t) > 1 and t not in {'the', 'and', 'for', 'with'}]
+    if not tokens:
+        return ''
+    core = ' '.join(sorted(tokens)[:10])
+    return hashlib.sha1(core.encode('utf-8')).hexdigest()[:20]
+
+
+def get_blocked_links_and_fingerprints(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    blocked_links = set()
+    blocked_fingerprints = set()
+    try:
+        cursor.execute(
+            "SELECT link, title_fingerprint FROM listings_feedback WHERE user_id = %s",
+            (user_id,)
+        )
+        for link, fp in cursor.fetchall():
+            if link:
+                blocked_links.add(link)
+            if fp:
+                blocked_fingerprints.add(fp)
+    except Exception:
+        pass
+    finally:
+        cursor.close()
+        conn.close()
+    return blocked_links, blocked_fingerprints
+
+
+def get_recent_listing_signatures(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute(
+            """
+            SELECT COALESCE(title_fingerprint, '') AS title_fingerprint, price
+            FROM listings
+            WHERE user_id = %s
+              AND created_at >= NOW() - INTERVAL '14 days'
+            """,
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        cursor.close()
+        conn.close()
+    return rows
+
+
 def save_listing(user_id, listing):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO listings (user_id, title, price, link, platform, console_type, threshold, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO listings (user_id, title, price, link, platform, console_type, threshold, image_url, location, title_fingerprint, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (link) DO NOTHING
         ''', (
         user_id, listing['title'], listing['price'], listing['link'], listing['platform'], listing.get('console_type'),
-        listing.get('threshold')))
+        listing.get('threshold'), listing.get('image_url'), listing.get('location'), listing.get('title_fingerprint')))
         inserted = cursor.rowcount > 0
         conn.commit()
         cursor.close()
@@ -249,8 +304,12 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                     if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback,
                                                user_id): continue
 
-                    listings.append({'title': title, 'price': price, 'link': link, 'platform': 'Craigslist',
-                                     'console_type': console_type, 'threshold': max_price})
+                    listings.append({
+                        'title': title, 'price': price, 'link': link, 'platform': 'Craigslist',
+                        'console_type': console_type, 'threshold': max_price,
+                        'image_url': image_url,
+                        'location': f'Craigslist · {zip_code} ({search_radius} mi)'
+                    })
                 except:
                     continue
             time.sleep(1)
@@ -281,36 +340,25 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument('--silent')
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
 
-        # Try common Linux paths first (Render/Docker images vary)
-        chrome_bin_candidates = [
-            '/usr/bin/chromium',
-            '/usr/bin/chromium-browser',
-            '/usr/bin/google-chrome',
-            '/usr/bin/google-chrome-stable',
-        ]
-        chromedriver_candidates = [
-            '/usr/bin/chromedriver',
-            '/usr/local/bin/chromedriver',
-        ]
-
-        chrome_bin = next((p for p in chrome_bin_candidates if os.path.exists(p)), None)
-        chromedriver_bin = next((p for p in chromedriver_candidates if os.path.exists(p)), None)
-
+        # FIND BINARY
+        chrome_bin = next((p for p in ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'] if
+                           os.path.exists(p)), None)
         if chrome_bin:
             chrome_options.binary_location = chrome_bin
 
-        if chromedriver_bin:
-            service = Service(chromedriver_bin)
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-        else:
-            # Fallback for local dev; may fail on locked-down hosts.
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
+        # INITIALIZE ONCE
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        # STEALTH HANDSHAKE
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
 
         for term in search_terms.keys():
             try:
@@ -347,8 +395,12 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         if not check_image_with_ai(image_url, ai_enabled, ai_strictness, debug, log_callback,
                                                    user_id): continue
 
-                        listings.append({'title': title, 'price': price, 'link': link, 'platform': 'OfferUp',
-                                         'console_type': console_type, 'threshold': max_price})
+                        listings.append({
+                            'title': title, 'price': price, 'link': link, 'platform': 'OfferUp',
+                            'console_type': console_type, 'threshold': max_price,
+                            'image_url': image_url,
+                            'location': f'OfferUp · {zip_code} ({search_radius} mi)'
+                        })
                     except:
                         continue
                 time.sleep(3)
@@ -387,6 +439,15 @@ def scrape_for_user(user_config, log_callback=None, debug=False):
 
     exclusions = get_user_exclusions(user_id)
     seen_listings = get_seen_listings(user_id)
+    blocked_links, blocked_fingerprints = get_blocked_links_and_fingerprints(user_id)
+    recent_sigs = get_recent_listing_signatures(user_id)
+    recent_fp_to_prices = {}
+    for row in recent_sigs:
+        fp = row.get('title_fingerprint')
+        if not fp:
+            continue
+        recent_fp_to_prices.setdefault(fp, []).append(float(row.get('price') or 0))
+
     all_listings = []
 
     if user_config['platforms'].get('craigslist'):
@@ -400,13 +461,35 @@ def scrape_for_user(user_config, log_callback=None, debug=False):
                                     user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback))
 
     new_listings = []
+    cycle_fp_to_prices = {}
     for listing in all_listings:
-        if listing['link'] not in seen_listings:
-            if save_listing(user_id, listing):
-                new_listings.append(listing)
-                # Send the success log straight to the UI!
-                if log_callback: log_callback(user_id, f"DEAL FOUND: {listing['title'][:30]} for ${listing['price']}",
-                                              "success")
+        link = listing['link']
+        fp = _title_fingerprint(listing.get('title'))
+        listing['title_fingerprint'] = fp
+        price = float(listing.get('price') or 0)
+
+        if link in seen_listings or link in blocked_links:
+            continue
+        if fp and fp in blocked_fingerprints:
+            continue
+
+        # Fuzzy-ish duplicate gate across marketplaces:
+        # same normalized title fingerprint and close price (+/- $10)
+        recent_prices = recent_fp_to_prices.get(fp, [])
+        cycle_prices = cycle_fp_to_prices.get(fp, [])
+        if fp and any(abs(price - p) <= 10 for p in recent_prices + cycle_prices):
+            continue
+
+        if save_listing(user_id, listing):
+            new_listings.append(listing)
+            cycle_fp_to_prices.setdefault(fp, []).append(price)
+            # Send the success log straight to the UI!
+            if log_callback:
+                log_callback(
+                    user_id,
+                    f"DEAL FOUND: {listing['title'][:30]} for ${listing['price']}",
+                    "success"
+                )
 
     if log_callback and len(new_listings) == 0:
         log_callback(user_id, "Scan complete. No new matches found.", "info")
@@ -460,12 +543,22 @@ def main(log_callback=None):
                 # 2. THE CLOCK: Has enough time passed since their last scrape?
                 if current_time - last_scraped >= interval_seconds:
                     try:
+                        started = time.time()
                         # Run the scrape
                         new_count = scrape_for_user(user, log_callback=log_callback, debug=True)
                         total_new += new_count
+                        duration_ms = int((time.time() - started) * 1000)
 
                         # 3. THE MISSING PIECE: Stamp the clock in the database!
-                        cursor.execute("UPDATE user_settings SET last_scraped_at = NOW() WHERE user_id = %s", (uid,))
+                        cursor.execute(
+                            """
+                            UPDATE user_settings
+                            SET last_scraped_at = NOW(),
+                                last_scrape_duration_ms = %s
+                            WHERE user_id = %s
+                            """,
+                            (duration_ms, uid)
+                        )
                         conn.commit()
                     except Exception as e:
                         print(f"  ❌ [{uid}] Error: {e}", flush=True)
