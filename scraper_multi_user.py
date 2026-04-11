@@ -5,10 +5,12 @@ import re
 import json
 import hashlib
 import shutil
+import threading
 import requests
 import psycopg2
+from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -20,6 +22,38 @@ from webdriver_manager.chrome import ChromeDriverManager
 load_dotenv()
 
 print("✅ Multi-user scraper loaded", flush=True)
+
+# Users currently in scrape_for_user (same process as Flask when ENABLE_SCRAPER_THREAD=1).
+SCRAPING_USERS = set()
+_SCRAPING_LOCK = threading.Lock()
+
+
+def set_user_scraping(user_id, active):
+    with _SCRAPING_LOCK:
+        if active:
+            SCRAPING_USERS.add(user_id)
+        else:
+            SCRAPING_USERS.discard(user_id)
+
+
+def resolve_selenium_remote_url():
+    """Use SELENIUM_REMOTE_URL; if BROWSERLESS_TOKEN is set and the host is browserless without credentials, embed the token (https://TOKEN@chrome.browserless.io/webdriver)."""
+    base = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
+    if not base:
+        return None
+    token = (os.getenv('BROWSERLESS_TOKEN') or os.getenv('BROWSERLESS_API_KEY') or '').strip()
+    try:
+        p = urlparse(base)
+        netloc_lower = (p.netloc or '').lower()
+        if not token or 'browserless' not in netloc_lower:
+            return base
+        if p.username or p.password:
+            return base
+        new_netloc = f'{token}@{p.netloc}'
+        path = p.path if p.path else '/'
+        return urlunparse((p.scheme, new_netloc, path, p.params, p.query, p.fragment))
+    except Exception:
+        return base
 
 
 # ===========================
@@ -164,13 +198,26 @@ def save_listing(user_id, listing):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO listings (user_id, title, price, link, platform, console_type, threshold, image_url, location, title_fingerprint, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (link) DO NOTHING
-        ''', (
-        user_id, listing['title'], listing['price'], listing['link'], listing['platform'], listing.get('console_type'),
-        listing.get('threshold'), listing.get('image_url'), listing.get('location'), listing.get('title_fingerprint')))
+        try:
+            cursor.execute('''
+                INSERT INTO listings (user_id, title, price, link, platform, console_type, threshold, image_url, location, title_fingerprint, listed_at, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (link) DO NOTHING
+            ''', (
+            user_id, listing['title'], listing['price'], listing['link'], listing['platform'], listing.get('console_type'),
+            listing.get('threshold'), listing.get('image_url'), listing.get('location'), listing.get('title_fingerprint'),
+            listing.get('listed_at')))
+        except psycopg2.ProgrammingError as e:
+            conn.rollback()
+            if e.pgcode != errorcodes.UNDEFINED_COLUMN and 'listed_at' not in str(e):
+                raise
+            cursor.execute('''
+                INSERT INTO listings (user_id, title, price, link, platform, console_type, threshold, image_url, location, title_fingerprint, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (link) DO NOTHING
+            ''', (
+            user_id, listing['title'], listing['price'], listing['link'], listing['platform'], listing.get('console_type'),
+            listing.get('threshold'), listing.get('image_url'), listing.get('location'), listing.get('title_fingerprint')))
         inserted = cursor.rowcount > 0
         conn.commit()
         cursor.close()
@@ -189,6 +236,57 @@ def extract_price(price_text):
     match = re.search(r'[\$](\d+(?:,\d{3})*(?:\.\d{2})?)', str(price_text))
     if match: return float(match.group(1).replace(',', ''))
     return None
+
+
+def _extract_lazy_image_url(img_elem):
+    """Craigslist/OfferUp often use data-src or srcset instead of a usable src."""
+    if not img_elem:
+        return None
+    for attr in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+        v = img_elem.get(attr) if hasattr(img_elem, 'get') else None
+        if v and str(v).strip() and not str(v).startswith('data:'):
+            return str(v).strip()
+    srcset = (img_elem.get('srcset') or '') if hasattr(img_elem, 'get') else ''
+    if srcset:
+        part = srcset.split(',')[0].strip().split()
+        if part:
+            return part[0]
+    return None
+
+
+def _normalize_iso8601_tz(s):
+    """Craigslist uses e.g. -0700; Python's fromisoformat expects -07:00."""
+    if not s:
+        return s
+    m = re.search(r'([+-])(\d{2})(\d{2})$', str(s).strip())
+    if m:
+        return str(s).strip()[: m.start()] + f"{m.group(1)}{m.group(2)}:{m.group(3)}"
+    return str(s).strip()
+
+
+def _parse_source_datetime(val):
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, (int, float)):
+        x = float(val)
+        if x > 1e12:
+            x = x / 1000.0
+        if x > 1e9:
+            try:
+                return datetime.fromtimestamp(x, tz=timezone.utc)
+            except Exception:
+                return None
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        s = _normalize_iso8601_tz(s.replace('Z', '+00:00'))
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
 def check_price_threshold(title, price, search_terms):
@@ -216,7 +314,7 @@ def _is_recent_timestamp(dt_text, max_age_days):
         return True
     try:
         # Craigslist usually emits ISO-like datetimes
-        dt = datetime.fromisoformat(dt_text.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(_normalize_iso8601_tz(dt_text.replace('Z', '+00:00')))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         age = datetime.now(timezone.utc) - dt
@@ -288,6 +386,50 @@ def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_c
 # ===========================
 # CRAIGSLIST SCRAPER
 # ===========================
+def _best_craigslist_gallery_image(soup):
+    """Listing detail pages include images.craigslist.org URLs; search result tiles usually have no <img>."""
+    best = None
+    best_area = -1
+    for img in soup.find_all('img', src=True):
+        src = (img.get('src') or '').strip()
+        if 'images.craigslist.org' not in src:
+            continue
+        if src.startswith('//'):
+            src = 'https:' + src
+        m = re.search(r'(\d+)x(\d+)', src)
+        area = int(m.group(1)) * int(m.group(2)) if m else 0
+        if area > best_area:
+            best_area = area
+            best = src
+    return best
+
+
+def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_sec):
+    """GET the listing detail page for real posted time + gallery image. Returns False to skip this listing."""
+    try:
+        r = session.get(listing['link'], timeout=22)
+        time.sleep(max(0.0, polite_delay_sec))
+        if r.status_code == 404:
+            return False
+        if r.status_code != 200:
+            return True
+        soup = BeautifulSoup(r.content, 'html.parser')
+        time_el = soup.select_one('time[datetime]')
+        if not time_el:
+            time_el = soup.find('time', class_='date')
+        dt_text = time_el.get('datetime') if time_el else None
+        if dt_text:
+            if not _is_recent_timestamp(dt_text, max_age_days):
+                return False
+            listing['listed_at'] = _parse_source_datetime(dt_text)
+        img = _best_craigslist_gallery_image(soup)
+        if img:
+            listing['image_url'] = img
+        return True
+    except Exception:
+        return True
+
+
 def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
                                debug=False, log_callback=None):
     listings = []
@@ -296,14 +438,29 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     # sss = all for sale (couches, phones, games). vga = video games only — too narrow for mixed search terms.
     cl_cat = os.getenv('CRAIGSLIST_SEARCH_CAT', 3 * 's').strip() or (3 * 's')
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
+    fetch_detail = os.getenv('CRAIGSLIST_FETCH_DETAIL', '1').strip().lower() not in ('0', 'false', 'no')
+    try:
+        detail_delay = float(os.getenv('CRAIGSLIST_DETAIL_DELAY_SEC', '0.35'))
+    except ValueError:
+        detail_delay = 0.35
 
-    if log_callback: log_callback(user_id, "Waking up Craigslist scraper...", "info")
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+
+    if log_callback:
+        log_callback(user_id, "Waking up Craigslist scraper...", "info")
+        if fetch_detail and debug:
+            log_callback(user_id, "Craigslist: fetching each listing page for photos + posted time (search tiles omit them).", "info")
 
     for subdomain in subdomains:
         for term in search_terms.keys():
             url = f"https://{subdomain}.craigslist.org/search/{cl_cat}?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
             try:
-                response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                response = session.get(url, timeout=15)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 items = soup.find_all('li', class_='cl-static-search-result')
                 if debug and log_callback:
@@ -318,7 +475,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
 
                         time_elem = item.find('time')
                         dt_text = time_elem.get('datetime') if time_elem else None
-                        if not _is_recent_timestamp(dt_text, max_age_days):
+                        if dt_text and not _is_recent_timestamp(dt_text, max_age_days):
                             continue
 
                         link_elem = item.find('a')
@@ -339,29 +496,38 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         if is_excluded(title, price, exclusions):
                             continue
 
-                        image_url = None
-                        try:
-                            img_elem = item.find('img')
-                            if img_elem and 'src' in img_elem.attrs:
-                                image_url = img_elem['src']
-                        except:
-                            pass
+                        entry = {
+                            'title': title,
+                            'price': price,
+                            'link': link,
+                            'platform': 'Craigslist',
+                            'console_type': console_type,
+                            'threshold': max_price,
+                            'image_url': None,
+                            'listed_at': _parse_source_datetime(dt_text) if dt_text else None,
+                            'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)',
+                        }
+
+                        if fetch_detail:
+                            if not _enrich_craigslist_from_detail(session, entry, max_age_days, detail_delay):
+                                continue
+                        else:
+                            try:
+                                img_elem = item.find('img')
+                                entry['image_url'] = _extract_lazy_image_url(img_elem)
+                            except Exception:
+                                pass
 
                         if not check_image_with_ai(
-                            image_url, ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='craigslist'
+                            entry['image_url'], ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='craigslist'
                         ):
                             continue
 
-                        listings.append({
-                            'title': title, 'price': price, 'link': link, 'platform': 'Craigslist',
-                            'console_type': console_type, 'threshold': max_price,
-                            'image_url': image_url,
-                            'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)'
-                        })
-                    except:
+                        listings.append(entry)
+                    except Exception:
                         continue
                 time.sleep(1)
-            except:
+            except Exception:
                 pass
     if debug and log_callback:
         log_callback(user_id, f"Craigslist complete: {len(listings)} candidate matches", "info")
@@ -380,33 +546,41 @@ def _mercari_items_from_next_data(html_text):
 
         def walk(obj):
             if isinstance(obj, dict):
-                if 'id' in obj and 'name' in obj and 'price' in obj:
-                    pid = str(obj.get('id', ''))
-                    name = obj.get('name') or ''
+                if 'price' in obj:
                     price_obj = obj.get('price')
-                    if isinstance(price_obj, dict):
-                        amt = price_obj.get('amount') or price_obj.get('value')
-                    else:
-                        amt = price_obj
-                    if pid and name and amt is not None:
-                        try:
-                            a = float(amt)
-                            # Mercari often stores price in cents as a whole number
-                            price = (a / 100.0) if (a >= 100 and a == int(a) and a < 1000000) else a
-                        except (TypeError, ValueError):
-                            price = extract_price(str(amt))
-                        if price:
-                            thumb = None
-                            photos = obj.get('photos') or obj.get('thumbnails') or []
-                            if photos and isinstance(photos[0], dict):
-                                thumb = photos[0].get('url') or photos[0].get('imageUrl')
-                            link = f"https://www.mercari.com/us/item/{pid}/"
-                            out.append({
-                                'title': str(name).strip(),
-                                'price': price,
-                                'link': link,
-                                'image_url': thumb,
-                            })
+                    name = (obj.get('name') or obj.get('title') or '').strip()
+                    pid = str(obj.get('id') or obj.get('item_id') or '').strip()
+                    if name and pid and price_obj is not None:
+                        if isinstance(price_obj, dict):
+                            amt = price_obj.get('amount') or price_obj.get('value')
+                        else:
+                            amt = price_obj
+                        if amt is not None:
+                            try:
+                                a = float(amt)
+                                # Mercari often stores price in cents as a whole number
+                                price = (a / 100.0) if (a >= 100 and a == int(a) and a < 1000000) else a
+                            except (TypeError, ValueError):
+                                price = extract_price(str(amt))
+                            if price:
+                                thumb = None
+                                photos = obj.get('photos') or obj.get('thumbnails') or []
+                                if photos and isinstance(photos[0], dict):
+                                    thumb = photos[0].get('url') or photos[0].get('imageUrl')
+                                link = f"https://www.mercari.com/us/item/{pid}/"
+                                listed_dt = None
+                                for lk in ('created', 'created_at', 'item_created_at', 'listed_at', 'updated', 'created_time'):
+                                    if lk in obj and obj[lk] is not None:
+                                        listed_dt = _parse_source_datetime(obj.get(lk))
+                                        if listed_dt:
+                                            break
+                                out.append({
+                                    'title': str(name).strip(),
+                                    'price': price,
+                                    'link': link,
+                                    'image_url': thumb,
+                                    'listed_at': listed_dt,
+                                })
                 for v in obj.values():
                     walk(v)
             elif isinstance(obj, list):
@@ -417,6 +591,79 @@ def _mercari_items_from_next_data(html_text):
     except Exception:
         pass
     return out
+
+
+def _mercari_dedupe_raw(raw_items):
+    seen_links = set()
+    deduped = []
+    for r in raw_items:
+        lk = r.get('link')
+        if not lk or lk in seen_links:
+            continue
+        seen_links.add(lk)
+        deduped.append(r)
+    return deduped
+
+
+def _mercari_collect_from_html(html_text):
+    raw_items = _mercari_items_from_next_data(html_text)
+    if not raw_items:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        anchors = soup.select("a[href*='/item/']")
+        for a in anchors[:80]:
+            try:
+                href = a.get('href') or ''
+                if not href or '/item/' not in href:
+                    continue
+                link = href if href.startswith('http') else f"https://www.mercari.com{href}"
+                title = (a.get('aria-label') or a.get_text(" ", strip=True) or '').strip()
+                full_text = a.get_text(" ", strip=True)
+                price = extract_price(full_text)
+                if title and price:
+                    _img = a.find('img')
+                    raw_items.append({
+                        'title': title,
+                        'price': price,
+                        'link': link,
+                        'image_url': _extract_lazy_image_url(_img) if _img else None,
+                    })
+            except Exception:
+                continue
+    return _mercari_dedupe_raw(raw_items)
+
+
+def _mercari_page_source_via_selenium(term):
+    driver = None
+    try:
+        remote = resolve_selenium_remote_url()
+        if not remote:
+            return ''
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        chrome_options = Options()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument(
+            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        driver = webdriver.Remote(command_executor=remote, options=chrome_options)
+        url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
+        driver.get(url)
+        time.sleep(6)
+        driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+        time.sleep(2)
+        return driver.page_source or ''
+    except Exception as e:
+        print(f"Mercari selenium fetch: {e}", flush=True)
+        return ''
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
@@ -436,37 +683,11 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
         url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
         try:
             response = requests.get(url, headers=headers, timeout=20)
-            raw_items = _mercari_items_from_next_data(response.text)
-            if not raw_items:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                anchors = soup.select("a[href*='/item/']")
-                for a in anchors[:80]:
-                    try:
-                        href = a.get('href') or ''
-                        if not href or '/item/' not in href:
-                            continue
-                        link = href if href.startswith('http') else f"https://www.mercari.com{href}"
-                        title = (a.get('aria-label') or a.get_text(" ", strip=True) or '').strip()
-                        full_text = a.get_text(" ", strip=True)
-                        price = extract_price(full_text)
-                        if title and price:
-                            _img = a.find('img')
-                            raw_items.append({
-                                'title': title, 'price': price, 'link': link,
-                                'image_url': _img.get('src') or _img.get('data-src') if _img else None,
-                            })
-                    except Exception:
-                        continue
-
-            seen_links = set()
-            deduped = []
-            for r in raw_items:
-                lk = r.get('link')
-                if not lk or lk in seen_links:
-                    continue
-                seen_links.add(lk)
-                deduped.append(r)
-            raw_items = deduped
+            raw_items = _mercari_collect_from_html(response.text)
+            if not raw_items and resolve_selenium_remote_url():
+                if debug and log_callback:
+                    log_callback(user_id, f"Mercari '{term}': empty from HTTP; trying remote browser…", "info")
+                raw_items = _mercari_collect_from_html(_mercari_page_source_via_selenium(term))
 
             if debug and log_callback:
                 log_callback(user_id, f"Mercari '{term}': scanned {len(raw_items)} rows", "info")
@@ -497,6 +718,7 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                         'console_type': console_type,
                         'threshold': max_price,
                         'image_url': image_url,
+                        'listed_at': row.get('listed_at'),
                         'location': f'Mercari · {zip_code} ({search_radius} mi)'
                     })
                 except Exception:
@@ -536,7 +758,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         chrome_options.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
 
-        remote_url = os.getenv('SELENIUM_REMOTE_URL')
+        remote_url = resolve_selenium_remote_url()
         if remote_url:
             # SaaS-friendly path: use remote browser infrastructure (Browserless/Selenium Grid).
             if debug and log_callback:
@@ -626,8 +848,8 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         image_url = None
                         try:
                             img_elem = item.find_element(By.TAG_NAME, 'img')
-                            image_url = img_elem.get_attribute('src')
-                        except:
+                            image_url = img_elem.get_attribute('src') or img_elem.get_attribute('data-src')
+                        except Exception:
                             pass
 
                         if not check_image_with_ai(
@@ -668,6 +890,15 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
 # USER SCRAPER
 # ===========================
 def scrape_for_user(user_config, log_callback=None, debug=False):
+    user_id = user_config['user_id']
+    set_user_scraping(user_id, True)
+    try:
+        return _scrape_for_user_impl(user_config, log_callback=log_callback, debug=debug)
+    finally:
+        set_user_scraping(user_id, False)
+
+
+def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     user_id = user_config['user_id']
     zip_code = user_config['zip_code']
 
@@ -825,10 +1056,6 @@ def main(log_callback=None):
         except Exception as e:
             print(f"❌ Error: {e}", flush=True)
             time.sleep(60)
-
-if __name__ == "__main__":
-    main()
-
 
 if __name__ == "__main__":
     main()

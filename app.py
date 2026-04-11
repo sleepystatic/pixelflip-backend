@@ -8,6 +8,7 @@ import json
 import secrets
 import hashlib
 import psycopg2
+from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
 from functools import wraps
 import requests
@@ -18,6 +19,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
+
+try:
+    from scraper_multi_user import SCRAPING_USERS, resolve_selenium_remote_url
+except Exception:
+    SCRAPING_USERS = set()
+
+    def resolve_selenium_remote_url():
+        return (os.getenv('SELENIUM_REMOTE_URL') or '').strip() or None
 
 app = Flask(__name__)
 
@@ -376,7 +385,10 @@ def _detect_local_browser_binary():
 def scraper_health(user_id):
     if request.method == 'OPTIONS':
         return '', 200
-    remote_url = os.getenv('SELENIUM_REMOTE_URL', '').strip()
+    try:
+        remote_url = (resolve_selenium_remote_url() or os.getenv('SELENIUM_REMOTE_URL') or '').strip()
+    except Exception:
+        remote_url = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
     local_browser = _detect_local_browser_binary()
     offerup_mode = "remote" if remote_url else ("local" if local_browser else "disabled")
     return jsonify({
@@ -416,6 +428,7 @@ def get_status(user_id):
                 "subscription_status": "inactive",
                 "next_check_timestamp": 0,
                 "listings_count": 0,
+                "scraping_in_progress": False,
                 "recent_activity": []
             })
 
@@ -430,14 +443,19 @@ def get_status(user_id):
         last_raw = us.get('last_scraped_at')
         last_scraped = _epoch_from_last_scraped(last_raw)
 
-        # Calculate when the next check SHOULD be
+        # Calculate when the next check SHOULD be (countdown starts after last scrape *finished*)
         next_check_timestamp = last_scraped + interval_secs
 
-        # If the timer has already run out, keep it at 'current'
-        # so the UI stays at 0:00 instead of showing negative numbers
         current_now = time.time()
-        if current_now > next_check_timestamp:
-            next_check_timestamp = current_now
+        scraping_in_progress = user_id in SCRAPING_USERS
+
+        # While a scrape is running, do not advance the countdown target — the UI pauses until the run completes.
+        if scraping_in_progress:
+            next_check_timestamp_out = None
+        else:
+            next_check_timestamp_out = next_check_timestamp
+            if current_now > next_check_timestamp_out:
+                next_check_timestamp_out = current_now
 
         # 3. Stats
         cursor.execute("SELECT COUNT(*) AS c FROM listings WHERE user_id = %s", (user_id,))
@@ -451,7 +469,8 @@ def get_status(user_id):
             "last_scrape_duration_ms": us.get('last_scrape_duration_ms') or 0,
             "items_scanned_today": 0,
             "matches_found_today": 0,
-            "next_check_timestamp": next_check_timestamp,
+            "next_check_timestamp": next_check_timestamp_out,
+            "scraping_in_progress": scraping_in_progress,
             "recent_activity": user_logs.get(user_id, [])
         })
     finally:
@@ -1104,16 +1123,31 @@ def list_scraped_listings(user_id):
         return jsonify({"error": "Database error"}), 500
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute(
-            """
-            SELECT title, price, link, platform, image_url, location, created_at
-            FROM listings
-            WHERE user_id = %s
-            ORDER BY created_at DESC NULLS LAST
-            LIMIT %s OFFSET %s
-            """,
-            (user_id, limit, offset),
-        )
+        try:
+            cursor.execute(
+                """
+                SELECT title, price, link, platform, image_url, location, created_at, listed_at
+                FROM listings
+                WHERE user_id = %s
+                ORDER BY listed_at DESC NULLS LAST, created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user_id, limit, offset),
+            )
+        except psycopg2.ProgrammingError as e:
+            conn.rollback()
+            if e.pgcode != errorcodes.UNDEFINED_COLUMN and 'listed_at' not in str(e):
+                raise
+            cursor.execute(
+                """
+                SELECT title, price, link, platform, image_url, location, created_at
+                FROM listings
+                WHERE user_id = %s
+                ORDER BY created_at DESC NULLS LAST
+                LIMIT %s OFFSET %s
+                """,
+                (user_id, limit, offset),
+            )
         rows = cursor.fetchall()
         cursor.execute("SELECT COUNT(*) AS c FROM listings WHERE user_id = %s", (user_id,))
         total = cursor.fetchone()['c']
@@ -1122,6 +1156,9 @@ def list_scraped_listings(user_id):
             created = r['created_at']
             if hasattr(created, 'isoformat'):
                 created = created.isoformat()
+            listed = r.get('listed_at')
+            if listed is not None and hasattr(listed, 'isoformat'):
+                listed = listed.isoformat()
             price = r['price']
             if price is not None:
                 try:
@@ -1136,6 +1173,7 @@ def list_scraped_listings(user_id):
                 "image_url": r.get('image_url'),
                 "location": r.get('location'),
                 "created_at": created,
+                "listed_at": listed,
             })
         return jsonify({"listings": out, "total": total, "limit": limit, "offset": offset})
     except Exception as e:

@@ -14,7 +14,8 @@ ALTER TABLE user_settings
 ALTER TABLE listings
   ADD COLUMN IF NOT EXISTS image_url TEXT,
   ADD COLUMN IF NOT EXISTS location TEXT,
-  ADD COLUMN IF NOT EXISTS title_fingerprint TEXT;
+  ADD COLUMN IF NOT EXISTS title_fingerprint TEXT,
+  ADD COLUMN IF NOT EXISTS listed_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_listings_user_created ON listings (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_user_fingerprint ON listings (user_id, title_fingerprint);
