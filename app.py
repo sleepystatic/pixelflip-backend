@@ -12,7 +12,7 @@ from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
 from functools import wraps
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import stripe
 
 from dotenv import load_dotenv
@@ -237,17 +237,21 @@ def require_auth(f):
 # ==========================================
 # IN-MEMORY LOG BUFFER (User-Specific)
 # ==========================================
-# Looks like: { "user_id_123": [{"time": "10:00:00 AM", "message": "Scraping...", "type": "info"}] }
+# Looks like: { "user_id_123": [{"ts": 1712345678.9, "time": "…", "message": "…", "type": "info"}] }
 user_logs = {}
 
 
 def add_log(user_id, message, log_type="info"):
-    """Saves a log to the specific user's buffer to be sent to React"""
+    """Saves a log to the specific user's buffer to be sent to React.
+    `ts` is UTC epoch seconds so the browser can format in the viewer's local timezone."""
     if user_id not in user_logs:
         user_logs[user_id] = []
 
-    timestamp = datetime.now().strftime("%I:%M:%S %p")
-    user_logs[user_id].append({"time": timestamp, "message": message, "type": log_type})
+    now_utc = datetime.now(timezone.utc)
+    ts = now_utc.timestamp()
+    # Legacy `time` kept as UTC label so old cached clients are not misleading vs local `ts` display.
+    time_utc = now_utc.strftime("%I:%M:%S %p UTC")
+    user_logs[user_id].append({"ts": ts, "time": time_utc, "message": message, "type": log_type})
 
     # Keep only the last 50 logs so we don't run out of server memory
     if len(user_logs[user_id]) > 50:

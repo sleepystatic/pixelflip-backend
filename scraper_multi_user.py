@@ -195,6 +195,7 @@ def get_recent_listing_signatures(user_id):
 
 
 def save_listing(user_id, listing):
+    """Persist listing; `console_type` column holds the matched search term (legacy name)."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -289,10 +290,37 @@ def _parse_source_datetime(val):
         return None
 
 
+def _search_term_matches_title(term, title_lower):
+    """Relaxed matching: exact substring, compact (ignore spaces/punctuation), or all words (2+ chars)."""
+    tl = (term or '').lower().strip()
+    if not tl:
+        return False
+    if tl in title_lower:
+        return True
+    compact_term = re.sub(r'[^a-z0-9]', '', tl)
+    compact_title = re.sub(r'[^a-z0-9]', '', title_lower)
+    if len(compact_term) >= 4 and compact_term in compact_title:
+        return True
+    words = [w for w in re.split(r'\s+', tl) if w]
+    if len(words) >= 2:
+        def _word_in_title(w):
+            if len(w) <= 3:
+                return bool(re.search(r'(?<![a-z0-9])' + re.escape(w) + r'(?![a-z0-9])', title_lower))
+            return w in title_lower
+
+        return all(_word_in_title(w) for w in words)
+    if len(words) == 1:
+        w = words[0]
+        if len(w) <= 3:
+            return bool(re.search(r'(?<![a-z0-9])' + re.escape(w) + r'(?![a-z0-9])', title_lower))
+        return w in title_lower
+    return False
+
+
 def check_price_threshold(title, price, search_terms):
     title_lower = title.lower()
     for term, thresholds in sorted(search_terms.items(), key=lambda x: len(x[0]), reverse=True):
-        if term.lower() in title_lower:
+        if _search_term_matches_title(term, title_lower):
             if thresholds['min'] <= price <= thresholds['max']:
                 return True, term, thresholds['max']
     return False, None, None
@@ -300,12 +328,16 @@ def check_price_threshold(title, price, search_terms):
 
 def is_excluded(title, price, exclusions):
     title_lower = title.lower()
-    if price < 10: return True
+    # Optional floor (default: off). The old hard-coded $10 rule dropped $0–$9 deals and "free" posts.
+    try:
+        min_listing = float(os.getenv('MIN_LISTING_PRICE', '0'))
+    except ValueError:
+        min_listing = 0.0
+    if min_listing > 0 and price < min_listing:
+        return True
     for keyword in exclusions:
-        if keyword.lower() in title_lower: return True
-    game_patterns = [r'\d+\s*games?', r'game\s*(lot|bundle|collection)', r'(ds|3ds|gameboy|gba)\s*games']
-    for pattern in game_patterns:
-        if re.search(pattern, title_lower): return True
+        if keyword.lower() in title_lower:
+            return True
     return False
 
 
@@ -324,62 +356,82 @@ def _is_recent_timestamp(dt_text, max_age_days):
 
 
 # ===========================
-# AI IMAGE DETECTION
+# OPTIONAL AI IMAGE FILTER (GOOGLE VISION)
 # ===========================
 GOOGLE_VISION_API_KEY = os.getenv('GOOGLE_VISION_API_KEY')
 
 
 def _ai_enabled_for_platform(platform_name):
-    """Comma list in AI_IMAGE_FILTER_PLATFORMS, e.g. offerup,craigslist,mercari (lowercase).
-    Default: offerup only — Vision console heuristics often reject couches/phones on CL/Mercari."""
-    raw = os.getenv('AI_IMAGE_FILTER_PLATFORMS', 'offerup').lower()
+    """Comma-separated platforms (lowercase) that may use Vision when configured. Empty = none."""
+    raw = os.getenv('AI_IMAGE_FILTER_PLATFORMS', '').lower()
     allowed = {p.strip() for p in raw.split(',') if p.strip()}
     return platform_name.lower() in allowed
 
 
+def _vision_label_substrings_from_env(var_name):
+    raw = os.getenv(var_name, '').strip()
+    if not raw:
+        return []
+    return [x.strip().lower() for x in raw.split(',') if x.strip()]
+
+
+def _vision_blob_matches_substrings(blob_items, substrings):
+    """Each substring may match anywhere in any label/object string (Vision returns short phrases)."""
+    if not substrings:
+        return False
+    for item in blob_items:
+        for frag in substrings:
+            if frag in item:
+                return True
+    return False
+
+
 def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_callback=None, user_id=None, platform_name=''):
-    if not _ai_enabled_for_platform(platform_name or 'offerup'):
+    if not _ai_enabled_for_platform(platform_name or ''):
         return True
-    if not ai_enabled or not GOOGLE_VISION_API_KEY or not image_url: return True
+    if not ai_enabled or not GOOGLE_VISION_API_KEY or not image_url:
+        return True
+
+    positives = _vision_label_substrings_from_env('AI_IMAGE_POSITIVE_LABELS')
+    negatives = _vision_label_substrings_from_env('AI_IMAGE_NEGATIVE_LABELS')
+    # General marketplace default: no hardcoded category — skip Vision unless you configure labels.
+    if not positives and not negatives:
+        return True
 
     try:
         url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
         payload = {"requests": [{"image": {"source": {"imageUri": image_url}},
-                                 "features": [{"type": "LABEL_DETECTION", "maxResults": 10},
-                                              {"type": "OBJECT_LOCALIZATION", "maxResults": 5}]}]}
+                                 "features": [{"type": "LABEL_DETECTION", "maxResults": 15},
+                                              {"type": "OBJECT_LOCALIZATION", "maxResults": 8}]}]}
         response = requests.post(url, json=payload, timeout=10)
 
-        if response.status_code != 200: return True
+        if response.status_code != 200:
+            return True
 
         result = response.json()
-        if 'responses' not in result or not result['responses']: return True
+        if 'responses' not in result or not result['responses']:
+            return True
 
         data = result['responses'][0]
         labels = [label['description'].lower() for label in data.get('labelAnnotations', [])]
         objects = [obj['name'].lower() for obj in data.get('localizedObjectAnnotations', [])]
         all_detected = labels + objects
 
-        console_keywords = ['handheld game console', 'game console', 'gaming console', 'portable game console',
-                            'video game console', 'electronics']
-        non_console_keywords = ['game cartridge', 'cartridge', 'game case', 'cd', 'dvd', 'disc', 'box', 'packaging',
-                                'charger', 'cable', 'paper', 'book', 'document']
-
-        has_console = any(kw in all_detected for kw in console_keywords)
-        has_non_console = any(kw in all_detected for kw in non_console_keywords)
+        has_pos = _vision_blob_matches_substrings(all_detected, positives) if positives else True
+        has_neg = _vision_blob_matches_substrings(all_detected, negatives) if negatives else False
 
         if ai_strictness == 'strict':
-            passed = has_console and not has_non_console
+            passed = (has_pos if positives else True) and not has_neg
         elif ai_strictness == 'balanced':
-            passed = True if not (has_non_console and not has_console) else False
+            passed = (not has_neg) if not positives else (has_pos or not has_neg)
         else:
-            passed = not (has_non_console and not has_console)
+            passed = not has_neg
 
-        # Log AI rejections to the dashboard
-        if not passed and log_callback and user_id:
-            log_callback(user_id, f"AI Filtered Image: Found {all_detected[0]}", "error")
+        if not passed and log_callback and user_id and all_detected:
+            log_callback(user_id, f"AI image filter: labels {all_detected[:5]}", "error")
 
         return passed
-    except:
+    except Exception:
         return True
 
 
@@ -435,7 +487,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     listings = []
     sites_env = os.getenv('CRAIGSLIST_SITES', 'stockton,sacramento,sfbay,modesto')
     subdomains = [s.strip() for s in sites_env.split(',') if s.strip()]
-    # sss = all for sale (couches, phones, games). vga = video games only — too narrow for mixed search terms.
+    # `sss` = general for-sale; narrow category codes exclude many real listings — override with CRAIGSLIST_SEARCH_CAT if needed.
     cl_cat = os.getenv('CRAIGSLIST_SEARCH_CAT', 3 * 's').strip() or (3 * 's')
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
     fetch_detail = os.getenv('CRAIGSLIST_FETCH_DETAIL', '1').strip().lower() not in ('0', 'false', 'no')
@@ -490,7 +542,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         if not price or not link:
                             continue
 
-                        meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
+                        meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                         if not meets_threshold:
                             continue
                         if is_excluded(title, price, exclusions):
@@ -501,7 +553,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                             'price': price,
                             'link': link,
                             'platform': 'Craigslist',
-                            'console_type': console_type,
+                            'console_type': matched_term,
                             'threshold': max_price,
                             'image_url': None,
                             'listed_at': _parse_source_datetime(dt_text) if dt_text else None,
@@ -699,7 +751,7 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     link = row['link']
                     image_url = row.get('image_url')
 
-                    meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
+                    meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                     if not meets_threshold:
                         continue
                     if is_excluded(title, price, exclusions):
@@ -715,7 +767,7 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                         'price': price,
                         'link': link,
                         'platform': 'Mercari',
-                        'console_type': console_type,
+                        'console_type': matched_term,
                         'threshold': max_price,
                         'image_url': image_url,
                         'listed_at': row.get('listed_at'),
@@ -841,7 +893,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         price = extract_price(item.text)
 
                         if not price or not link or not title: continue
-                        meets_threshold, console_type, max_price = check_price_threshold(title, price, search_terms)
+                        meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                         if not meets_threshold: continue
                         if is_excluded(title, price, exclusions): continue
 
@@ -859,7 +911,7 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
 
                         listings.append({
                             'title': title, 'price': price, 'link': link, 'platform': 'OfferUp',
-                            'console_type': console_type, 'threshold': max_price,
+                            'console_type': matched_term, 'threshold': max_price,
                             'image_url': image_url,
                             'location': f'OfferUp · {zip_code} ({search_radius} mi)'
                         })
@@ -870,9 +922,10 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 pass
     except Exception as e:
         if log_callback:
+            detail = (str(e) or '').replace('\n', ' ')[:220]
             log_callback(
                 user_id,
-                f"OfferUp unavailable: {e.__class__.__name__}. Check Chrome/driver install on server.",
+                f"OfferUp unavailable: {e.__class__.__name__}: {detail}. Check SELENIUM_REMOTE_URL / Browserless token.",
                 "error"
             )
     finally:
@@ -965,7 +1018,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             if log_callback:
                 log_callback(
                     user_id,
-                    f"DEAL FOUND: {listing['title'][:30]} for ${listing['price']}",
+                    f"New match: {listing['title'][:40]} — ${listing['price']}",
                     "success"
                 )
 
