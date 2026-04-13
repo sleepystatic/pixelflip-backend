@@ -83,26 +83,33 @@ def get_db_connection():
 def get_active_users():
     """Get all users with active scraping enabled"""
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-    # CRITICAL FIX: Only grab users who clicked "Start Scanner" (is_active = TRUE)
     cursor.execute('''
-        SELECT user_id, zip_code, search_radius, platforms, 
-               ai_enabled, ai_strictness, check_interval_minutes
+        SELECT user_id, zip_code, search_radius, platforms,
+               ai_enabled, ai_strictness, check_interval_minutes,
+               plan_tier, is_pro
         FROM user_settings
         WHERE is_active = TRUE
     ''')
 
     users = []
     for row in cursor.fetchall():
+        tier = (row.get('plan_tier') or '').strip().lower()
+        if tier not in ('basic', 'pro'):
+            tier = 'pro' if row.get('is_pro') else 'inactive'
+        # Pro-only AI image pipeline (Basic never runs Vision, regardless of DB flag)
+        eff_ai = bool(row.get('ai_enabled')) and tier == 'pro'
+
         users.append({
-            'user_id': row[0],
-            'zip_code': row[1] or '95212',
-            'search_radius': row[2] or 25,
-            'platforms': row[3] or {'craigslist': True},
-            'ai_enabled': row[4],
-            'ai_strictness': row[5] or 'balanced',
-            'check_interval': row[6] or 10
+            'user_id': row['user_id'],
+            'zip_code': row['zip_code'] or '95212',
+            'search_radius': row['search_radius'] or 25,
+            'platforms': row['platforms'] or {'craigslist': True},
+            'ai_enabled': eff_ai,
+            'ai_strictness': row['ai_strictness'] or 'balanced',
+            'check_interval': row['check_interval_minutes'] or 10,
+            'plan_tier': tier,
         })
 
     cursor.close()
@@ -439,12 +446,12 @@ def check_image_with_ai(image_url, ai_enabled, ai_strictness, debug=False, log_c
 # CRAIGSLIST SCRAPER
 # ===========================
 def _best_craigslist_gallery_image(soup):
-    """Listing detail pages include images.craigslist.org URLs; search result tiles usually have no <img>."""
+    """Listing detail pages include images.craigslist.org URLs; tiles may use lazy attrs instead of src."""
     best = None
     best_area = -1
-    for img in soup.find_all('img', src=True):
-        src = (img.get('src') or '').strip()
-        if 'images.craigslist.org' not in src:
+    for img in soup.find_all('img'):
+        src = _extract_lazy_image_url(img)
+        if not src or 'images.craigslist.org' not in src:
             continue
         if src.startswith('//'):
             src = 'https:' + src
@@ -453,11 +460,54 @@ def _best_craigslist_gallery_image(soup):
         if area > best_area:
             best_area = area
             best = src
-    return best
+    if best:
+        return best
+    og = soup.find('meta', attrs={'property': 'og:image'})
+    if not og:
+        og = soup.find('meta', attrs={'name': 'twitter:image'})
+    if og and og.get('content'):
+        c = (og.get('content') or '').strip()
+        if 'images.craigslist.org' in c:
+            if c.startswith('//'):
+                return 'https:' + c
+            return c
+    return None
+
+
+def _is_craigslist_placeholder_price(price):
+    """CL search (and some ads) use placeholder prices like $1,234."""
+    if price is None:
+        return False
+    try:
+        v = float(price)
+    except (TypeError, ValueError):
+        return False
+    raw = os.getenv('CRAIGSLIST_PLACEHOLDER_PRICES', '1234')
+    for part in raw.split(','):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            if abs(v - float(p)) < 0.01:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _extract_craigslist_price_from_listing_soup(soup):
+    """Real asking price from a listing detail page."""
+    for sel in ('span.price', 'h1.price', '.price'):
+        el = soup.select_one(sel)
+        if el:
+            p = extract_price(el.get_text(' ', strip=True))
+            if p is not None and not _is_craigslist_placeholder_price(p):
+                return p
+    return None
 
 
 def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_sec):
-    """GET the listing detail page for real posted time + gallery image. Returns False to skip this listing."""
+    """GET the listing detail page for posted time, gallery image, and price when the tile omits it."""
     try:
         r = session.get(listing['link'], timeout=22)
         time.sleep(max(0.0, polite_delay_sec))
@@ -474,6 +524,10 @@ def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_
             if not _is_recent_timestamp(dt_text, max_age_days):
                 return False
             listing['listed_at'] = _parse_source_datetime(dt_text)
+        detail_price = _extract_craigslist_price_from_listing_soup(soup)
+        if detail_price is not None:
+            if listing.get('price') is None or _is_craigslist_placeholder_price(listing.get('price')):
+                listing['price'] = detail_price
         img = _best_craigslist_gallery_image(soup)
         if img:
             listing['image_url'] = img
@@ -539,13 +593,10 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         price = extract_price(price_elem.text if price_elem else None)
                         if not price:
                             price = extract_price(item.get_text(" ", strip=True))
-                        if not price or not link:
-                            continue
+                        if _is_craigslist_placeholder_price(price):
+                            price = None
 
-                        meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
-                        if not meets_threshold:
-                            continue
-                        if is_excluded(title, price, exclusions):
+                        if not link:
                             continue
 
                         entry = {
@@ -553,8 +604,8 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                             'price': price,
                             'link': link,
                             'platform': 'Craigslist',
-                            'console_type': matched_term,
-                            'threshold': max_price,
+                            'console_type': None,
+                            'threshold': None,
                             'image_url': None,
                             'listed_at': _parse_source_datetime(dt_text) if dt_text else None,
                             'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)',
@@ -564,11 +615,24 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                             if not _enrich_craigslist_from_detail(session, entry, max_age_days, detail_delay):
                                 continue
                         else:
+                            if not entry.get('price'):
+                                continue
                             try:
                                 img_elem = item.find('img')
                                 entry['image_url'] = _extract_lazy_image_url(img_elem)
                             except Exception:
                                 pass
+
+                        if entry.get('price') is None or _is_craigslist_placeholder_price(entry.get('price')):
+                            continue
+
+                        meets_threshold, matched_term, max_price = check_price_threshold(title, entry['price'], search_terms)
+                        if not meets_threshold:
+                            continue
+                        if is_excluded(title, entry['price'], exclusions):
+                            continue
+                        entry['console_type'] = matched_term
+                        entry['threshold'] = max_price
 
                         if not check_image_with_ai(
                             entry['image_url'], ai_enabled, ai_strictness, debug, log_callback, user_id, platform_name='craigslist'

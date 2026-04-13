@@ -101,6 +101,103 @@ def _subscription_is_entitled(status):
     return status in ('active', 'trialing')
 
 
+def _first_stripe_price_id_from_env(*keys):
+    """First non-empty Stripe Price id from env (supports comma-separated lists)."""
+    for key in keys:
+        raw = (os.getenv(key) or '').strip()
+        for part in raw.split(','):
+            p = part.strip()
+            if p:
+                return p
+    return None
+
+
+def _stripe_price_to_tier(price_id):
+    """Map Stripe Price id to basic | pro (defaults to pro if unknown)."""
+    if not price_id:
+        return 'pro'
+    pid = str(price_id).strip()
+    basic_ids = {x.strip() for x in os.getenv('STRIPE_PRICE_BASIC_ID', '').split(',') if x.strip()}
+    pro_ids = {x.strip() for x in os.getenv('STRIPE_PRICE_PRO_ID', '').split(',') if x.strip()}
+    legacy = os.getenv('STRIPE_PRICE_ID', '').strip()
+    if pid in basic_ids:
+        return 'basic'
+    if pid in pro_ids:
+        return 'pro'
+    if legacy and pid == legacy:
+        return 'pro'
+    return 'pro'
+
+
+def _effective_plan_tier(us):
+    if not us:
+        return 'inactive'
+    pt = (us.get('plan_tier') or '').strip().lower()
+    if pt in ('basic', 'pro'):
+        return pt
+    if us.get('is_pro'):
+        return 'pro'
+    return 'inactive'
+
+
+def _plan_limits(tier):
+    t = (tier or 'inactive').lower()
+    if t == 'pro':
+        return {'max_search_terms': 999, 'ai_image_allowed': True}
+    if t == 'basic':
+        return {'max_search_terms': 3, 'ai_image_allowed': False}
+    try:
+        # Pre-beta / trial: allow a few terms before checkout; set to 0 in production if you require payment first.
+        inactive_cap = int(os.getenv('MAX_SEARCH_TERMS_INACTIVE', '3'))
+    except ValueError:
+        inactive_cap = 3
+    return {'max_search_terms': max(0, inactive_cap), 'ai_image_allowed': False}
+
+
+def _effective_limits(us):
+    """Tier defaults, with optional per-row overrides from Supabase (set manually or via admin)."""
+    tier = _effective_plan_tier(us)
+    lim = dict(_plan_limits(tier))
+    if not us:
+        return lim
+    o = us.get('max_search_terms_override')
+    if o is not None:
+        try:
+            lim['max_search_terms'] = max(0, int(o))
+        except (TypeError, ValueError):
+            pass
+    oa = us.get('ai_image_allowed_override')
+    if oa is not None:
+        lim['ai_image_allowed'] = bool(oa)
+    return lim
+
+
+def _plan_display_name(tier):
+    t = (tier or 'inactive').lower()
+    if t == 'basic':
+        return 'Basic Scanner'
+    if t == 'pro':
+        return 'Pro Scanner'
+    return None
+
+
+def _billing_config_response():
+    def _f(key, default):
+        try:
+            return float(os.getenv(key, str(default)))
+        except ValueError:
+            return float(default)
+
+    prebeta = os.getenv('PREBETA_ACTIVE', '').lower() in ('1', 'true', 'yes')
+    return {
+        'prebeta_active': prebeta,
+        'price_basic_standard': _f('DISPLAY_PRICE_BASIC_STANDARD', 9.99),
+        'price_pro_standard': _f('DISPLAY_PRICE_PRO_STANDARD', 19.99),
+        'price_basic_prebeta': _f('DISPLAY_PRICE_BASIC_PREBETA', 4.99),
+        'price_pro_prebeta': _f('DISPLAY_PRICE_PRO_PREBETA', 9.99),
+    }
+
+
 def _apply_subscription_row(cursor, user_id, is_pro, period_end=None, cancel_at_end=None, customer_id=None, sub_id=None):
     """Keep is_pro, subscription_status, and Stripe ids in sync."""
     sets = ["is_pro = %s", "subscription_status = %s"]
@@ -121,34 +218,41 @@ def _apply_subscription_row(cursor, user_id, is_pro, period_end=None, cancel_at_
     cursor.execute(f"UPDATE user_settings SET {', '.join(sets)} WHERE user_id = %s", vals)
 
 
-def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, cancel_at_end):
+def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, cancel_at_end, plan_tier='pro'):
     """
-    Set Pro + active subscription after Checkout or webhook.
-    Inserts a minimal user_settings row if none exists (common for brand-new accounts).
+    Upsert subscription after Checkout or webhook.
+    plan_tier: basic | pro — controls AI image access and search-term limits.
     """
     platforms = json.dumps({"craigslist": True, "offerup": True, "mercari": True})
+    plan_tier = (plan_tier or 'pro').lower()
+    if plan_tier not in ('basic', 'pro'):
+        plan_tier = 'pro'
+    is_pro = plan_tier == 'pro'
+    ai_on = is_pro
     cursor.execute(
         """
         INSERT INTO user_settings (
             user_id, zip_code, search_radius, platforms, ai_enabled,
             check_interval_minutes, ai_strictness,
-            is_pro, subscription_status,
+            is_pro, subscription_status, plan_tier,
             stripe_customer_id, stripe_subscription_id,
             subscription_current_period_end, subscription_cancel_at_period_end
         )
         VALUES (
-            %s, '95212', 25, %s::jsonb, TRUE, 10, 'balanced',
-            TRUE, 'active', %s, %s, %s, %s
+            %s, '95212', 25, %s::jsonb, %s, 10, 'balanced',
+            %s, 'active', %s, %s, %s, %s, %s
         )
         ON CONFLICT (user_id) DO UPDATE SET
-            is_pro = TRUE,
+            is_pro = EXCLUDED.is_pro,
+            ai_enabled = EXCLUDED.ai_enabled,
             subscription_status = 'active',
+            plan_tier = EXCLUDED.plan_tier,
             stripe_customer_id = EXCLUDED.stripe_customer_id,
             stripe_subscription_id = EXCLUDED.stripe_subscription_id,
             subscription_current_period_end = EXCLUDED.subscription_current_period_end,
             subscription_cancel_at_period_end = EXCLUDED.subscription_cancel_at_period_end
         """,
-        (user_id, platforms, customer_id, sub_id, period_end, cancel_at_end),
+        (user_id, platforms, ai_on, is_pro, plan_tier, customer_id, sub_id, period_end, cancel_at_end),
     )
 
 # Wildcard origin + supports_credentials=True is invalid per CORS; browsers drop Allow-Origin on preflight.
@@ -521,12 +625,17 @@ def handle_settings(user_id):
                     "check_interval": 10,
                     "thresholds": terms,
                     "excluded_keywords": exclusions,
-                    "ai_detection": True,
+                    "ai_detection": False,
                     "strictness": 3,
                     "subscription_status": "inactive",
                     "is_pro": False,
+                    "plan_tier": "inactive",
+                    "plan_name": None,
+                    "max_search_terms": _plan_limits('inactive')['max_search_terms'],
+                    "ai_image_allowed": False,
                     "subscription_current_period_end": None,
                     "subscription_cancel_at_period_end": False,
+                    "billing": _billing_config_response(),
                 })
 
             strict_map = {'lenient': 1, 'balanced': 2, 'strict': 3}
@@ -534,6 +643,10 @@ def handle_settings(user_id):
             sub_display = 'active' if is_pro else (us.get('subscription_status') or 'inactive')
             if is_pro:
                 sub_display = 'active'
+            pt = _effective_plan_tier(us)
+            limits = _effective_limits(us)
+            ai_allowed = limits['ai_image_allowed']
+            ai_show = bool(us.get('ai_enabled')) and ai_allowed
             return jsonify({
                 "platforms": us['platforms'] if us['platforms'] else {"craigslist": True, "offerup": True,
                                                                       "mercari": True},
@@ -542,18 +655,36 @@ def handle_settings(user_id):
                 "check_interval": us['check_interval_minutes'],
                 "thresholds": terms,
                 "excluded_keywords": exclusions,
-                "ai_detection": us['ai_enabled'],
+                "ai_detection": ai_show,
                 "strictness": strict_map.get(us['ai_strictness'], 2),
                 "subscription_status": sub_display,
                 "is_pro": is_pro,
+                "plan_tier": pt,
+                "plan_name": _plan_display_name(pt),
+                "max_search_terms": limits['max_search_terms'],
+                "ai_image_allowed": ai_allowed,
                 "subscription_current_period_end": us.get('subscription_current_period_end'),
                 "subscription_cancel_at_period_end": bool(us.get('subscription_cancel_at_period_end')),
+                "billing": _billing_config_response(),
             })
 
         elif request.method == 'POST':
             data = request.json
+            cursor.execute("SELECT * FROM user_settings WHERE user_id = %s;", (user_id,))
+            us_row = cursor.fetchone()
+            limits = _effective_limits(us_row)
+            thresholds_in = data.get('thresholds') or {}
+            if len(thresholds_in) > limits['max_search_terms']:
+                return jsonify({
+                    "error": f"Your plan allows up to {limits['max_search_terms']} search terms.",
+                }), 400
+
             strict_map = {1: 'lenient', 2: 'balanced', 3: 'strict'}
             strict_text = strict_map.get(data.get('strictness', 2), 'balanced')
+
+            want_ai = bool(data.get('ai_detection', False))
+            if not limits['ai_image_allowed']:
+                want_ai = False
 
             # UPSERT Core Settings
             cursor.execute("""
@@ -564,12 +695,12 @@ def handle_settings(user_id):
                     ai_enabled = EXCLUDED.ai_enabled, check_interval_minutes = EXCLUDED.check_interval_minutes, ai_strictness = EXCLUDED.ai_strictness;
             """, (
             user_id, data.get('zip_code', '95212'), data.get('distance', 25), json.dumps(data.get('platforms', {})),
-            data.get('ai_detection', True), data.get('check_interval', 10), strict_text))
+            want_ai, data.get('check_interval', 10), strict_text))
 
             # REPLACE Search Terms
             # POST: Save both max and min to the database
             cursor.execute("DELETE FROM user_search_terms WHERE user_id = %s;", (user_id,))
-            for term, prices in data.get('thresholds', {}).items():
+            for term, prices in thresholds_in.items():
                 cursor.execute(
                     "INSERT INTO user_search_terms (user_id, search_term, max_price, min_price) VALUES (%s, %s, %s, %s);",
                     (user_id, term, prices.get('max', 0), prices.get('min', 0))
@@ -581,7 +712,9 @@ def handle_settings(user_id):
                 cursor.execute("INSERT INTO user_exclusions (user_id, keyword) VALUES (%s, %s);", (user_id, keyword))
 
             conn.commit()
-            return jsonify({"success": True, "settings": data})
+            out = dict(data)
+            out['ai_detection'] = want_ai
+            return jsonify({"success": True, "settings": out})
 
     except Exception as e:
         conn.rollback()
@@ -673,10 +806,13 @@ def stripe_webhook():
             customer_id = sess.get('customer')
             sub_id = sess.get('subscription')
             if user_id and customer_id and sub_id:
-                sub = stripe.Subscription.retrieve(sub_id)
+                sub = stripe.Subscription.retrieve(sub_id, expand=['items.data.price'])
                 pe = sub.get('current_period_end')
                 ca = bool(sub.get('cancel_at_period_end'))
-                _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca)
+                items = sub.get('items', {}).get('data') or []
+                price_id = items[0].get('price', {}).get('id') if items else None
+                tier = _stripe_price_to_tier(price_id)
+                _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca, plan_tier=tier)
             conn.commit()
 
         elif etype == 'customer.subscription.updated':
@@ -686,15 +822,38 @@ def stripe_webhook():
             pe = sub.get('current_period_end')
             ca = bool(sub.get('cancel_at_period_end'))
             entitled = _subscription_is_entitled(status)
+            items = sub.get('items', {}).get('data') or []
+            price_id = items[0].get('price', {}).get('id') if items else None
+            tier = _stripe_price_to_tier(price_id) if entitled else 'inactive'
+            is_pro = tier == 'pro'
             cursor.execute(
                 "SELECT user_id FROM user_settings WHERE stripe_customer_id = %s LIMIT 1",
                 (customer_id,)
             )
             row = cursor.fetchone()
             if row:
-                _apply_subscription_row(
-                    cursor, row['user_id'], entitled,
-                    period_end=pe, cancel_at_end=ca, sub_id=sub.get('id')
+                cursor.execute(
+                    """
+                    UPDATE user_settings SET
+                        is_pro = %s,
+                        subscription_status = %s,
+                        plan_tier = %s,
+                        ai_enabled = %s,
+                        subscription_current_period_end = %s,
+                        subscription_cancel_at_period_end = %s,
+                        stripe_subscription_id = COALESCE(%s, stripe_subscription_id)
+                    WHERE user_id = %s
+                    """,
+                    (
+                        is_pro,
+                        'active' if entitled else 'inactive',
+                        tier,
+                        is_pro,
+                        pe,
+                        ca,
+                        sub.get('id'),
+                        row['user_id'],
+                    ),
                 )
             conn.commit()
 
@@ -712,6 +871,8 @@ def stripe_webhook():
                     UPDATE user_settings SET
                         is_pro = FALSE,
                         subscription_status = 'inactive',
+                        plan_tier = 'inactive',
+                        ai_enabled = FALSE,
                         stripe_subscription_id = NULL,
                         subscription_current_period_end = NULL,
                         subscription_cancel_at_period_end = FALSE
@@ -934,15 +1095,32 @@ def request_email_change(user_id):
             cursor.close()
         conn.close()
 
+
+@app.route('/api/billing/config', methods=['GET', 'OPTIONS'])
+@app.route('/billing/config', methods=['GET', 'OPTIONS'])
+def billing_config():
+    """Display prices + pre-beta flag for the dashboard (no auth)."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    return jsonify(_billing_config_response())
+
+
 @app.route('/api/create-checkout-session', methods=['POST', 'OPTIONS'])
 @app.route('/create-checkout-session', methods=['POST', 'OPTIONS'])
 @require_auth
 def create_checkout(user_id):
     if request.method == 'OPTIONS':
         return '', 200
-    price_id = os.getenv('STRIPE_PRICE_ID')
+    data = request.get_json(silent=True) or {}
+    plan = (data.get('plan') or 'pro').lower()
+    if plan == 'basic':
+        price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID', 'STRIPE_PRICE_ID')
+    else:
+        price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_PRO_ID', 'STRIPE_PRICE_ID')
     if not price_id:
-        return jsonify({"error": "STRIPE_PRICE_ID not configured"}), 500
+        return jsonify({
+            "error": "Stripe price not configured. Set STRIPE_PRICE_BASIC_ID and STRIPE_PRICE_PRO_ID (or legacy STRIPE_PRICE_ID).",
+        }), 500
     if not stripe.api_key:
         return jsonify({"error": "STRIPE_SECRET_KEY not configured"}), 500
     base = _frontend_base_url()
@@ -951,7 +1129,7 @@ def create_checkout(user_id):
             mode='subscription',
             line_items=[{'price': price_id, 'quantity': 1}],
             client_reference_id=user_id,
-            metadata={'user_id': user_id},
+            metadata={'user_id': user_id, 'plan': plan},
             success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{base}/?checkout=canceled",
             allow_promotion_codes=True,
@@ -1002,26 +1180,24 @@ def complete_checkout(user_id):
     sub_raw = sess.get('subscription')
     if not sub_raw:
         return jsonify({"error": "No subscription on session"}), 400
-    if isinstance(sub_raw, str):
-        sub_id = sub_raw
-        sub = stripe.Subscription.retrieve(sub_id)
-        pe = sub.get('current_period_end')
-        ca = bool(sub.get('cancel_at_period_end'))
-    else:
-        # Expanded Subscription object (StripeObject behaves like a mapping)
-        sub_id = sub_raw.get('id')
-        pe = sub_raw.get('current_period_end')
-        ca = bool(sub_raw.get('cancel_at_period_end'))
+    sub_id = sub_raw if isinstance(sub_raw, str) else sub_raw.get('id')
 
     if not customer_id or not sub_id:
         return jsonify({"error": "Missing customer or subscription"}), 400
+
+    sub = stripe.Subscription.retrieve(sub_id, expand=['items.data.price'])
+    pe = sub.get('current_period_end')
+    ca = bool(sub.get('cancel_at_period_end'))
+    items = sub.get('items', {}).get('data') or []
+    price_id = items[0].get('price', {}).get('id') if items else None
+    tier = _stripe_price_to_tier(price_id)
 
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Database error"}), 500
     try:
         cursor = conn.cursor()
-        _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca)
+        _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca, plan_tier=tier)
         conn.commit()
         return jsonify({"success": True, "subscription_status": "active"})
     except Exception as e:
