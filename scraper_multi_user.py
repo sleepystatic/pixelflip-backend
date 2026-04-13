@@ -41,9 +41,19 @@ def resolve_selenium_remote_url():
     base = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
     if not base:
         return None
+    # Common .env mistake: value includes "SELENIUM_REMOTE_URL=" prefix.
+    if '=' in base and base.lower().startswith('selenium_remote_url='):
+        base = base.split('=', 1)[1].strip()
+    # Strip wrapping quotes from env values.
+    if (base.startswith('"') and base.endswith('"')) or (base.startswith("'") and base.endswith("'")):
+        base = base[1:-1].strip()
+    # Common typo: duplicated scheme (https://https://...)
+    base = re.sub(r'^(https?://)(https?://)', r'\2', base, flags=re.I)
     token = (os.getenv('BROWSERLESS_TOKEN') or os.getenv('BROWSERLESS_API_KEY') or '').strip()
     try:
         p = urlparse(base)
+        if p.scheme not in ('http', 'https') or not p.netloc:
+            return None
         netloc_lower = (p.netloc or '').lower()
         if not token or 'browserless' not in netloc_lower:
             return base
@@ -888,6 +898,70 @@ def _mercari_page_source_via_selenium(term):
                 pass
 
 
+def _mercari_items_via_selenium(term):
+    """Rendered DOM fallback when Mercari blocks plain HTTP."""
+    driver = None
+    items = []
+    try:
+        remote = resolve_selenium_remote_url()
+        if not remote:
+            return items
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.chrome.options import Options
+        chrome_options = Options()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument(
+            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        driver = webdriver.Remote(command_executor=remote, options=chrome_options)
+        url = f"https://www.mercari.com/us/search/?keyword={quote_plus(term)}&sort=created_time&order=desc"
+        driver.get(url)
+        time.sleep(5)
+        for _ in range(2):
+            driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+            time.sleep(2)
+
+        anchors = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
+        for a in anchors[:100]:
+            try:
+                href = a.get_attribute('href') or ''
+                if not href or '/item/' not in href:
+                    continue
+                title = (a.get_attribute('aria-label') or a.text or '').strip()
+                text_blob = a.text or ''
+                price = extract_price(text_blob)
+                if not (title and price):
+                    continue
+                image_url = None
+                try:
+                    img = a.find_element(By.TAG_NAME, 'img')
+                    image_url = img.get_attribute('src') or img.get_attribute('data-src')
+                except Exception:
+                    pass
+                items.append({
+                    'title': title,
+                    'price': price,
+                    'link': href if href.startswith('http') else f"https://www.mercari.com{href}",
+                    'image_url': image_url,
+                    'listed_at': None,
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Mercari selenium DOM fetch: {e}", flush=True)
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    return _mercari_dedupe_raw(items)
+
+
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
                             debug=False, log_callback=None):
     listings = []
@@ -912,6 +986,8 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
             for url in urls:
                 response = requests.get(url, headers=headers, timeout=20)
                 if response.status_code != 200:
+                    if debug and log_callback:
+                        log_callback(user_id, f"Mercari '{term}': HTTP {response.status_code} from {urlparse(url).path}", "error")
                     continue
                 html = response.text or ''
                 raw_items = _mercari_collect_from_html(html)
@@ -927,6 +1003,8 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     log_callback(user_id, f"Mercari '{term}': empty from HTTP; trying remote browser…", "info")
                 html = _mercari_page_source_via_selenium(term)
                 raw_items = _mercari_collect_from_html(html) or _mercari_items_from_json_ld(html)
+                if not raw_items:
+                    raw_items = _mercari_items_via_selenium(term)
             if not raw_items:
                 html = _mercari_fetch_with_scrapingfish(urls[0])
                 if html:
@@ -1061,9 +1139,10 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
             driver = webdriver.Chrome(service=service, options=chrome_options)
 
         # STEALTH HANDSHAKE
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
+        if hasattr(driver, "execute_cdp_cmd"):
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            })
 
         for term in search_terms.keys():
             try:
