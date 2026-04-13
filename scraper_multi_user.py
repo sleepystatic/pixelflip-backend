@@ -1318,6 +1318,10 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             scrape_mercari_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                     user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback))
 
+    skipped_seen_or_link_blocked = 0
+    skipped_fingerprint_blocked = 0
+    skipped_recent_dupe = 0
+    saved_count = 0
     new_listings = []
     cycle_fp_to_prices = {}
     for listing in all_listings:
@@ -1327,8 +1331,10 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         price = float(listing.get('price') or 0)
 
         if link in seen_listings or link in blocked_links:
+            skipped_seen_or_link_blocked += 1
             continue
         if fp and fp in blocked_fingerprints:
+            skipped_fingerprint_blocked += 1
             continue
 
         # Fuzzy-ish duplicate gate across marketplaces:
@@ -1336,10 +1342,12 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         recent_prices = recent_fp_to_prices.get(fp, [])
         cycle_prices = cycle_fp_to_prices.get(fp, [])
         if fp and any(abs(price - p) <= 10 for p in recent_prices + cycle_prices):
+            skipped_recent_dupe += 1
             continue
 
         if save_listing(user_id, listing):
             new_listings.append(listing)
+            saved_count += 1
             cycle_fp_to_prices.setdefault(fp, []).append(price)
             # Send the success log straight to the UI!
             if log_callback:
@@ -1348,6 +1356,19 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
                     f"New match: {listing['title'][:40]} — ${listing['price']}",
                     "success"
                 )
+
+    if debug and log_callback:
+        log_callback(
+            user_id,
+            (
+                f"Filter summary: candidates={len(all_listings)} "
+                f"saved={saved_count} "
+                f"seen_or_link_blocked={skipped_seen_or_link_blocked} "
+                f"fingerprint_blocked={skipped_fingerprint_blocked} "
+                f"recent_dupe={skipped_recent_dupe}"
+            ),
+            "info",
+        )
 
     if log_callback and len(new_listings) == 0:
         log_callback(user_id, "Scan complete. No new matches found.", "info")
