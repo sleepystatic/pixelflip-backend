@@ -271,6 +271,11 @@ _cors_origins = [
     "http://localhost:3001",           # Local Dev (Your current port)
     "http://127.0.0.1:3001"            # Local Dev (Alternative)
 ]
+for _o in (os.getenv("CORS_ORIGINS") or "").split(","):
+    _o = _o.strip()
+    if _o and _o not in _cors_origins:
+        _cors_origins.append(_o)
+
 CORS(
     app,
     resources={r"/*": {"origins": _cors_origins}},
@@ -540,8 +545,10 @@ def get_status(user_id):
                 "recent_activity": []
             })
 
-        # 1. Permission & State
-        is_pro = us.get('is_pro', False)
+        # 1. Permission & State (Basic tier is is_pro=False but subscription_status may still be 'active')
+        is_pro = bool(us.get('is_pro'))
+        ss_raw = (us.get('subscription_status') or '').strip().lower()
+        subscription_entitled = ss_raw in ('active', 'trialing') or is_pro
         is_running = us.get('is_active', False)
 
         # 2. Timer Logic (Always active)
@@ -572,7 +579,7 @@ def get_status(user_id):
         return jsonify({
             "status": "running" if is_running else "stopped",
             "running": is_running,
-            "subscription_status": "active" if is_pro else "inactive",
+            "subscription_status": "active" if subscription_entitled else "inactive",
             "listings_count": listings_count,
             "last_scrape_duration_ms": us.get('last_scrape_duration_ms') or 0,
             "items_scanned_today": 0,

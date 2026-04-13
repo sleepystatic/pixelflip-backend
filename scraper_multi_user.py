@@ -10,7 +10,7 @@ import requests
 import psycopg2
 from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, quote_plus
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -673,9 +673,9 @@ def _mercari_items_from_next_data(html_text):
                             amt = price_obj
                         if amt is not None:
                             try:
-                                a = float(amt)
-                                # Mercari often stores price in cents as a whole number
-                                price = (a / 100.0) if (a >= 100 and a == int(a) and a < 1000000) else a
+                                # Treat integral values as dollars by default; false cent conversion
+                                # was filtering real listings out by dropping price 100x.
+                                price = float(amt)
                             except (TypeError, ValueError):
                                 price = extract_price(str(amt))
                             if price:
@@ -748,6 +748,112 @@ def _mercari_collect_from_html(html_text):
     return _mercari_dedupe_raw(raw_items)
 
 
+def _mercari_items_from_json_ld(html_text):
+    out = []
+    try:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        tags = soup.find_all('script', attrs={'type': 'application/ld+json'})
+        for tag in tags:
+            raw = (tag.string or tag.get_text() or '').strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                # Support ItemList and Product-like nodes.
+                if str(node.get('@type', '')).lower() == 'itemlist':
+                    for li in node.get('itemListElement') or []:
+                        item = li.get('item') if isinstance(li, dict) else None
+                        if isinstance(item, dict):
+                            nodes.append(item)
+                    continue
+                name = (node.get('name') or '').strip()
+                url = (node.get('url') or '').strip()
+                img = node.get('image')
+                if isinstance(img, list):
+                    img = img[0] if img else None
+                if isinstance(img, dict):
+                    img = img.get('url')
+                offers = node.get('offers') if isinstance(node.get('offers'), dict) else {}
+                price_raw = offers.get('price') or node.get('price')
+                try:
+                    price = float(price_raw)
+                except (TypeError, ValueError):
+                    price = extract_price(str(price_raw))
+                listed_at = _parse_source_datetime(node.get('datePosted') or node.get('dateCreated'))
+                if name and url and price:
+                    out.append({
+                        'title': name,
+                        'price': price,
+                        'link': url if url.startswith('http') else f"https://www.mercari.com{url}",
+                        'image_url': img if isinstance(img, str) else None,
+                        'listed_at': listed_at,
+                    })
+    except Exception:
+        pass
+    return out
+
+
+def _mercari_extract_items_from_script_blobs(html_text):
+    """Last-resort parser for embedded JSON blobs with listing card fields."""
+    out = []
+    if not html_text:
+        return out
+    try:
+        blobs = re.findall(r'\{[^{}]*"id"[^{}]*"name"[^{}]*"price"[^{}]*\}', html_text)
+    except Exception:
+        blobs = []
+    for b in blobs[:300]:
+        try:
+            obj = json.loads(b)
+            name = (obj.get('name') or obj.get('title') or '').strip()
+            pid = str(obj.get('id') or obj.get('item_id') or '').strip()
+            if not (name and pid):
+                continue
+            price_raw = obj.get('price')
+            price = float(price_raw) if isinstance(price_raw, (int, float, str)) else None
+            if price is None:
+                continue
+            out.append({
+                'title': name,
+                'price': price,
+                'link': f"https://www.mercari.com/us/item/{pid}/",
+                'image_url': None,
+                'listed_at': _parse_source_datetime(obj.get('created_at') or obj.get('created')),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _mercari_fetch_with_scrapingfish(url):
+    """Optional rendered fetch fallback when Selenium capacity is unavailable."""
+    key = (os.getenv('SCRAPINGFISH_API_KEY') or '').strip()
+    if not key:
+        return ''
+    try:
+        r = requests.get(
+            "https://api.scrapingfish.com/scrape",
+            params={
+                'api_key': key,
+                'url': url,
+                'render_js': 'true',
+                'country': os.getenv('SCRAPINGFISH_COUNTRY', 'us'),
+            },
+            timeout=35,
+        )
+        if r.status_code == 200:
+            return r.text or ''
+    except Exception:
+        pass
+    return ''
+
+
 def _mercari_page_source_via_selenium(term):
     driver = None
     try:
@@ -796,14 +902,37 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
 
     for term in search_terms.keys():
-        url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
+        q = quote_plus(term)
+        urls = [
+            f"https://www.mercari.com/us/search/?keyword={q}&sort=created_time&order=desc",
+            f"https://www.mercari.com/search/?keyword={q}&sort=created_time&order=desc",
+        ]
         try:
-            response = requests.get(url, headers=headers, timeout=20)
-            raw_items = _mercari_collect_from_html(response.text)
+            raw_items = []
+            for url in urls:
+                response = requests.get(url, headers=headers, timeout=20)
+                if response.status_code != 200:
+                    continue
+                html = response.text or ''
+                raw_items = _mercari_collect_from_html(html)
+                if not raw_items:
+                    raw_items = _mercari_items_from_json_ld(html)
+                if not raw_items:
+                    raw_items = _mercari_extract_items_from_script_blobs(html)
+                if raw_items:
+                    break
+
             if not raw_items and resolve_selenium_remote_url():
                 if debug and log_callback:
                     log_callback(user_id, f"Mercari '{term}': empty from HTTP; trying remote browser…", "info")
-                raw_items = _mercari_collect_from_html(_mercari_page_source_via_selenium(term))
+                html = _mercari_page_source_via_selenium(term)
+                raw_items = _mercari_collect_from_html(html) or _mercari_items_from_json_ld(html)
+            if not raw_items:
+                html = _mercari_fetch_with_scrapingfish(urls[0])
+                if html:
+                    if debug and log_callback:
+                        log_callback(user_id, f"Mercari '{term}': trying ScrapingFish rendered HTML…", "info")
+                    raw_items = _mercari_collect_from_html(html) or _mercari_items_from_json_ld(html)
 
             if debug and log_callback:
                 log_callback(user_id, f"Mercari '{term}': scanned {len(raw_items)} rows", "info")
@@ -815,6 +944,10 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     link = row['link']
                     image_url = row.get('image_url')
 
+                    listed_at = row.get('listed_at')
+                    listed_for_age = listed_at.isoformat() if isinstance(listed_at, datetime) else listed_at
+                    if listed_for_age and not _is_recent_timestamp(listed_for_age, max_age_days):
+                        continue
                     meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                     if not meets_threshold:
                         continue
@@ -834,7 +967,7 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                         'console_type': matched_term,
                         'threshold': max_price,
                         'image_url': image_url,
-                        'listed_at': row.get('listed_at'),
+                        'listed_at': listed_at,
                         'location': f'Mercari · {zip_code} ({search_radius} mi)'
                     })
                 except Exception:
