@@ -10,7 +10,7 @@ import requests
 import psycopg2
 from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
-from urllib.parse import urlparse, urlunparse, quote_plus
+from urllib.parse import urlparse, urlunparse, quote_plus, quote
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -37,7 +37,11 @@ def set_user_scraping(user_id, active):
 
 
 def resolve_selenium_remote_url():
-    """Use SELENIUM_REMOTE_URL; if BROWSERLESS_TOKEN is set and the host is browserless without credentials, embed the token (https://TOKEN@chrome.browserless.io/webdriver)."""
+    """
+    Normalize remote WebDriver URL. For Browserless, the API key must be accepted by the server:
+    Selenium's Python client reliably sends userinfo (https://TOKEN@host/...) on the session request;
+    ?token= alone often yields 401 Authorization Required because follow-up requests omit the query.
+    """
     base = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
     if not base:
         return None
@@ -57,17 +61,28 @@ def resolve_selenium_remote_url():
         netloc_lower = (p.netloc or '').lower()
         if 'browserless' not in netloc_lower:
             return base
-        # Browserless Selenium endpoint should be /webdriver.
+
+        hostname = p.hostname or ''
+        port = p.port
+        host_only = f'{hostname}:{port}' if port else hostname
+
         path = (p.path or '').strip()
         if not path or path == '/' or path.endswith('/chrome') or path.endswith('/chromium') or path.endswith('/content'):
             path = '/webdriver'
         if '/webdriver' not in path:
             path = '/webdriver'
-        query = p.query or ''
-        # Prefer query token style for Browserless.
-        if token and 'token=' not in query.lower():
-            query = f"{query}&token={token}" if query else f"token={token}"
-        return urlunparse((p.scheme, p.netloc, path, p.params, query, p.fragment))
+
+        # Already has API key in URL (user:pass@host or token@host)?
+        if p.username is not None and str(p.username).strip() != '':
+            netloc = p.netloc
+            return urlunparse((p.scheme, netloc, path, p.params, p.query, p.fragment))
+
+        if token:
+            safe = quote(token, safe='')
+            netloc = f'{safe}@{host_only}'
+            return urlunparse((p.scheme, netloc, path, p.params, '', p.fragment))
+
+        return urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
     except Exception:
         return base
 
