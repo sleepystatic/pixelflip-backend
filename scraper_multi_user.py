@@ -38,9 +38,12 @@ def set_user_scraping(user_id, active):
 
 def resolve_selenium_remote_url():
     """
-    Normalize remote WebDriver URL. For Browserless, the API key must be accepted by the server:
-    Selenium's Python client reliably sends userinfo (https://TOKEN@host/...) on the session request;
-    ?token= alone often yields 401 Authorization Required because follow-up requests omit the query.
+    Normalize remote WebDriver URL for Browserless.
+
+    Selenium 4 builds Basic auth from URL userinfo as f"{username}:{password}".
+    If you use https://TOKEN@host with no password, urllib parses password as None and Selenium
+    encodes the literal "TOKEN:None" — Browserless rejects that with 401.
+    Always use an explicit empty password: https://TOKEN:@host/webdriver
     """
     base = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
     if not base:
@@ -72,14 +75,19 @@ def resolve_selenium_remote_url():
         if '/webdriver' not in path:
             path = '/webdriver'
 
-        # Already has API key in URL (user:pass@host or token@host)?
+        # User supplied credentials in URL — fix token@host (no password) for Selenium Basic auth.
         if p.username is not None and str(p.username).strip() != '':
-            netloc = p.netloc
+            if p.password is None:
+                safe_user = quote(p.username, safe='')
+                netloc = f'{safe_user}:@{host_only}'
+            else:
+                netloc = p.netloc
             return urlunparse((p.scheme, netloc, path, p.params, p.query, p.fragment))
 
         if token:
             safe = quote(token, safe='')
-            netloc = f'{safe}@{host_only}'
+            # Empty password segment so Selenium sends Basic auth for "token:" not "token:None"
+            netloc = f'{safe}:@{host_only}'
             return urlunparse((p.scheme, netloc, path, p.params, '', p.fragment))
 
         return urlunparse((p.scheme, p.netloc, path, p.params, p.query, p.fragment))
