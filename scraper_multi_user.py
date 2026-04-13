@@ -55,13 +55,19 @@ def resolve_selenium_remote_url():
         if p.scheme not in ('http', 'https') or not p.netloc:
             return None
         netloc_lower = (p.netloc or '').lower()
-        if not token or 'browserless' not in netloc_lower:
+        if 'browserless' not in netloc_lower:
             return base
-        if p.username or p.password:
-            return base
-        new_netloc = f'{token}@{p.netloc}'
-        path = p.path if p.path else '/'
-        return urlunparse((p.scheme, new_netloc, path, p.params, p.query, p.fragment))
+        # Browserless Selenium endpoint should be /webdriver.
+        path = (p.path or '').strip()
+        if not path or path == '/' or path.endswith('/chrome') or path.endswith('/chromium') or path.endswith('/content'):
+            path = '/webdriver'
+        if '/webdriver' not in path:
+            path = '/webdriver'
+        query = p.query or ''
+        # Prefer query token style for Browserless.
+        if token and 'token=' not in query.lower():
+            query = f"{query}&token={token}" if query else f"token={token}"
+        return urlunparse((p.scheme, p.netloc, path, p.params, query, p.fragment))
     except Exception:
         return base
 
