@@ -898,7 +898,7 @@ def _mercari_page_source_via_selenium(term):
                 pass
 
 
-def _mercari_items_via_selenium(term):
+def _mercari_items_via_selenium(term, debug=False, log_callback=None, user_id=None):
     """Rendered DOM fallback when Mercari blocks plain HTTP."""
     driver = None
     items = []
@@ -926,6 +926,10 @@ def _mercari_items_via_selenium(term):
             time.sleep(2)
 
         anchors = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
+        if debug and log_callback and user_id:
+            title = (driver.title or '').strip()
+            cur = (driver.current_url or '').strip()
+            log_callback(user_id, f"Mercari browser page: title='{title[:80]}' url='{cur[:120]}' anchors={len(anchors)}", "info")
         for a in anchors[:100]:
             try:
                 href = a.get_attribute('href') or ''
@@ -1004,7 +1008,11 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                 html = _mercari_page_source_via_selenium(term)
                 raw_items = _mercari_collect_from_html(html) or _mercari_items_from_json_ld(html)
                 if not raw_items:
-                    raw_items = _mercari_items_via_selenium(term)
+                    raw_items = _mercari_items_via_selenium(term, debug=debug, log_callback=log_callback, user_id=user_id)
+                if debug and log_callback and not raw_items:
+                    h = (html or '').lower()
+                    if 'captcha' in h or 'robot' in h or 'blocked' in h or 'cloudflare' in h:
+                        log_callback(user_id, f"Mercari '{term}': browser content appears blocked/challenged.", "error")
             if not raw_items:
                 html = _mercari_fetch_with_scrapingfish(urls[0])
                 if html:
@@ -1158,15 +1166,58 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     time.sleep(2)
 
-                items = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
+                items = []
+                selector_candidates = [
+                    "a[href*='/item/']",
+                    "a[data-testid*='listing']",
+                    "a[data-testid*='feed-item']",
+                    "a[href*='/search/'][href*='cid']",
+                ]
+                for sel in selector_candidates:
+                    try:
+                        nodes = driver.find_elements(By.CSS_SELECTOR, sel)
+                    except Exception:
+                        nodes = []
+                    if nodes:
+                        items = nodes
+                        break
+                if not items:
+                    # Fallback parse from rendered HTML for dynamic markup changes.
+                    try:
+                        soup = BeautifulSoup(driver.page_source or '', 'html.parser')
+                        links = []
+                        for a in soup.select("a[href]"):
+                            href = a.get('href') or ''
+                            if '/item/' in href:
+                                links.append(href if href.startswith('http') else f"https://offerup.com{href}")
+                        # Dummy wrappers with href/text-like access not needed; handle below.
+                        items = links
+                    except Exception:
+                        items = []
                 if debug and log_callback:
-                    log_callback(user_id, f"OfferUp '{term}': scanned {len(items[:50])} rows", "info")
+                    ttl = (driver.title or '').strip()
+                    log_callback(user_id, f"OfferUp '{term}': scanned {len(items[:50])} rows (title='{ttl[:70]}')", "info")
 
                 for item in items[:50]:
                     try:
-                        link = item.get_attribute('href')
-                        title = item.get_attribute('aria-label') or item.text
-                        price = extract_price(item.text)
+                        if isinstance(item, str):
+                            link = item
+                            title = ''
+                            price = None
+                            # Resolve link page quickly for title/price when only href was found.
+                            try:
+                                rr = requests.get(link, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+                                if rr.status_code == 200:
+                                    ps = BeautifulSoup(rr.text, 'html.parser')
+                                    tt = ps.find('title')
+                                    title = (tt.get_text(" ", strip=True) if tt else '').strip()
+                                    price = extract_price(ps.get_text(" ", strip=True))
+                            except Exception:
+                                pass
+                        else:
+                            link = item.get_attribute('href')
+                            title = item.get_attribute('aria-label') or item.text
+                            price = extract_price(item.text)
 
                         if not price or not link or not title: continue
                         meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
