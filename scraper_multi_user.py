@@ -910,7 +910,7 @@ def _mercari_page_source_via_selenium(term):
         chrome_options.add_argument(
             'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         driver = webdriver.Remote(command_executor=remote, options=chrome_options)
-        url = f"https://www.mercari.com/us/search/?keyword={term.replace(' ', '%20')}&sort=created_time&order=desc"
+        url = f"https://www.mercari.com/search/?keyword={quote_plus(term)}&sortBy=2"
         driver.get(url)
         time.sleep(6)
         driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
@@ -947,7 +947,7 @@ def _mercari_items_via_selenium(term, debug=False, log_callback=None, user_id=No
         chrome_options.add_argument(
             'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         driver = webdriver.Remote(command_executor=remote, options=chrome_options)
-        url = f"https://www.mercari.com/us/search/?keyword={quote_plus(term)}&sort=created_time&order=desc"
+        url = f"https://www.mercari.com/search/?keyword={quote_plus(term)}&sortBy=2"
         driver.get(url)
         time.sleep(5)
         for _ in range(2):
@@ -1011,6 +1011,7 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
     for term in search_terms.keys():
         q = quote_plus(term)
         urls = [
+            f"https://www.mercari.com/search/?keyword={q}&sortBy=2",
             f"https://www.mercari.com/us/search/?keyword={q}&sort=created_time&order=desc",
             f"https://www.mercari.com/search/?keyword={q}&sort=created_time&order=desc",
         ]
