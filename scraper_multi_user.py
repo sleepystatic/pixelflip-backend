@@ -95,6 +95,31 @@ def resolve_selenium_remote_url():
         return base
 
 
+def _make_chrome_options_with_stealth(user_agent=None):
+    """
+    Build Chrome options with Browserless stealth enabled.
+
+    browserless:options stealth=true hides WebDriver fingerprints at the browser
+    level before any page JavaScript runs — this is the primary fix for Mercari
+    and OfferUp bot detection on cloud/datacenter IPs.
+    """
+    from selenium.webdriver.chrome.options import Options
+    opts = Options()
+    opts.add_argument('--headless=new')
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--window-size=1920,1080')
+    opts.add_argument('--disable-blink-features=AutomationControlled')
+    opts.add_argument(
+        f'user-agent={user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}'
+    )
+    # Browserless stealth capability — hides navigator.webdriver and automation
+    # flags so Mercari/OfferUp JS challenges don't fingerprint the session.
+    opts.set_capability("browserless:options", {"stealth": True})
+    return opts
+
+
 # ===========================
 # DATABASE CONNECTION
 # ===========================
@@ -893,81 +918,74 @@ def _mercari_fetch_with_scrapingfish(url):
     return ''
 
 
-def _mercari_page_source_via_selenium(term):
+def _mercari_via_browser(term, debug=False, log_callback=None, user_id=None):
+    """
+    Single-session browser fallback for Mercari.
+
+    Previously two separate sessions were opened (page_source + DOM extraction)
+    per search term. Now we reuse one session: grab page_source first for
+    Next.js/JSON-LD parsing, then fall back to live DOM element extraction if
+    HTML parsing still yields nothing — all inside the same browser session.
+
+    Stealth is applied via the browserless:options capability so Mercari's
+    JS-based bot detection doesn't fire before items render.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
     driver = None
+    html = ''
+    dom_items = []
     try:
         remote = resolve_selenium_remote_url()
         if not remote:
-            return ''
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        chrome_options = Options()
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument(
-            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            return html, dom_items
+
+        if debug and log_callback and user_id:
+            log_callback(user_id, f"Mercari remote browser: connecting for '{term}'", "info")
+
+        chrome_options = _make_chrome_options_with_stealth()
         driver = webdriver.Remote(command_executor=remote, options=chrome_options)
+
         url = f"https://www.mercari.com/search/?keyword={quote_plus(term)}&sortBy=2"
         driver.get(url)
-        time.sleep(6)
-        driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
-        time.sleep(2)
-        return driver.page_source or ''
-    except Exception as e:
-        print(f"Mercari selenium fetch: {e}", flush=True)
-        return ''
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
+        # Wait up to 12 s for item links to appear; fall back gracefully if they don't.
+        try:
+            WebDriverWait(driver, 12).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/item/']"))
+            )
+        except Exception:
+            pass
 
-def _mercari_items_via_selenium(term, debug=False, log_callback=None, user_id=None):
-    """Rendered DOM fallback when Mercari blocks plain HTTP."""
-    driver = None
-    items = []
-    try:
-        remote = resolve_selenium_remote_url()
-        if not remote:
-            return items
-        from selenium import webdriver
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.chrome.options import Options
-        chrome_options = Options()
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument(
-            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        driver = webdriver.Remote(command_executor=remote, options=chrome_options)
-        url = f"https://www.mercari.com/search/?keyword={quote_plus(term)}&sortBy=2"
-        driver.get(url)
-        time.sleep(5)
+        # Scroll to trigger lazy-loaded items.
         for _ in range(2):
             driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
-            time.sleep(2)
+            time.sleep(1.5)
 
+        html = driver.page_source or ''
+
+        # DOM extraction in the same session (no second browser open).
         anchors = driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")
         if debug and log_callback and user_id:
-            title = (driver.title or '').strip()
-            cur = (driver.current_url or '').strip()
-            log_callback(user_id, f"Mercari browser page: title='{title[:80]}' url='{cur[:120]}' anchors={len(anchors)}", "info")
+            pg_title = (driver.title or '').strip()
+            cur_url = (driver.current_url or '').strip()
+            log_callback(
+                user_id,
+                f"Mercari browser page: title='{pg_title[:80]}' url='{cur_url[:120]}' anchors={len(anchors)}",
+                "info",
+            )
+
         for a in anchors[:100]:
             try:
                 href = a.get_attribute('href') or ''
                 if not href or '/item/' not in href:
                     continue
-                title = (a.get_attribute('aria-label') or a.text or '').strip()
-                text_blob = a.text or ''
-                price = extract_price(text_blob)
-                if not (title and price):
+                item_title = (a.get_attribute('aria-label') or a.text or '').strip()
+                price = extract_price(a.text or '')
+                if not (item_title and price):
                     continue
                 image_url = None
                 try:
@@ -975,8 +993,8 @@ def _mercari_items_via_selenium(term, debug=False, log_callback=None, user_id=No
                     image_url = img.get_attribute('src') or img.get_attribute('data-src')
                 except Exception:
                     pass
-                items.append({
-                    'title': title,
+                dom_items.append({
+                    'title': item_title,
                     'price': price,
                     'link': href if href.startswith('http') else f"https://www.mercari.com{href}",
                     'image_url': image_url,
@@ -984,15 +1002,17 @@ def _mercari_items_via_selenium(term, debug=False, log_callback=None, user_id=No
                 })
             except Exception:
                 continue
+
     except Exception as e:
-        print(f"Mercari selenium DOM fetch: {e}", flush=True)
+        print(f"Mercari browser fetch: {e}", flush=True)
     finally:
         if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
-    return _mercari_dedupe_raw(items)
+
+    return html, _mercari_dedupe_raw(dom_items)
 
 
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
@@ -1035,14 +1055,19 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
             if not raw_items and resolve_selenium_remote_url():
                 if debug and log_callback:
                     log_callback(user_id, f"Mercari '{term}': empty from HTTP; trying remote browser…", "info")
-                html = _mercari_page_source_via_selenium(term)
+                # Single browser session: get page source + DOM items together.
+                html, dom_items = _mercari_via_browser(
+                    term, debug=debug, log_callback=log_callback, user_id=user_id
+                )
                 raw_items = _mercari_collect_from_html(html) or _mercari_items_from_json_ld(html)
                 if not raw_items:
-                    raw_items = _mercari_items_via_selenium(term, debug=debug, log_callback=log_callback, user_id=user_id)
+                    raw_items = dom_items
                 if debug and log_callback and not raw_items:
                     h = (html or '').lower()
                     if 'captcha' in h or 'robot' in h or 'blocked' in h or 'cloudflare' in h:
                         log_callback(user_id, f"Mercari '{term}': browser content appears blocked/challenged.", "error")
+                    elif not h:
+                        log_callback(user_id, f"Mercari '{term}': browser returned empty page source.", "error")
             if not raw_items:
                 html = _mercari_fetch_with_scrapingfish(urls[0])
                 if html:
@@ -1111,26 +1136,19 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
         from selenium.webdriver.common.by import By
         from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.chrome.service import Service
-
-        chrome_options = Options()
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
 
         remote_url = resolve_selenium_remote_url()
         if remote_url:
-            # SaaS-friendly path: use remote browser infrastructure (Browserless/Selenium Grid).
+            # Remote path: Browserless/Selenium Grid with stealth capability.
             if debug and log_callback:
                 log_callback(user_id, "OfferUp using remote browser endpoint", "info")
+            chrome_options = _make_chrome_options_with_stealth()
             driver = webdriver.Remote(command_executor=remote_url, options=chrome_options)
         else:
-            # FIND BINARY (env override first) for local/self-hosted installs.
+            # Local path: detect Chrome binary for self-hosted installs.
+            chrome_options = _make_chrome_options_with_stealth()
             chrome_bin = os.getenv('CHROME_BINARY')
             if chrome_bin and not os.path.exists(chrome_bin):
                 chrome_bin = None
@@ -1172,29 +1190,30 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                     )
                 return listings
 
-            # INITIALIZE ONCE (local mode)
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=chrome_options)
 
-        # STEALTH HANDSHAKE
-        if hasattr(driver, "execute_cdp_cmd"):
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            })
-
         for term in search_terms.keys():
             try:
-                # Newest first (matches OfferUp "Recent" sort intent)
                 sort_param = os.getenv('OFFERUP_SORT', '-created_at')
                 url = f"https://offerup.com/search/?q={term.replace(' ', '%20')}&radius={search_radius}&sort={sort_param}"
-                if log_callback: log_callback(user_id, f"Scanning OfferUp for '{term}'...", "info")
+                if log_callback:
+                    log_callback(user_id, f"Scanning OfferUp for '{term}'...", "info")
 
                 driver.get(url)
-                time.sleep(5)
 
-                for scroll in range(3):
+                # Wait for listing anchors to appear (up to 12 s) rather than a
+                # blind sleep — catches slow JS renders and avoids over-waiting.
+                try:
+                    WebDriverWait(driver, 12).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/item/']"))
+                    )
+                except Exception:
+                    pass
+
+                for scroll in range(2):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(2)
+                    time.sleep(1.5)
 
                 items = []
                 selector_candidates = [
@@ -1220,13 +1239,15 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                             href = a.get('href') or ''
                             if '/item/' in href:
                                 links.append(href if href.startswith('http') else f"https://offerup.com{href}")
-                        # Dummy wrappers with href/text-like access not needed; handle below.
                         items = links
                     except Exception:
                         items = []
                 if debug and log_callback:
                     ttl = (driver.title or '').strip()
                     log_callback(user_id, f"OfferUp '{term}': scanned {len(items[:50])} rows (title='{ttl[:70]}')", "info")
+                    if not items and not ttl:
+                        src_snip = (driver.page_source or '')[:300].replace('\n', ' ')
+                        log_callback(user_id, f"OfferUp '{term}': page snippet → {src_snip}", "error")
 
                 for item in items[:50]:
                     try:
