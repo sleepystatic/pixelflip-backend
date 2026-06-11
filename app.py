@@ -12,6 +12,7 @@ from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
 from functools import wraps
 import requests
+import re
 from datetime import datetime, timedelta, timezone
 import stripe
 
@@ -20,19 +21,56 @@ load_dotenv()
 
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 
+# Web Push VAPID configuration
+VAPID_PUBLIC_KEY = (os.getenv('VAPID_PUBLIC_KEY') or '').strip()
+VAPID_PRIVATE_KEY = (os.getenv('VAPID_PRIVATE_KEY') or '').strip()
+VAPID_CLAIMS_EMAIL = (os.getenv('VAPID_CLAIMS_EMAIL') or 'admin@pixelflip.app').strip()
+
+_dsns = (os.getenv('SENTRY_DSN') or '').strip()
+if _dsns:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+
+        sentry_sdk.init(
+            dsn=_dsns,
+            integrations=[FlaskIntegration()],
+            traces_sample_rate=float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0') or '0'),
+            profiles_sample_rate=float(os.getenv('SENTRY_PROFILES_SAMPLE_RATE', '0') or '0'),
+            enable_tracing=bool(float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0') or '0')),
+        )
+    except Exception as _se:
+        print(f"Sentry init skipped: {_se}", flush=True)
+
 try:
-    from scraper_multi_user import SCRAPING_USERS, resolve_selenium_remote_url
+    from scraper_multi_user import SCRAPING_USERS
 except Exception:
     SCRAPING_USERS = set()
 
-    def resolve_selenium_remote_url():
-        return (os.getenv('SELENIUM_REMOTE_URL') or '').strip() or None
+# Health check tracking (set by scraper thread)
+_health_last_scraper_cycle = None
+
+def set_health_scraper_cycle(ts=None):
+    """Called by scraper to report last successful cycle."""
+    global _health_last_scraper_cycle
+    _health_last_scraper_cycle = ts or time.time()
 
 app = Flask(__name__)
 
 
-def _frontend_base_url():
-    return (os.getenv('FRONTEND_URL') or 'http://localhost:3000').rstrip('/')
+def _frontend_base_url(origin_header=None):
+    """
+    Stripe success/cancel URLs and billing portal return_url.
+    Set FRONTEND_URL in production. For local dev, if unset, we accept the
+    browser Origin (e.g. http://localhost:3001) so cancel links match the port you use.
+    """
+    explicit = (os.getenv('FRONTEND_URL') or '').strip().rstrip('/')
+    if explicit:
+        return explicit
+    oh = (origin_header or '').strip().rstrip('/')
+    if oh.startswith('http://localhost:') or oh.startswith('http://127.0.0.1:'):
+        return oh
+    return 'http://localhost:3000'
 
 
 def _send_email_change_code_email(to_email, code):
@@ -71,6 +109,42 @@ def _send_email_change_code_email(to_email, code):
         raise ValueError(f"Mailgun send failed ({resp.status_code}): {message}")
 
 
+def _send_password_reset_code_email(to_email, code):
+    mailgun_api_key = os.getenv('MAILGUN_API_KEY')
+    mailgun_domain = os.getenv('MAILGUN_DOMAIN')
+    mailgun_from = os.getenv('MAILGUN_FROM_EMAIL')
+    mailgun_base_url = os.getenv('MAILGUN_BASE_URL', 'https://api.mailgun.net')
+
+    if not all([mailgun_api_key, mailgun_domain, mailgun_from]):
+        raise ValueError("Mailgun settings missing (MAILGUN_API_KEY/MAILGUN_DOMAIN/MAILGUN_FROM_EMAIL)")
+
+    endpoint = f"{mailgun_base_url.rstrip('/')}/v3/{mailgun_domain}/messages"
+    subject = "PixelFlip password reset code"
+    text_body = (
+        f"Your PixelFlip password reset code is: {code}\n\n"
+        "This code expires in 10 minutes. If you did not request this, ignore this email."
+    )
+
+    resp = requests.post(
+        endpoint,
+        auth=("api", mailgun_api_key),
+        data={
+            "from": mailgun_from,
+            "to": [to_email],
+            "subject": subject,
+            "text": text_body,
+        },
+        timeout=20,
+    )
+    if resp.status_code >= 300:
+        try:
+            payload = resp.json()
+            message = payload.get("message") or payload.get("error") or resp.text
+        except Exception:
+            message = resp.text
+        raise ValueError(f"Mailgun send failed ({resp.status_code}): {message}")
+
+
 def _ensure_email_change_table(cursor):
     cursor.execute(
         """
@@ -85,11 +159,60 @@ def _ensure_email_change_table(cursor):
     )
 
 
+def _ensure_password_reset_table(cursor):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+          email TEXT PRIMARY KEY,
+          code_hash TEXT NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+
+def _admin_lookup_supabase_user_by_email(email):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise ValueError("SUPABASE_SERVICE_ROLE_KEY is required for password reset")
+    url = f"{SUPABASE_URL}/auth/v1/admin/users"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+    page = 1
+    per_page = 200
+    while page <= 5:
+        resp = requests.get(
+            url,
+            headers=headers,
+            params={"page": page, "per_page": per_page},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            raise ValueError(f"Supabase admin users lookup failed ({resp.status_code})")
+        data = resp.json() or {}
+        users = data.get('users') or []
+        if not users:
+            break
+        target = (email or '').strip().lower()
+        for u in users:
+            u_email = (u.get('email') or '').strip().lower()
+            if u_email == target:
+                return u
+        if len(users) < per_page:
+            break
+        page += 1
+    return None
+
+
 def _epoch_from_last_scraped(value):
     """Normalize last_scraped_at / timestamp to unix seconds for countdown."""
     if value is None:
         return 0
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return int(value.timestamp())
     try:
         return int(float(value))
@@ -143,7 +266,7 @@ def _effective_plan_tier(us):
 def _plan_limits(tier):
     t = (tier or 'inactive').lower()
     if t == 'pro':
-        return {'max_search_terms': 999, 'ai_image_allowed': True}
+        return {'max_search_terms': 10, 'ai_image_allowed': True}
     if t == 'basic':
         return {'max_search_terms': 3, 'ai_image_allowed': False}
     try:
@@ -172,6 +295,26 @@ def _effective_limits(us):
     return lim
 
 
+def _effective_check_interval_minutes(us):
+    """Pro + Facebook Marketplace (Bright Data) enforces at least a 30-minute poll interval."""
+    if not us:
+        return 10
+    try:
+        stored = int(us.get('check_interval_minutes') or 10)
+    except (TypeError, ValueError):
+        stored = 10
+    plat = us.get('platforms') or {}
+    if isinstance(plat, str):
+        try:
+            plat = json.loads(plat)
+        except Exception:
+            plat = {}
+    plat = plat or {}
+    if _effective_plan_tier(us) == 'pro' and plat.get('facebook'):
+        return max(stored, 30)
+    return stored
+
+
 def _plan_display_name(tier):
     t = (tier or 'inactive').lower()
     if t == 'basic':
@@ -179,6 +322,36 @@ def _plan_display_name(tier):
     if t == 'pro':
         return 'Pro Scanner'
     return None
+
+
+def _normalize_notification_channels(raw):
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        'email': bool(raw.get('email', True)),
+        'sms': bool(raw.get('sms', False)),
+        'push': bool(raw.get('push', False)),
+    }
+
+
+def _sanitize_contact_phone(raw):
+    """Return None for cleared field; digits-only or +E.164-ish string; raises ValueError if invalid."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    digits = re.sub(r'\D', '', s)
+    if len(digits) < 10:
+        raise ValueError('Phone number must include at least 10 digits')
+    if s.startswith('+'):
+        return '+' + digits[:15]
+    return digits[:15]
 
 
 def _billing_config_response():
@@ -223,7 +396,7 @@ def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, c
     Upsert subscription after Checkout or webhook.
     plan_tier: basic | pro — controls AI image access and search-term limits.
     """
-    platforms = json.dumps({"craigslist": True, "offerup": True, "mercari": True})
+    platforms = json.dumps({"craigslist": True, "offerup": True, "mercari": True, "facebook": False})
     plan_tier = (plan_tier or 'pro').lower()
     if plan_tier not in ('basic', 'pro'):
         plan_tier = 'pro'
@@ -254,6 +427,40 @@ def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, c
         """,
         (user_id, platforms, ai_on, is_pro, plan_tier, customer_id, sub_id, period_end, cancel_at_end),
     )
+
+_ALLOWED_PLATFORMS = frozenset(('craigslist', 'offerup', 'mercari', 'facebook'))
+
+
+def _parse_platform_filters(req):
+    """Single `platform` or comma-separated `platforms` → normalized list (empty = no filter)."""
+    multi = (req.args.get('platforms') or '').strip().lower()
+    single = (req.args.get('platform') or '').strip().lower()
+    raw = multi or single
+    if not raw:
+        return []
+    out = [p for p in re.split(r'[\s,]+', raw) if p]
+    bad = [p for p in out if p not in _ALLOWED_PLATFORMS]
+    if bad:
+        raise ValueError(f"invalid platform: {bad}")
+    return out
+
+
+def _user_settings_buyer_prefs(us):
+    if not us:
+        return True, True
+    return bool(us.get('buyer_include_local', True)), bool(us.get('buyer_include_shipping', True))
+
+
+def _coerce_buyer_prefs_from_post(data, prev_row):
+    pl, ps = _user_settings_buyer_prefs(prev_row)
+    if 'buyer_include_local' in data:
+        pl = bool(data.get('buyer_include_local'))
+    if 'buyer_include_shipping' in data:
+        ps = bool(data.get('buyer_include_shipping'))
+    if not pl and not ps:
+        raise ValueError('Select at least one: local or shipping.')
+    return pl, ps
+
 
 # Wildcard origin + supports_credentials=True is invalid per CORS; browsers drop Allow-Origin on preflight.
 # List explicit origins (comma-separated in CORS_ORIGINS on Render) or default to Vercel + local dev.
@@ -294,7 +501,14 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 
 def get_db_connection():
     try:
-        return psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            from db_schema import ensure_buyer_delivery_columns, ensure_push_subscription_column
+            ensure_buyer_delivery_columns(conn)
+            ensure_push_subscription_column(conn)
+        except Exception as schema_err:
+            print(f"Schema ensure warning: {schema_err}", flush=True)
+        return conn
     except Exception as e:
         print(f"Database connection error: {e}", flush=True)
         return None
@@ -413,8 +627,8 @@ def start_background_scraper():
         def log_bridge(user_id, message, log_type="info"):
             add_log(user_id, message, log_type)
 
-        # Pass the bridge into the scraper
-        run_scraper(log_callback=log_bridge)
+        # Pass the bridge and health callback into the scraper
+        run_scraper(log_callback=log_bridge, health_callback=set_health_scraper_cycle)
 
     except Exception as e:
         scraper_status['running'] = False
@@ -463,7 +677,7 @@ ensure_cleanup_thread_started()
 # API ENDPOINTS
 # ==========================================
 @app.route('/')
-def health_check():
+def root_status():
     return jsonify({"status": "running", "scraper_active": scraper_status['running']})
 
 
@@ -498,22 +712,13 @@ def _detect_local_browser_binary():
 def scraper_health(user_id):
     if request.method == 'OPTIONS':
         return '', 200
-    try:
-        remote_url = (resolve_selenium_remote_url() or os.getenv('SELENIUM_REMOTE_URL') or '').strip()
-    except Exception:
-        remote_url = (os.getenv('SELENIUM_REMOTE_URL') or '').strip()
-    local_browser = _detect_local_browser_binary()
-    offerup_mode = "remote" if remote_url else ("local" if local_browser else "disabled")
     return jsonify({
         "ok": True,
         "scraper_running": bool(scraper_status.get('running')),
         "scraper_error": scraper_status.get('error'),
         "scraper_thread_started": bool(_scraper_thread_started),
         "cleanup_thread_started": bool(_cleanup_thread_started),
-        "offerup_mode": offerup_mode,
-        "selenium_remote_enabled": bool(remote_url),
-        "local_browser_detected": bool(local_browser),
-        "local_browser_path": local_browser,
+        "scrape_provider": "scrapingbee",
         "timestamp": int(time.time()),
     })
 
@@ -552,7 +757,7 @@ def get_status(user_id):
         is_running = us.get('is_active', False)
 
         # 2. Timer Logic (Always active)
-        interval_min = us.get('check_interval_minutes') or 10
+        interval_min = _effective_check_interval_minutes(us)
         interval_secs = int(interval_min) * 60
 
         last_raw = us.get('last_scraped_at')
@@ -569,8 +774,10 @@ def get_status(user_id):
             next_check_timestamp_out = None
         else:
             next_check_timestamp_out = next_check_timestamp
+            # If we are overdue, keep showing "SCANNING..." until a run finishes and stamps last_scraped_at.
+            # This avoids countdown flicker (e.g., 0:01 -> SCANNING) during long/active cycles.
             if current_now > next_check_timestamp_out:
-                next_check_timestamp_out = current_now
+                next_check_timestamp_out = None
 
         # 3. Stats
         cursor.execute("SELECT COUNT(*) AS c FROM listings WHERE user_id = %s", (user_id,))
@@ -626,7 +833,7 @@ def handle_settings(user_id):
 
             if not us:
                 return jsonify({
-                    "platforms": {"craigslist": True, "offerup": True, "mercari": True},
+                    "platforms": {"craigslist": True, "offerup": True, "mercari": True, "facebook": False},
                     "zip_code": "95212",
                     "distance": 25,
                     "check_interval": 10,
@@ -642,6 +849,10 @@ def handle_settings(user_id):
                     "ai_image_allowed": False,
                     "subscription_current_period_end": None,
                     "subscription_cancel_at_period_end": False,
+                    "notifications": _normalize_notification_channels(None),
+                    "contact_phone": "",
+                    "buyer_include_local": True,
+                    "buyer_include_shipping": True,
                     "billing": _billing_config_response(),
                 })
 
@@ -656,7 +867,7 @@ def handle_settings(user_id):
             ai_show = bool(us.get('ai_enabled')) and ai_allowed
             return jsonify({
                 "platforms": us['platforms'] if us['platforms'] else {"craigslist": True, "offerup": True,
-                                                                      "mercari": True},
+                                                                      "mercari": True, "facebook": False},
                 "zip_code": us['zip_code'],
                 "distance": us['search_radius'],
                 "check_interval": us['check_interval_minutes'],
@@ -672,6 +883,10 @@ def handle_settings(user_id):
                 "ai_image_allowed": ai_allowed,
                 "subscription_current_period_end": us.get('subscription_current_period_end'),
                 "subscription_cancel_at_period_end": bool(us.get('subscription_cancel_at_period_end')),
+                "notifications": _normalize_notification_channels(us.get('notification_channels')),
+                "contact_phone": str(us.get('contact_phone') or ''),
+                "buyer_include_local": _user_settings_buyer_prefs(us)[0],
+                "buyer_include_shipping": _user_settings_buyer_prefs(us)[1],
                 "billing": _billing_config_response(),
             })
 
@@ -693,16 +908,56 @@ def handle_settings(user_id):
             if not limits['ai_image_allowed']:
                 want_ai = False
 
-            # UPSERT Core Settings
+            prev_nc = None
+            prev_phone = None
+            if us_row:
+                prev_nc = us_row.get('notification_channels')
+                prev_phone = us_row.get('contact_phone')
+            if 'notifications' in data:
+                nc_json = _normalize_notification_channels(data.get('notifications'))
+            else:
+                nc_json = _normalize_notification_channels(prev_nc)
+            try:
+                if 'contact_phone' in data:
+                    phone = _sanitize_contact_phone(data.get('contact_phone'))
+                else:
+                    phone = prev_phone
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+            plat = dict(data.get('platforms') or {})
+            tier_eff = _effective_plan_tier(us_row) if us_row else 'inactive'
+            if tier_eff != 'pro':
+                plat['facebook'] = False
+            try:
+                check_iv = int(data.get('check_interval', 10))
+            except (TypeError, ValueError):
+                check_iv = 10
+            if tier_eff == 'pro' and plat.get('facebook'):
+                check_iv = max(check_iv, 30)
+
+            try:
+                bl_buy, bs_buy = _coerce_buyer_prefs_from_post(data, us_row)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+            # UPSERT Core Settings (buyer prefs require migration 006)
             cursor.execute("""
-                INSERT INTO user_settings (user_id, zip_code, search_radius, platforms, ai_enabled, check_interval_minutes, ai_strictness)
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                INSERT INTO user_settings (
+                    user_id, zip_code, search_radius, platforms, ai_enabled,
+                    check_interval_minutes, ai_strictness, notification_channels, contact_phone,
+                    buyer_include_local, buyer_include_shipping
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     zip_code = EXCLUDED.zip_code, search_radius = EXCLUDED.search_radius, platforms = EXCLUDED.platforms,
-                    ai_enabled = EXCLUDED.ai_enabled, check_interval_minutes = EXCLUDED.check_interval_minutes, ai_strictness = EXCLUDED.ai_strictness;
+                    ai_enabled = EXCLUDED.ai_enabled, check_interval_minutes = EXCLUDED.check_interval_minutes, ai_strictness = EXCLUDED.ai_strictness,
+                    notification_channels = EXCLUDED.notification_channels, contact_phone = EXCLUDED.contact_phone,
+                    buyer_include_local = EXCLUDED.buyer_include_local, buyer_include_shipping = EXCLUDED.buyer_include_shipping;
             """, (
-            user_id, data.get('zip_code', '95212'), data.get('distance', 25), json.dumps(data.get('platforms', {})),
-            want_ai, data.get('check_interval', 10), strict_text))
+            user_id, data.get('zip_code', '95212'), data.get('distance', 25), json.dumps(plat),
+            want_ai, check_iv, strict_text,
+            json.dumps(nc_json), phone, bl_buy, bs_buy))
 
             # REPLACE Search Terms
             # POST: Save both max and min to the database
@@ -720,9 +975,55 @@ def handle_settings(user_id):
 
             conn.commit()
             out = dict(data)
+            out['platforms'] = plat
+            out['check_interval'] = check_iv
             out['ai_detection'] = want_ai
+            out['notifications'] = nc_json
+            out['contact_phone'] = phone or ''
+            out['buyer_include_local'] = bl_buy
+            out['buyer_include_shipping'] = bs_buy
             return jsonify({"success": True, "settings": out})
 
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/account-contact', methods=['POST', 'OPTIONS'])
+@app.route('/account-contact', methods=['POST', 'OPTIONS'])
+@require_auth
+def update_account_contact(user_id):
+    """Update only contact_phone (optional SMS number) without posting full scanner settings."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(silent=True) or {}
+    try:
+        phone = _sanitize_contact_phone(data.get('contact_phone'))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    cursor = conn.cursor()
+    try:
+        default_platforms = json.dumps({"craigslist": True, "offerup": True, "mercari": True, "facebook": False})
+        cursor.execute(
+            """
+            INSERT INTO user_settings (
+                user_id, zip_code, search_radius, platforms, ai_enabled,
+                check_interval_minutes, ai_strictness, contact_phone
+            )
+            VALUES (%s, '95212', 25, %s::jsonb, FALSE, 10, 'balanced', %s)
+            ON CONFLICT (user_id) DO UPDATE SET contact_phone = EXCLUDED.contact_phone
+            """,
+            (user_id, default_platforms, phone),
+        )
+        conn.commit()
+        return jsonify({"success": True, "contact_phone": phone or ""})
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 500
@@ -769,7 +1070,15 @@ def stop_scraper(user_id):
     if not conn: return jsonify({"error": "DB error"}), 500
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE user_settings SET is_active = FALSE WHERE user_id = %s;", (user_id,))
+        cursor.execute(
+            """
+            UPDATE user_settings
+            SET is_active = FALSE,
+                last_scraped_at = NOW()
+            WHERE user_id = %s;
+            """,
+            (user_id,)
+        )
         conn.commit()
         return jsonify({"success": True, "status": "stopped"})
     except Exception as e:
@@ -1124,13 +1433,28 @@ def create_checkout(user_id):
         price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID', 'STRIPE_PRICE_ID')
     else:
         price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_PRO_ID', 'STRIPE_PRICE_ID')
+    basic_direct = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID')
+    pro_direct = _first_stripe_price_id_from_env('STRIPE_PRICE_PRO_ID')
+    legacy = _first_stripe_price_id_from_env('STRIPE_PRICE_ID')
+    if legacy and not basic_direct and not pro_direct:
+        print(
+            "Stripe: STRIPE_PRICE_BASIC_ID and STRIPE_PRICE_PRO_ID are unset; "
+            "every checkout uses STRIPE_PRICE_ID. Set both price ids so Basic vs Pro map to different Stripe prices.",
+            flush=True,
+        )
     if not price_id:
         return jsonify({
             "error": "Stripe price not configured. Set STRIPE_PRICE_BASIC_ID and STRIPE_PRICE_PRO_ID (or legacy STRIPE_PRICE_ID).",
         }), 500
     if not stripe.api_key:
         return jsonify({"error": "STRIPE_SECRET_KEY not configured"}), 500
-    base = _frontend_base_url()
+    print(
+        "[Stripe checkout] "
+        f"plan={plan!r} resolved_price_id={price_id!r} "
+        f"basic_explicit={basic_direct!r} pro_explicit={pro_direct!r} legacy_fallback={legacy!r}",
+        flush=True,
+    )
+    base = _frontend_base_url(request.headers.get('Origin'))
     try:
         checkout_session = stripe.checkout.Session.create(
             mode='subscription',
@@ -1240,7 +1564,7 @@ def create_portal_session(user_id):
                 "error": "no_customer",
                 "message": "Subscribe once from Upgrade so we can link your billing account."
             }), 400
-        base = _frontend_base_url()
+        base = _frontend_base_url(request.headers.get('Origin'))
         portal = stripe.billing_portal.Session.create(
             customer=customer_id,
             return_url=f"{base}/",
@@ -1305,38 +1629,87 @@ def list_scraped_listings(user_id):
         offset = max(int(request.args.get('offset', 0)), 0)
     except ValueError:
         return jsonify({"error": "invalid pagination"}), 400
+    q = (request.args.get('q') or '').strip()
+    try:
+        platform_list = _parse_platform_filters(request)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    sort = (request.args.get('sort') or 'newest').strip().lower()
+    if sort not in ('newest', 'oldest', 'saved_newest', 'saved_oldest'):
+        return jsonify({"error": "invalid sort"}), 400
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Database error"}), 500
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         try:
+            where_clauses = ["user_id = %s"]
+            params = [user_id]
+            if q:
+                where_clauses.append("LOWER(title) LIKE %s")
+                params.append(f"%{q.lower()}%")
+            if platform_list:
+                where_clauses.append("LOWER(TRIM(platform)) = ANY(%s)")
+                params.append(platform_list)
+            where_sql = " AND ".join(where_clauses)
+            if sort == 'oldest':
+                order_sql = "listed_at ASC NULLS LAST, created_at ASC"
+            elif sort == 'saved_newest':
+                order_sql = "created_at DESC"
+            elif sort == 'saved_oldest':
+                order_sql = "created_at ASC"
+            else:
+                order_sql = "listed_at DESC NULLS LAST, created_at DESC"
             cursor.execute(
-                """
+                f"""
                 SELECT title, price, link, platform, image_url, location, created_at, listed_at
                 FROM listings
-                WHERE user_id = %s
-                ORDER BY listed_at DESC NULLS LAST, created_at DESC
+                WHERE {where_sql}
+                ORDER BY {order_sql}
                 LIMIT %s OFFSET %s
                 """,
-                (user_id, limit, offset),
+                tuple(params + [limit, offset]),
             )
         except psycopg2.ProgrammingError as e:
             conn.rollback()
             if e.pgcode != errorcodes.UNDEFINED_COLUMN and 'listed_at' not in str(e):
                 raise
+            where_clauses = ["user_id = %s"]
+            params = [user_id]
+            if q:
+                where_clauses.append("LOWER(title) LIKE %s")
+                params.append(f"%{q.lower()}%")
+            if platform_list:
+                where_clauses.append("LOWER(TRIM(platform)) = ANY(%s)")
+                params.append(platform_list)
+            where_sql = " AND ".join(where_clauses)
+            if sort in ('oldest', 'saved_oldest'):
+                order_sql = "created_at ASC NULLS LAST"
+            else:
+                order_sql = "created_at DESC NULLS LAST"
             cursor.execute(
-                """
+                f"""
                 SELECT title, price, link, platform, image_url, location, created_at
                 FROM listings
-                WHERE user_id = %s
-                ORDER BY created_at DESC NULLS LAST
+                WHERE {where_sql}
+                ORDER BY {order_sql}
                 LIMIT %s OFFSET %s
                 """,
-                (user_id, limit, offset),
+                tuple(params + [limit, offset]),
             )
         rows = cursor.fetchall()
-        cursor.execute("SELECT COUNT(*) AS c FROM listings WHERE user_id = %s", (user_id,))
+        where_clauses = ["user_id = %s"]
+        count_params = [user_id]
+        if q:
+            where_clauses.append("LOWER(title) LIKE %s")
+            count_params.append(f"%{q.lower()}%")
+        if platform_list:
+            where_clauses.append("LOWER(TRIM(platform)) = ANY(%s)")
+            count_params.append(platform_list)
+        cursor.execute(
+            f"SELECT COUNT(*) AS c FROM listings WHERE {' AND '.join(where_clauses)}",
+            tuple(count_params),
+        )
         total = cursor.fetchone()['c']
         out = []
         for r in rows:
@@ -1371,6 +1744,130 @@ def list_scraped_listings(user_id):
         conn.close()
 
 
+@app.route('/api/request-password-reset-code', methods=['POST', 'OPTIONS'])
+@app.route('/request-password-reset-code', methods=['POST', 'OPTIONS'])
+def request_password_reset_code():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    if not email or '@' not in email:
+        return jsonify({"success": False, "error": "Valid email is required"}), 400
+    code = f"{secrets.randbelow(1000000):06d}"
+    code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"success": False, "error": "Database error"}), 500
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        _ensure_password_reset_table(cursor)
+        cursor.execute(
+            """
+            INSERT INTO password_reset_requests (email, code_hash, expires_at, created_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (email) DO UPDATE SET
+                code_hash = EXCLUDED.code_hash,
+                expires_at = EXCLUDED.expires_at,
+                created_at = NOW()
+            """,
+            (email, code_hash, expires_at)
+        )
+        _send_password_reset_code_email(email, code)
+        conn.commit()
+        # Always return success-like response to avoid user enumeration.
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback()
+        msg = str(e)
+        if "Mailgun send failed" in msg:
+            return jsonify({"success": False, "error": f"{msg}. Verify Mailgun configuration."}), 400
+        return jsonify({"success": False, "error": msg}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@app.route('/api/reset-password-with-code', methods=['POST', 'OPTIONS'])
+@app.route('/reset-password-with-code', methods=['POST', 'OPTIONS'])
+def reset_password_with_code():
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    code = (data.get('code') or '').strip()
+    new_password = (data.get('new_password') or '').strip()
+    if not email or not code or not new_password:
+        return jsonify({"success": False, "error": "Email, code, and new password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"success": False, "error": "Password must be at least 8 characters"}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"success": False, "error": "Database error"}), 500
+    cursor = None
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        _ensure_password_reset_table(cursor)
+        cursor.execute(
+            """
+            SELECT email, code_hash, expires_at, (expires_at > NOW()) AS is_valid
+            FROM password_reset_requests
+            WHERE email = %s
+            LIMIT 1
+            """,
+            (email,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "No reset request found"}), 400
+        if not row.get('is_valid'):
+            return jsonify({"success": False, "error": "Verification code expired"}), 400
+        code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+        if row['code_hash'] != code_hash:
+            return jsonify({"success": False, "error": "Invalid verification code"}), 400
+
+        user = _admin_lookup_supabase_user_by_email(email)
+        if not user:
+            # Avoid account enumeration.
+            cursor.execute("DELETE FROM password_reset_requests WHERE email = %s", (email,))
+            conn.commit()
+            return jsonify({"success": True})
+
+        admin_url = f"{SUPABASE_URL}/auth/v1/admin/users/{user.get('id')}"
+        admin_headers = {
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/json"
+        }
+        resp = requests.put(
+            admin_url,
+            headers=admin_headers,
+            json={"password": new_password},
+            timeout=20,
+        )
+        if resp.status_code not in (200, 201):
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            msg = payload.get('msg') or payload.get('error_description') or payload.get('message') or 'Password reset failed'
+            return jsonify({"success": False, "error": msg}), resp.status_code
+
+        cursor.execute("DELETE FROM password_reset_requests WHERE email = %s", (email,))
+        conn.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
 @app.route('/api/listings/feedback', methods=['POST', 'OPTIONS'])
 @app.route('/listings/feedback', methods=['POST', 'OPTIONS'])
 @require_auth
@@ -1382,7 +1879,7 @@ def mark_listing_feedback(user_id):
     reason = (data.get('reason') or '').strip().lower()
     if not link:
         return jsonify({"error": "Missing listing link"}), 400
-    if reason not in ('sold', 'not_a_deal'):
+    if reason not in ('sold', 'not_a_deal', 'false_positive', 'just_remove'):
         return jsonify({"error": "Invalid feedback reason"}), 400
 
     conn = get_db_connection()
@@ -1432,6 +1929,152 @@ def mark_listing_feedback(user_id):
     finally:
         cursor.close()
         conn.close()
+
+
+@app.route('/api/listings/clear-all', methods=['POST', 'OPTIONS'])
+@app.route('/listings/clear-all', methods=['POST', 'OPTIONS'])
+@require_auth
+def clear_all_scraped_listings(user_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database error"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM listings WHERE user_id = %s", (user_id,))
+        n = cursor.rowcount
+        conn.commit()
+        return jsonify({"success": True, "deleted": int(n)})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/push/vapid-public-key', methods=['GET', 'OPTIONS'])
+@app.route('/push/vapid-public-key', methods=['GET', 'OPTIONS'])
+def push_vapid_public_key():
+    """Return VAPID public key for frontend to subscribe to push notifications."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({"error": "Push notifications not configured"}), 503
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY})
+
+
+@app.route('/api/push/subscribe', methods=['POST', 'OPTIONS'])
+@app.route('/push/subscribe', methods=['POST', 'OPTIONS'])
+@require_auth
+def push_subscribe(user_id):
+    """Save push subscription for the authenticated user."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.json
+    subscription = data.get('subscription')
+    if not subscription:
+        return jsonify({"error": "No subscription provided"}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database error"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE user_settings
+            SET push_subscription = %s::jsonb
+            WHERE user_id = %s
+            """,
+            (json.dumps(subscription), user_id)
+        )
+        conn.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/push/unsubscribe', methods=['POST', 'OPTIONS'])
+@app.route('/push/unsubscribe', methods=['POST', 'OPTIONS'])
+@require_auth
+def push_unsubscribe(user_id):
+    """Remove push subscription for the authenticated user."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database error"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE user_settings
+            SET push_subscription = NULL
+            WHERE user_id = %s
+            """,
+            (user_id,)
+        )
+        conn.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/health', methods=['GET', 'OPTIONS'])
+@app.route('/health', methods=['GET', 'OPTIONS'])
+def health_check():
+    """
+    Health check endpoint for Render/downtime monitoring.
+    Returns DB connectivity and scraper cycle timestamp (if available).
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    status = {"status": "ok", "checks": {}}
+    code = 200
+
+    # DB check
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+            status["checks"]["database"] = "ok"
+        except Exception as e:
+            status["checks"]["database"] = f"error: {e}"
+            status["status"] = "degraded"
+            code = 503
+        finally:
+            conn.close()
+    else:
+        status["checks"]["database"] = "unreachable"
+        status["status"] = "error"
+        code = 503
+
+    # Scraper cycle check
+    global _health_last_scraper_cycle
+    if _health_last_scraper_cycle:
+        age_sec = time.time() - _health_last_scraper_cycle
+        status["checks"]["scraper_last_cycle_age_seconds"] = round(age_sec, 1)
+        status["checks"]["scraper_last_cycle_at"] = datetime.fromtimestamp(
+            _health_last_scraper_cycle, tz=timezone.utc
+        ).isoformat()
+    else:
+        status["checks"]["scraper_last_cycle"] = "not yet recorded"
+
+    return jsonify(status), code
 
 
 if __name__ == '__main__':
