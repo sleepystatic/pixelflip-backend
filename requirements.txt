@@ -10,9 +10,11 @@ SQLAlchemy>=2.0.0
 Flask-SQLAlchemy>=3.0.0
 
 # Scraper & Automation
-selenium==4.27.1
-webdriver-manager==4.0.2
-playwright==1.42.0
+playwright==1.61.0
+# patchright is an undetected Playwright fork, used ONLY for Mercari: it is the
+# only client that gets past Mercari's Cloudflare + /v1/api 403. Keep its version
+# aligned with playwright above.
+patchright==1.61.2
 beautifulsoup4==4.14.3
 requests==2.32.5
 

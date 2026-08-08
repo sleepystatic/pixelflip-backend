@@ -97,7 +97,16 @@ def send_twilio_sms(to_number, body):
     return True, None
 
 
-def send_mailgun_email(to_email, subject, text_body):
+def send_mailgun_email(to_email, subject, text_body, html_body=None, unsubscribe_url=None):
+    """
+    Send via Mailgun. Always includes the text part; adds the HTML part when given
+    so clients pick whichever they can render.
+
+    `unsubscribe_url` adds List-Unsubscribe headers. Gmail and Yahoo require
+    one-click unsubscribe for bulk senders, and having it materially improves
+    inbox placement — the header is what puts the native "Unsubscribe" control
+    next to the sender name.
+    """
     mailgun_api_key = os.getenv('MAILGUN_API_KEY')
     mailgun_domain = os.getenv('MAILGUN_DOMAIN')
     mailgun_from = os.getenv('MAILGUN_FROM_EMAIL')
@@ -105,15 +114,21 @@ def send_mailgun_email(to_email, subject, text_body):
     if not all([mailgun_api_key, mailgun_domain, mailgun_from, to_email]):
         return False, 'Mailgun env or email incomplete'
     endpoint = f"{mailgun_base_url.rstrip('/')}/v3/{mailgun_domain}/messages"
+    payload = {
+        'from': mailgun_from,
+        'to': [to_email],
+        'subject': subject[:998],
+        'text': text_body[:50000],
+    }
+    if html_body:
+        payload['html'] = html_body[:200000]
+    if unsubscribe_url:
+        payload['h:List-Unsubscribe'] = f'<{unsubscribe_url}>'
+        payload['h:List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
     r = requests.post(
         endpoint,
         auth=('api', mailgun_api_key),
-        data={
-            'from': mailgun_from,
-            'to': [to_email],
-            'subject': subject[:998],
-            'text': text_body[:50000],
-        },
+        data=payload,
         timeout=25,
     )
     if r.status_code >= 300:
@@ -162,8 +177,8 @@ def send_web_push(subscription, title, body, url=None):
             'title': title,
             'body': body,
             'url': url or '/',
-            'icon': '/logo192.png',
-            'badge': '/logo192.png',
+            'icon': '/apple_touch_icon.png',
+            'badge': '/favicon-32x32.png',
         })
         webpush(
             subscription_info=subscription,
@@ -242,8 +257,21 @@ def dispatch_scrape_digest_notifications(user_id, listings, prefs, user_email=No
         if not to_mail:
             errors.append('Email enabled but no user email')
         else:
-            text_body = _format_batch_email_body(listings, email_item_template, email_batch_header)
-            ok, err = send_mailgun_email(to_mail, email_subject, text_body)
+            try:
+                from email_templates import build_listing_digest_email, build_unsubscribe_url
+                subject_html, html_body, text_body = build_listing_digest_email(
+                    listings, user_id, user_email=to_mail,
+                )
+                ok, err = send_mailgun_email(
+                    to_mail, subject_html, text_body,
+                    html_body=html_body,
+                    unsubscribe_url=build_unsubscribe_url(user_id),
+                )
+            except Exception as e:
+                # Never lose an alert to a template bug — fall back to plain text.
+                print(f'[email] HTML template failed ({e}); sending plain text', flush=True)
+                text_body = _format_batch_email_body(listings, email_item_template, email_batch_header)
+                ok, err = send_mailgun_email(to_mail, email_subject, text_body)
             if not ok:
                 errors.append(f'Email: {err}')
 

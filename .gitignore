@@ -1,6 +1,8 @@
 # Environment
-.env
-.env.local
+# `.env*` rather than plain `.env`: a backup like .env.backup-20260807 carries
+# every secret in the file it copied, and the bare pattern does not match it.
+.env*
+!.env.example
 
 # Python
 __pycache__/
@@ -8,13 +10,28 @@ __pycache__/
 .venv/
 venv/
 
-# IDE
+# IDE — machine-specific interpreter paths, not shareable config
 .idea/
 .vscode/
 
-# Separate projects
+# Separate projects (own repos / own Vercel deploys)
 frontend/
 .vercel/
 
 # System
 .DS_Store
+
+# Proxy credentials — supply as OFFERUP_PROXY_LIST env var instead
+proxies.txt
+
+# Local debug artifacts
+fb_debug.html
+*_debug.html
+
+# Local-only dev scripts and notes
+PIXELFLIP-HANDOFF.md
+test_scraper.py
+debug_fb.py
+test_email.py
+capture_fb_cookies.py
+start-backend.bat

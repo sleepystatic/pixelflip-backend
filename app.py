@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import threading
 import time
@@ -7,6 +7,7 @@ import shutil
 import json
 import secrets
 import hashlib
+import hmac
 import psycopg2
 from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
@@ -43,9 +44,15 @@ if _dsns:
         print(f"Sentry init skipped: {_se}", flush=True)
 
 try:
-    from scraper_multi_user import SCRAPING_USERS
+    # is_user_scraping() applies the staleness guard; reading SCRAPING_USERS
+    # directly would report a hung scrape as still running forever.
+    from scraper_multi_user import SCRAPING_USERS, is_user_scraping, set_user_scraping
 except Exception:
-    SCRAPING_USERS = set()
+    SCRAPING_USERS = {}
+    def is_user_scraping(_uid):
+        return False
+    def set_user_scraping(_uid, _active):
+        pass
 
 # Health check tracking (set by scraper thread)
 _health_last_scraper_cycle = None
@@ -295,24 +302,33 @@ def _effective_limits(us):
     return lim
 
 
+# Scan cadence is a plan feature. Facebook no longer carries its own floor —
+# the no-login Playwright path has no per-scrape cost, so it follows the same
+# tier cadence as the other marketplaces. Keep in sync with the identical
+# tables in scraper_multi_user.py.
+PLAN_INTERVAL_FLOOR_MINUTES = {'pro': 5, 'basic': 10}
+PLAN_INTERVAL_OPTIONS = {
+    'pro': [5, 10, 15, 30, 60],
+    'basic': [10, 15, 30, 60],
+}
+DEFAULT_INTERVAL_FLOOR_MINUTES = 10
+
+
+def _interval_floor_for_tier(tier):
+    return PLAN_INTERVAL_FLOOR_MINUTES.get(
+        (tier or '').strip().lower(), DEFAULT_INTERVAL_FLOOR_MINUTES
+    )
+
+
 def _effective_check_interval_minutes(us):
-    """Pro + Facebook Marketplace (Bright Data) enforces at least a 30-minute poll interval."""
+    """Clamp the user's chosen interval up to their plan's floor."""
     if not us:
-        return 10
+        return DEFAULT_INTERVAL_FLOOR_MINUTES
     try:
-        stored = int(us.get('check_interval_minutes') or 10)
+        stored = int(us.get('check_interval_minutes') or DEFAULT_INTERVAL_FLOOR_MINUTES)
     except (TypeError, ValueError):
-        stored = 10
-    plat = us.get('platforms') or {}
-    if isinstance(plat, str):
-        try:
-            plat = json.loads(plat)
-        except Exception:
-            plat = {}
-    plat = plat or {}
-    if _effective_plan_tier(us) == 'pro' and plat.get('facebook'):
-        return max(stored, 30)
-    return stored
+        stored = DEFAULT_INTERVAL_FLOOR_MINUTES
+    return max(stored, _interval_floor_for_tier(_effective_plan_tier(us)))
 
 
 def _plan_display_name(tier):
@@ -324,6 +340,17 @@ def _plan_display_name(tier):
     return None
 
 
+# Email categories a recipient can opt out of individually. Transactional mail
+# (receipts, password resets, billing failures) is deliberately NOT here: it is
+# exempt from unsubscribe rules and must keep sending, or users miss things like
+# a failed payment that costs them their account.
+EMAIL_CATEGORIES = {
+    'listing_alerts': True,    # the new-match digest — the core product
+    'product_updates': True,   # new features, changed behaviour
+    'marketing': True,         # tips, offers, promotions
+}
+
+
 def _normalize_notification_channels(raw):
     if isinstance(raw, str):
         try:
@@ -332,11 +359,14 @@ def _normalize_notification_channels(raw):
             raw = {}
     if not isinstance(raw, dict):
         raw = {}
-    return {
+    out = {
         'email': bool(raw.get('email', True)),
         'sms': bool(raw.get('sms', False)),
         'push': bool(raw.get('push', False)),
     }
+    for key, default in EMAIL_CATEGORIES.items():
+        out[key] = bool(raw.get(key, default))
+    return out
 
 
 def _sanitize_contact_phone(raw):
@@ -476,7 +506,16 @@ _cors_origins = [
     "https://api.pixelflip.app",       # The API itself
     "http://localhost:3000",           # Local Dev (React default)
     "http://localhost:3001",           # Local Dev (Your current port)
-    "http://127.0.0.1:3001"            # Local Dev (Alternative)
+    "http://127.0.0.1:3001",           # Local Dev (Alternative)
+    # Private LAN origins, so the dashboard can be opened on a phone during
+    # development (http://192.168.x.x:3000). Without these the browser blocks
+    # every API response and the app hangs on "verifying clearance".
+    # Safe to leave enabled: auth is a bearer token, not a cookie, and
+    # supports_credentials is False — CORS is not the security boundary here.
+    # These addresses are unroutable from the public internet anyway.
+    re.compile(r"^http://192\.168\.\d{1,3}\.\d{1,3}:\d+$"),
+    re.compile(r"^http://10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$"),
+    re.compile(r"^http://172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}:\d+$"),
 ]
 for _o in (os.getenv("CORS_ORIGINS") or "").split(","):
     _o = _o.strip()
@@ -503,9 +542,18 @@ def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         try:
-            from db_schema import ensure_buyer_delivery_columns, ensure_push_subscription_column
+            from db_schema import (
+                ensure_buyer_delivery_columns,
+                ensure_push_subscription_column,
+                ensure_per_term_exclusion_columns,
+                ensure_tour_column,
+                ensure_listing_uniqueness_per_user,
+            )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
+            ensure_per_term_exclusion_columns(conn)
+            ensure_tour_column(conn)
+            ensure_listing_uniqueness_per_user(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -564,6 +612,17 @@ def require_auth(f):
 user_logs = {}
 
 
+try:
+    # 50 was far too small: one scan that matches 30 listings logs a line each,
+    # which evicts the platform errors printed earlier in the same scan — the
+    # single most useful thing in the console. At ~150 bytes a line, 500 entries
+    # is well under a megabyte per active user. /api/status serves this
+    # incrementally (see `since`), so a bigger buffer costs no extra bandwidth.
+    MAX_USER_LOGS = max(50, int(os.getenv('MAX_USER_LOGS', '500')))
+except ValueError:
+    MAX_USER_LOGS = 500
+
+
 def add_log(user_id, message, log_type="info"):
     """Saves a log to the specific user's buffer to be sent to React.
     `ts` is UTC epoch seconds so the browser can format in the viewer's local timezone."""
@@ -574,11 +633,12 @@ def add_log(user_id, message, log_type="info"):
     ts = now_utc.timestamp()
     # Legacy `time` kept as UTC label so old cached clients are not misleading vs local `ts` display.
     time_utc = now_utc.strftime("%I:%M:%S %p UTC")
-    user_logs[user_id].append({"ts": ts, "time": time_utc, "message": message, "type": log_type})
+    logs = user_logs[user_id]
+    logs.append({"ts": ts, "time": time_utc, "message": message, "type": log_type})
 
-    # Keep only the last 50 logs so we don't run out of server memory
-    if len(user_logs[user_id]) > 50:
-        user_logs[user_id].pop(0)
+    # Trim in one slice rather than repeated pop(0), which is O(n) per call.
+    if len(logs) > MAX_USER_LOGS:
+        del logs[:len(logs) - MAX_USER_LOGS]
 
 
 def cleanup_old_listings():
@@ -718,7 +778,7 @@ def scraper_health(user_id):
         "scraper_error": scraper_status.get('error'),
         "scraper_thread_started": bool(_scraper_thread_started),
         "cleanup_thread_started": bool(_cleanup_thread_started),
-        "scrape_provider": "scrapingbee",
+        "scrape_provider": "playwright",
         "timestamp": int(time.time()),
     })
 
@@ -767,7 +827,7 @@ def get_status(user_id):
         next_check_timestamp = last_scraped + interval_secs
 
         current_now = time.time()
-        scraping_in_progress = user_id in SCRAPING_USERS
+        scraping_in_progress = is_user_scraping(user_id)
 
         # While a scrape is running, do not advance the countdown target — the UI pauses until the run completes.
         if scraping_in_progress:
@@ -783,6 +843,23 @@ def get_status(user_id):
         cursor.execute("SELECT COUNT(*) AS c FROM listings WHERE user_id = %s", (user_id,))
         listings_count = cursor.fetchone()['c']
 
+        # Console log delivery. This endpoint is polled every 2s, so shipping the
+        # whole buffer each time would waste real bandwidth now that it holds
+        # hundreds of lines. A client that passes `since` (the newest ts it
+        # already has) gets only what is new; omitting it returns a full
+        # snapshot, which is what a fresh page load wants.
+        activity = user_logs.get(user_id, [])
+        activity_partial = False
+        since_raw = request.args.get('since')
+        if since_raw:
+            try:
+                since_ts = float(since_raw)
+            except (TypeError, ValueError):
+                pass  # malformed cursor: fall back to a full snapshot
+            else:
+                activity = [l for l in activity if float(l.get('ts') or 0) > since_ts]
+                activity_partial = True
+
         return jsonify({
             "status": "running" if is_running else "stopped",
             "running": is_running,
@@ -793,7 +870,10 @@ def get_status(user_id):
             "matches_found_today": 0,
             "next_check_timestamp": next_check_timestamp_out,
             "scraping_in_progress": scraping_in_progress,
-            "recent_activity": user_logs.get(user_id, [])
+            "recent_activity": activity,
+            # True when `activity` is a delta the client should APPEND. False
+            # means it is a full snapshot to replace with.
+            "activity_partial": activity_partial,
         })
     finally:
         cursor.close()
@@ -818,18 +898,29 @@ def handle_settings(user_id):
             cursor.execute("SELECT * FROM user_settings WHERE user_id = %s;", (user_id,))
             us = cursor.fetchone()
 
-            # THE FIX: Added min_price to the SELECT statement and added 'None' safety nets
+            # NULL min/max means "any price" — an unset bound, not zero. Keep it
+            # as None all the way to the client so the input renders empty.
             cursor.execute("SELECT search_term, max_price, min_price FROM user_search_terms WHERE user_id = %s;",
                            (user_id,))
             terms = {
                 row['search_term']: {
-                    'max': float(row['max_price'] if row['max_price'] is not None else 0),
-                    'min': float(row['min_price'] if row['min_price'] is not None else 0)
+                    'max': float(row['max_price']) if row['max_price'] is not None else None,
+                    'min': float(row['min_price']) if row['min_price'] is not None else None,
+                    'exclusions': [],
                 } for row in cursor.fetchall()
             }
 
-            cursor.execute("SELECT keyword FROM user_exclusions WHERE user_id = %s;", (user_id,))
-            exclusions = [row['keyword'] for row in cursor.fetchall()]
+            # Exclusions are per search term. Rows with a NULL search_term are
+            # pre-migration leftovers and are ignored (and cleared on next save).
+            cursor.execute(
+                "SELECT keyword, search_term FROM user_exclusions "
+                "WHERE user_id = %s AND search_term IS NOT NULL;", (user_id,)
+            )
+            exclusions = []
+            for row in cursor.fetchall():
+                term = row.get('search_term')
+                if term in terms:
+                    terms[term]['exclusions'].append(row['keyword'])
 
             if not us:
                 return jsonify({
@@ -930,11 +1021,12 @@ def handle_settings(user_id):
             if tier_eff != 'pro':
                 plat['facebook'] = False
             try:
-                check_iv = int(data.get('check_interval', 10))
+                check_iv = int(data.get('check_interval', DEFAULT_INTERVAL_FLOOR_MINUTES))
             except (TypeError, ValueError):
-                check_iv = 10
-            if tier_eff == 'pro' and plat.get('facebook'):
-                check_iv = max(check_iv, 30)
+                check_iv = DEFAULT_INTERVAL_FLOOR_MINUTES
+            # Enforce the plan floor server-side: the dropdown already limits the
+            # options, but the API must not trust the client to respect them.
+            check_iv = max(check_iv, _interval_floor_for_tier(tier_eff))
 
             try:
                 bl_buy, bs_buy = _coerce_buyer_prefs_from_post(data, us_row)
@@ -962,16 +1054,34 @@ def handle_settings(user_id):
             # REPLACE Search Terms
             # POST: Save both max and min to the database
             cursor.execute("DELETE FROM user_search_terms WHERE user_id = %s;", (user_id,))
+
+            def _price_or_none(v):
+                """'' / None / non-numeric all mean 'no bound', stored as NULL."""
+                if v is None or v == '':
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
             for term, prices in thresholds_in.items():
+                prices = prices or {}
                 cursor.execute(
                     "INSERT INTO user_search_terms (user_id, search_term, max_price, min_price) VALUES (%s, %s, %s, %s);",
-                    (user_id, term, prices.get('max', 0), prices.get('min', 0))
+                    (user_id, term, _price_or_none(prices.get('max')), _price_or_none(prices.get('min')))
                 )
 
-            # REPLACE Exclusions
+            # REPLACE Exclusions — all per-term. The DELETE also clears any
+            # pre-migration global rows, so saving settings once cleans them out.
             cursor.execute("DELETE FROM user_exclusions WHERE user_id = %s;", (user_id,))
-            for keyword in data.get('excluded_keywords', []):
-                cursor.execute("INSERT INTO user_exclusions (user_id, keyword) VALUES (%s, %s);", (user_id, keyword))
+            for term, prices in thresholds_in.items():
+                for keyword in ((prices or {}).get('exclusions') or []):
+                    kw = str(keyword).strip()
+                    if kw:
+                        cursor.execute(
+                            "INSERT INTO user_exclusions (user_id, keyword, search_term) VALUES (%s, %s, %s);",
+                            (user_id, kw, term),
+                        )
 
             conn.commit()
             out = dict(data)
@@ -1032,6 +1142,251 @@ def update_account_contact(user_id):
         conn.close()
 
 
+_UNSUB_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>{title} · PixelFlip</title></head>
+<body style="margin:0;background:#F7FAFC;font-family:'SF Mono',SFMono-Regular,Consolas,Menlo,monospace;">
+  <div style="max-width:520px;margin:64px auto;padding:0 16px;">
+    <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);background-color:#764ba2;
+                border-radius:12px 12px 0 0;padding:24px;">
+      <div style="font-size:21px;font-weight:700;color:#fff;letter-spacing:-0.4px;">PixelFlip</div>
+    </div>
+    <div style="background:#fff;border:1px solid #E2E8F0;border-top:none;border-radius:0 0 12px 12px;
+                padding:32px 24px;text-align:center;">
+      <h1 style="font-size:18px;color:#2D3748;margin:0 0 12px;">{title}</h1>
+      <p style="font-size:14px;line-height:1.6;color:#718096;margin:0 0 24px;">{body}</p>
+      <a href="{app_url}/settings" style="display:inline-block;background:#764ba2;color:#fff;
+         font-size:14px;font-weight:600;text-decoration:none;padding:12px 26px;border-radius:8px;">
+        Manage alert preferences
+      </a>
+    </div>
+  </div>
+</body></html>"""
+
+
+_UNSUB_PAGE_RAW = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>{title} · PixelFlip</title></head>
+<body style="margin:0;background:#F7FAFC;font-family:'SF Mono',SFMono-Regular,Consolas,Menlo,monospace;">
+  <div style="max-width:520px;margin:56px auto;padding:0 16px;">
+    <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);background-color:#764ba2;
+                border-radius:12px 12px 0 0;padding:24px;">
+      <div style="font-size:21px;font-weight:700;color:#fff;letter-spacing:-0.4px;">PixelFlip</div>
+    </div>
+    <div style="background:#fff;border:1px solid #E2E8F0;border-top:none;border-radius:0 0 12px 12px;
+                padding:28px 24px;text-align:center;">
+      <h1 style="font-size:18px;color:#2D3748;margin:0 0 16px;">{title}</h1>
+      {body}
+    </div>
+  </div>
+</body></html>"""
+
+
+def _unsub_response(title, body, status=200, raw_body=False):
+    """`raw_body=True` passes HTML through instead of wrapping it as a paragraph."""
+    # dashboard., not app. — that is the subdomain that actually resolves.
+    app_url = (os.getenv('FRONTEND_URL') or 'https://dashboard.pixelflip.app').rstrip('/')
+    if raw_body:
+        html = _UNSUB_PAGE_RAW.format(title=title, body=body)
+    else:
+        html = _UNSUB_PAGE.format(title=title, body=body, app_url=app_url)
+    return Response(html, status=status, mimetype='text/html')
+
+
+def _get_notification_channels(user_id):
+    """Current channel/category prefs for a user, or None on DB failure."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT notification_channels FROM user_settings WHERE user_id = %s", (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        current = row[0] if not isinstance(row, dict) else row.get('notification_channels')
+        return _normalize_notification_channels(current)
+    except Exception as e:
+        print(f'[unsubscribe] read error: {e}', flush=True)
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _update_notification_channels(user_id, updates):
+    """Merge `updates` into the user's stored prefs. Returns True on success."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT notification_channels FROM user_settings WHERE user_id = %s", (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+        current = row[0] if not isinstance(row, dict) else row.get('notification_channels')
+        channels = _normalize_notification_channels(current)
+        channels.update(updates)
+        cursor.execute(
+            "UPDATE user_settings SET notification_channels = %s::jsonb WHERE user_id = %s",
+            (json.dumps(channels), user_id),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f'[unsubscribe] write error: {e}', flush=True)
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+_PREF_LABELS = [
+    ('listing_alerts', 'Listing alerts',
+     'New marketplace matches from your saved searches. This is the core PixelFlip alert.'),
+    ('product_updates', 'Product updates',
+     'New features and meaningful changes to how PixelFlip works.'),
+    ('marketing', 'Tips & offers',
+     'Reselling tips, occasional promotions and product news.'),
+]
+
+
+def _pref_form(user_id, token, channels, saved=False):
+    """Preference centre: choose which email types to receive."""
+    rows = []
+    for key, label, desc in _PREF_LABELS:
+        checked = 'checked' if channels.get(key, True) else ''
+        rows.append(f'''
+        <label style="display:block;text-align:left;border:1px solid #E2E8F0;border-radius:8px;
+                      padding:14px 16px;margin-bottom:10px;cursor:pointer;">
+          <input type="checkbox" name="cat" value="{key}" {checked}
+                 style="margin-right:10px;vertical-align:top;margin-top:3px;" />
+          <span style="font-weight:600;color:#2D3748;font-size:14px;">{label}</span>
+          <div style="margin-left:24px;font-size:12px;color:#718096;line-height:1.5;">{desc}</div>
+        </label>''')
+
+    banner = ''
+    if saved:
+        banner = ('<div style="background:#F0FFF4;border:1px solid #9AE6B4;color:#22543D;'
+                  'border-radius:8px;padding:11px;margin-bottom:18px;font-size:13px;">'
+                  'Your preferences have been saved.</div>')
+
+    # dashboard., not app. — that is the subdomain that actually resolves.
+    app_url = (os.getenv('FRONTEND_URL') or 'https://dashboard.pixelflip.app').rstrip('/')
+    body = f'''
+      {banner}
+      <p style="font-size:13px;line-height:1.6;color:#718096;margin:0 0 18px;text-align:left;">
+        Choose which emails you'd like to receive. Unchecking everything stops all
+        marketing and alert email. Account and billing notices are always sent.
+      </p>
+      <form method="POST" action="/unsubscribe">
+        <input type="hidden" name="uid" value="{_esc_attr(user_id)}" />
+        <input type="hidden" name="token" value="{_esc_attr(token)}" />
+        <input type="hidden" name="form" value="1" />
+        {''.join(rows)}
+        <button type="submit"
+                style="width:100%;background:#764ba2;color:#fff;border:none;border-radius:8px;
+                       padding:13px;font-size:14px;font-weight:600;cursor:pointer;
+                       font-family:inherit;margin-top:6px;">
+          Save preferences
+        </button>
+      </form>
+      <form method="POST" action="/unsubscribe" style="margin-top:10px;">
+        <input type="hidden" name="uid" value="{_esc_attr(user_id)}" />
+        <input type="hidden" name="token" value="{_esc_attr(token)}" />
+        <input type="hidden" name="form" value="1" />
+        <button type="submit"
+                style="width:100%;background:transparent;color:#718096;border:1px solid #CBD5E0;
+                       border-radius:8px;padding:11px;font-size:13px;cursor:pointer;
+                       font-family:inherit;">
+          Unsubscribe from all
+        </button>
+      </form>
+      <div style="margin-top:16px;font-size:12px;">
+        <a href="{app_url}/settings" style="color:#667eea;">Open full settings</a>
+      </div>'''
+    return _unsub_response('Email preferences', body, raw_body=True)
+
+
+def _esc_attr(v):
+    return (str(v or '').replace('&', '&amp;').replace('"', '&quot;')
+            .replace('<', '&lt;').replace('>', '&gt;'))
+
+
+@app.route('/unsubscribe', methods=['GET', 'POST'])
+@app.route('/api/unsubscribe', methods=['GET', 'POST'])
+def unsubscribe():
+    """
+    Email preference centre + one-click unsubscribe. Deliberately
+    unauthenticated: a recipient must be able to opt out straight from the
+    email, and CAN-SPAM plus the Gmail/Yahoo bulk-sender rules require it to
+    work in one step. A signed token stands in for a login.
+
+    Three cases:
+      * POST with List-Unsubscribe=One-Click — Gmail's native control. Must opt
+        the user out immediately, with no page and no confirmation step.
+      * GET  — a human clicked the footer link: show the preference centre.
+      * POST from that form — save the chosen categories.
+    """
+    form = request.form if request.form else {}
+    user_id = (request.args.get('uid') or form.get('uid') or '').strip()
+    token = (request.args.get('token') or form.get('token') or '').strip()
+
+    if not user_id or not token:
+        return _unsub_response('Invalid link', 'This unsubscribe link is missing information.', 400)
+
+    try:
+        from email_templates import make_unsubscribe_token
+        expected = make_unsubscribe_token(user_id)
+    except Exception as e:
+        print(f'[unsubscribe] token build failed: {e}', flush=True)
+        return _unsub_response('Something went wrong',
+                               'We could not process this request. Please try again.', 500)
+
+    # Constant-time compare so the token can't be guessed byte by byte.
+    if not hmac.compare_digest(token, expected):
+        return _unsub_response('Invalid link',
+                               'This unsubscribe link is not valid or has expired.', 400)
+
+    # Gmail/Yahoo one-click: opt out of everything opt-out-able, immediately.
+    if request.method == 'POST' and not form.get('form'):
+        updates = {k: False for k in EMAIL_CATEGORIES}
+        updates['email'] = False
+        if _update_notification_channels(user_id, updates) is None:
+            return _unsub_response('Something went wrong',
+                                   'We could not update your preferences.', 500)
+        return _unsub_response(
+            'Unsubscribed',
+            'You will no longer receive alert or marketing email from PixelFlip. '
+            'Your searches keep running, and you can turn email back on any time.',
+        )
+
+    if request.method == 'POST':
+        selected = set(request.form.getlist('cat'))
+        updates = {k: (k in selected) for k in EMAIL_CATEGORIES}
+        # The email channel stays on only while at least one category is wanted.
+        updates['email'] = bool(selected)
+        if _update_notification_channels(user_id, updates) is None:
+            return _unsub_response('Something went wrong',
+                                   'We could not update your preferences.', 500)
+        channels = _get_notification_channels(user_id) or updates
+        return _pref_form(user_id, token, channels, saved=True)
+
+    channels = _get_notification_channels(user_id)
+    if channels is None:
+        return _unsub_response('Something went wrong',
+                               'We could not load your preferences.', 500)
+    return _pref_form(user_id, token, channels or dict(EMAIL_CATEGORIES))
+
+
 @app.route('/api/start', methods=['POST', 'OPTIONS'])
 @app.route('/api/start/', methods=['POST', 'OPTIONS'])
 @app.route('/start', methods=['POST', 'OPTIONS'])
@@ -1070,16 +1425,32 @@ def stop_scraper(user_id):
     if not conn: return jsonify({"error": "DB error"}), 500
     try:
         cursor = conn.cursor()
+        # Do NOT touch last_scraped_at here. Stopping is not scraping, and
+        # stamping it started the countdown from the moment the user hit STOP —
+        # so pressing START again meant waiting a full interval for a scan that
+        # had never run. That produced "ghost scrapes": a fresh timestamp, a
+        # ticking timer, no listings and no logs.
         cursor.execute(
-            """
-            UPDATE user_settings
-            SET is_active = FALSE,
-                last_scraped_at = NOW()
-            WHERE user_id = %s;
-            """,
+            "UPDATE user_settings SET is_active = FALSE WHERE user_id = %s;",
             (user_id,)
         )
         conn.commit()
+        # is_user_active() caches for a few seconds so the per-listing check in
+        # the result loop is not 295 fresh TLS connections. Drop that entry now
+        # or STOP could take the whole TTL to be noticed.
+        try:
+            from scraper_multi_user import _invalidate_active_cache
+            _invalidate_active_cache(user_id)
+        except Exception:
+            pass
+        # An in-flight scrape only notices is_active between platforms, so the
+        # dashboard could sit on "SCRAPING..." long after Stop was pressed.
+        # Clearing the flag here makes the UI reflect the user's intent
+        # immediately; the running scrape still exits at its next checkpoint.
+        try:
+            set_user_scraping(user_id, False)
+        except Exception:
+            pass
         return jsonify({"success": True, "status": "stopped"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1455,6 +1826,25 @@ def create_checkout(user_id):
         flush=True,
     )
     base = _frontend_base_url(request.headers.get('Origin'))
+
+    # Stripe never auto-applies a coupon to an API-created Checkout Session.
+    # Restricting a coupon to specific products only limits where it is VALID —
+    # it does not attach it to anything. A session gets a discount exactly two
+    # ways, and they are mutually exclusive:
+    #   discounts=[...]            -> applied for the customer, no code to type
+    #   allow_promotion_codes=True -> customer types a promotion code
+    # Set STRIPE_PREBETA_COUPON_ID to the coupon id (looks like 'AbC123xY', not
+    # the name) for silent pre-beta pricing; unset it when pre-beta ends and
+    # checkout falls back to the manual promotion-code field.
+    prebeta_coupon = (os.getenv('STRIPE_PREBETA_COUPON_ID') or '').strip()
+    discount_kwargs = (
+        {'discounts': [{'coupon': prebeta_coupon}]}
+        if prebeta_coupon
+        else {'allow_promotion_codes': True}
+    )
+    print(f"[Stripe checkout] discount={'coupon ' + prebeta_coupon if prebeta_coupon else 'promo-code field'}",
+          flush=True)
+
     try:
         checkout_session = stripe.checkout.Session.create(
             mode='subscription',
@@ -1463,7 +1853,7 @@ def create_checkout(user_id):
             metadata={'user_id': user_id, 'plan': plan},
             success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{base}/?checkout=canceled",
-            allow_promotion_codes=True,
+            **discount_kwargs,
         )
         return jsonify({'url': checkout_session.url})
     except Exception as e:
@@ -1618,6 +2008,36 @@ def cancel_subscription_at_period_end(user_id):
         conn.close()
 
 
+def _iso_utc(value):
+    """
+    Serialize a datetime with an explicit UTC offset.
+
+    `listings.created_at` is `timestamp WITHOUT time zone`, so psycopg2 hands
+    back a naive datetime and a bare .isoformat() emits no offset at all:
+
+        2026-08-04T19:11:26.704634
+
+    ECMA-262 parses an offsetless date-TIME string as LOCAL time (only
+    date-only forms default to UTC). So `new Date(...)` in the browser read
+    every UTC timestamp as though it were the viewer's wall clock and shifted
+    each listing into the future by their whole UTC offset — "Found just now"
+    on an hour-old listing, "6h ago" on one from the night before.
+
+    Note this is NOT what Flask's default datetime serializer does; jsonify
+    would emit an RFC-822 string ending in GMT, which parses correctly. The bug
+    only existed because this endpoint stringified the value first.
+
+    The column holds UTC (NOW() with the DB on UTC), so stamping UTC on a naive
+    value is correct. Already-aware values like listed_at (TIMESTAMPTZ) keep
+    their own offset.
+    """
+    if value is None or not hasattr(value, 'isoformat'):
+        return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
 @app.route('/api/listings', methods=['GET', 'OPTIONS'])
 @app.route('/listings', methods=['GET', 'OPTIONS'])
 @require_auth
@@ -1713,12 +2133,8 @@ def list_scraped_listings(user_id):
         total = cursor.fetchone()['c']
         out = []
         for r in rows:
-            created = r['created_at']
-            if hasattr(created, 'isoformat'):
-                created = created.isoformat()
-            listed = r.get('listed_at')
-            if listed is not None and hasattr(listed, 'isoformat'):
-                listed = listed.isoformat()
+            created = _iso_utc(r['created_at'])
+            listed = _iso_utc(r.get('listed_at'))
             price = r['price']
             if price is not None:
                 try:
@@ -1742,6 +2158,77 @@ def list_scraped_listings(user_id):
     finally:
         cursor.close()
         conn.close()
+
+
+SUPPORT_INBOX_EMAIL = os.getenv('SUPPORT_INBOX_EMAIL', 'support@pixelflip.app')
+_SUPPORT_COOLDOWN_SECONDS = 60
+_support_last_sent = {}
+
+
+@app.route('/api/support/message', methods=['POST', 'OPTIONS'])
+@app.route('/support/message', methods=['POST', 'OPTIONS'])
+@require_auth
+def submit_support_message(user_id):
+    """
+    Where Flip's help chat hands off when it has no canned answer.
+
+    Authenticated deliberately. This endpoint sends mail, so leaving it open
+    would make it a spam relay pointed at our own inbox — and since the caller
+    is logged in we can read their address from auth.users instead of trusting
+    a field in the request body that anyone could forge.
+    """
+    data = request.get_json(silent=True) or {}
+    message = (data.get('message') or '').strip()
+    if len(message) < 5:
+        return jsonify({"success": False, "error": "Add a little more detail so we can help."}), 400
+    if len(message) > 4000:
+        message = message[:4000] + '\n\n[truncated]'
+
+    # Per-user cooldown: auth stops strangers, not an impatient user clicking
+    # send five times because the first one appeared to do nothing.
+    now = time.time()
+    elapsed = now - _support_last_sent.get(user_id, 0)
+    if elapsed < _SUPPORT_COOLDOWN_SECONDS:
+        wait = int(_SUPPORT_COOLDOWN_SECONDS - elapsed) or 1
+        return jsonify({
+            "success": False,
+            "error": f"Message already sent — you can send another in {wait}s.",
+        }), 429
+
+    try:
+        from scraper_multi_user import get_user_auth_email
+        sender = get_user_auth_email(user_id) or '(address unavailable)'
+    except Exception:
+        sender = '(address unavailable)'
+
+    subject = f'[PixelFlip help] {message.splitlines()[0][:60]}'
+    body = (
+        f'From:    {sender}\n'
+        f'User ID: {user_id}\n'
+        f'Sent:    {datetime.now(timezone.utc).isoformat()}\n'
+        f'{"-" * 52}\n\n'
+        f'{message}\n'
+    )
+
+    # Log before sending: if Mailgun is down, the message still exists
+    # somewhere rather than disappearing with the user's only copy of it.
+    print(f"📮 support message from {sender} ({len(message)} chars)", flush=True)
+
+    try:
+        from listing_notifications import send_mailgun_email
+        ok, err = send_mailgun_email(SUPPORT_INBOX_EMAIL, subject, body)
+    except Exception as e:
+        ok, err = False, str(e)
+
+    if not ok:
+        print(f"❌ support message send failed: {err}\n{body}", flush=True)
+        return jsonify({
+            "success": False,
+            "error": f"Could not send that. Email us directly at {SUPPORT_INBOX_EMAIL}.",
+        }), 502
+
+    _support_last_sent[user_id] = now
+    return jsonify({"success": True})
 
 
 @app.route('/api/request-password-reset-code', methods=['POST', 'OPTIONS'])
@@ -2030,6 +2517,113 @@ def push_unsubscribe(user_id):
         conn.close()
 
 
+@app.route('/api/push/test', methods=['POST', 'OPTIONS'])
+@app.route('/push/test', methods=['POST', 'OPTIONS'])
+@require_auth
+def push_test(user_id):
+    """
+    Fire a test notification at the caller's stored subscription.
+
+    Push can't be verified from an automated browser (Playwright-launched
+    Chrome can't register with FCM), so this gives the user a one-click way to
+    confirm the whole chain — subscription stored, VAPID signing, delivery,
+    service worker display — from a real browser.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT push_subscription FROM user_settings WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        sub = row.get('push_subscription') if row else None
+        if isinstance(sub, str):
+            try:
+                sub = json.loads(sub)
+            except Exception:
+                sub = None
+        if not sub or not sub.get('endpoint'):
+            return jsonify({
+                "success": False,
+                "error": "No push subscription saved. Enable push notifications first."
+            }), 400
+
+        from listing_notifications import send_web_push
+        ok, err = send_web_push(
+            sub,
+            'PixelFlip test',
+            'Push notifications are working — real alerts will look like this.',
+            '/',
+        )
+        if not ok:
+            return jsonify({"success": False, "error": err or 'send failed'}), 502
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/tour', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/tour', methods=['GET', 'POST', 'OPTIONS'])
+@require_auth
+def tour_progress(user_id):
+    """
+    Which tour sections this user has completed.
+
+    Stored server-side rather than in localStorage so a user who onboards on
+    their phone doesn't get the tour again on desktop. Shape is
+    {"intro": true, "first_scan": false} — a dict, so new sections can be
+    added later and shown only to people who haven't seen that one.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database connection failed"}), 500
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if request.method == 'GET':
+            cursor.execute("SELECT has_seen_tour FROM user_settings WHERE user_id = %s", (user_id,))
+            row = cursor.fetchone()
+            seen = (row or {}).get('has_seen_tour') or {}
+            if isinstance(seen, str):
+                try:
+                    seen = json.loads(seen)
+                except Exception:
+                    seen = {}
+            return jsonify({"seen": seen})
+
+        data = request.get_json(silent=True) or {}
+        section = (data.get('section') or '').strip()
+        if not section:
+            return jsonify({"error": "section required"}), 400
+
+        # Merge rather than replace, so completing one section can't wipe the
+        # record of another.
+        cursor.execute(
+            """
+            UPDATE user_settings
+            SET has_seen_tour = COALESCE(has_seen_tour, '{}'::jsonb) || %s::jsonb
+            WHERE user_id = %s
+            RETURNING has_seen_tour
+            """,
+            (json.dumps({section: bool(data.get('done', True))}), user_id),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return jsonify({"success": True, "seen": (row or {}).get('has_seen_tour') or {}})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 @app.route('/health', methods=['GET', 'OPTIONS'])
 def health_check():
@@ -2077,10 +2671,83 @@ def health_check():
     return jsonify(status), code
 
 
-if __name__ == '__main__':
-    # Start scraper thread
-    scraper_thread = threading.Thread(target=start_background_scraper, daemon=True)
-    scraper_thread.start()
+def _preflight_or_die(port):
+    """
+    Refuse to start if this process would be a broken or duplicate backend.
 
+    Both checks exist because their failure modes are silent and expensive.
+
+    1. Duplicate instance. A second app.py still starts its own scraper thread.
+       Both processes then scrape the same users, both stamp last_scraped_at,
+       and console logs live in per-process memory — so the dashboard shows the
+       console of whichever process won the port while the other one does the
+       actual scraping. The symptom is a "ghost scrape": no output, no results
+       on screen, and a burned interval, with rows quietly landing in the DB.
+       Exiting here is far better than running invisibly.
+
+    2. Wrong interpreter. System Python has no Playwright/patchright, so every
+       browser scraper returns an empty string instantly while Craigslist keeps
+       working (it only needs requests). That reads exactly like the
+       marketplaces blocking you, and it has burned several debugging sessions.
+    """
+    import socket
+    import sys
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(('0.0.0.0', port))
+    except OSError:
+        print(
+            f"\n{'=' * 68}\n"
+            f"  REFUSING TO START — port {port} is already in use.\n\n"
+            f"  Another app.py is almost certainly running. A second one would\n"
+            f"  start its own scraper thread, burn scan intervals, and log to a\n"
+            f"  console the dashboard never reads.\n\n"
+            f"  Find it:  Get-CimInstance Win32_Process -Filter \"Name LIKE '%python%'\"\n"
+            f"{'=' * 68}\n",
+            flush=True,
+        )
+        sys.exit(1)
+    finally:
+        probe.close()
+
+    missing = [
+        name for name in ('playwright', 'patchright')
+        if __import__('importlib.util', fromlist=['util']).find_spec(name) is None
+    ]
+    if missing:
+        print(
+            f"\n{'=' * 68}\n"
+            f"  REFUSING TO START — missing: {', '.join(missing)}\n\n"
+            f"  Running interpreter:\n    {sys.executable}\n\n"
+            f"  Every browser scraper would return nothing instantly while\n"
+            f"  Craigslist kept working, which looks like an anti-bot block.\n\n"
+            f"  Start it with the venv interpreter instead:\n"
+            f"    .\\.venv\\Scripts\\python.exe app.py\n"
+            f"{'=' * 68}\n",
+            flush=True,
+        )
+        sys.exit(1)
+
+
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+
+    # Must run BEFORE the scraper thread starts — the thread is what does the
+    # damage when a second instance slips through.
+    _preflight_or_die(port)
+
+    # ensure_scraper_thread_started() already runs at import time and starts the
+    # loop when ENABLE_SCRAPER_THREAD=1. Starting another here would give this
+    # single process TWO scraper threads competing over the same users — the
+    # ghost-scrape failure, but inside one PID, where the port guard cannot see
+    # it. ENABLE_SCRAPER_THREAD exists for gunicorn, where __main__ never runs.
+    if _scraper_thread_started:
+        print("Scraper thread already started via ENABLE_SCRAPER_THREAD "
+              "(that flag is for gunicorn; it is not needed with `python app.py`).",
+              flush=True)
+    else:
+        scraper_thread = threading.Thread(target=start_background_scraper, daemon=True)
+        scraper_thread.start()
+
     app.run(host='0.0.0.0', port=port, debug=False)

@@ -1,0 +1,765 @@
+[
+ {
+  "slug": "albuquerque",
+  "name": "Albuquerque",
+  "lat": 35.0873,
+  "lon": -106.6506,
+  "valid": true
+ },
+ {
+  "slug": "anchorage",
+  "name": "Anchorage",
+  "lat": 61.2175,
+  "lon": -149.8917,
+  "valid": true
+ },
+ {
+  "slug": "annarbor",
+  "name": "Ann Arbor",
+  "lat": 42.2745,
+  "lon": -83.7393,
+  "valid": true
+ },
+ {
+  "slug": "appleton",
+  "name": "Appleton",
+  "lat": 44.2655,
+  "lon": -88.4017,
+  "valid": true
+ },
+ {
+  "slug": "arlington",
+  "name": "Arlington",
+  "lat": 32.739,
+  "lon": -97.1145,
+  "valid": true
+ },
+ {
+  "slug": "atlanta",
+  "name": "Atlanta",
+  "lat": 33.7566,
+  "lon": -84.3889,
+  "valid": true
+ },
+ {
+  "slug": "augusta",
+  "name": "Augusta",
+  "lat": 33.4479,
+  "lon": -82.0067,
+  "valid": true
+ },
+ {
+  "slug": "austin",
+  "name": "Austin",
+  "lat": 30.2677,
+  "lon": -97.7475,
+  "valid": true
+ },
+ {
+  "slug": "baltimore",
+  "name": "Baltimore",
+  "lat": 39.2944,
+  "lon": -76.614,
+  "valid": true
+ },
+ {
+  "slug": "bangor",
+  "name": "Bangor",
+  "lat": 44.8109,
+  "lon": -68.783,
+  "valid": true
+ },
+ {
+  "slug": "batonrouge",
+  "name": "Baton Rouge",
+  "lat": 30.4581,
+  "lon": -91.1402,
+  "valid": true
+ },
+ {
+  "slug": "boise",
+  "name": "Boise",
+  "lat": 43.6141,
+  "lon": -116.2038,
+  "valid": true
+ },
+ {
+  "slug": "boston",
+  "name": "Boston",
+  "lat": 42.3577,
+  "lon": -71.0565,
+  "valid": true
+ },
+ {
+  "slug": "bowling-green-ky",
+  "name": "Bowling Green",
+  "lat": 36.9817,
+  "lon": -86.4444,
+  "valid": true
+ },
+ {
+  "slug": "buffalo",
+  "name": "Buffalo",
+  "lat": 42.9047,
+  "lon": -78.8494,
+  "valid": true
+ },
+ {
+  "slug": "cedar-rapids",
+  "name": "Cedar Rapids",
+  "lat": 41.9831,
+  "lon": -91.6685,
+  "valid": true
+ },
+ {
+  "slug": "charleston",
+  "name": "Charleston",
+  "lat": 32.7872,
+  "lon": -79.9372,
+  "valid": true
+ },
+ {
+  "slug": "charlotte",
+  "name": "Charlotte",
+  "lat": 35.226944444444,
+  "lon": -80.843333333333,
+  "valid": true
+ },
+ {
+  "slug": "chattanooga-tn",
+  "name": "Chattanooga",
+  "lat": 35.0455,
+  "lon": -85.2673,
+  "valid": true
+ },
+ {
+  "slug": "chicago",
+  "name": "Chicago",
+  "lat": 41.883222,
+  "lon": -87.632496,
+  "valid": true
+ },
+ {
+  "slug": "cincinnati",
+  "name": "Cincinnati",
+  "lat": 39.133333333333,
+  "lon": -84.5,
+  "valid": true
+ },
+ {
+  "slug": "cleveland",
+  "name": "Cleveland",
+  "lat": 41.4996,
+  "lon": -81.6937,
+  "valid": true
+ },
+ {
+  "slug": "coloradosprings",
+  "name": "Colorado Springs",
+  "lat": 38.8301,
+  "lon": -104.8207,
+  "valid": true
+ },
+ {
+  "slug": "columbia-mo",
+  "name": "Columbia",
+  "lat": 38.9484,
+  "lon": -92.3338,
+  "valid": true
+ },
+ {
+  "slug": "columbus",
+  "name": "Columbus",
+  "lat": 39.9624,
+  "lon": -82.9996,
+  "valid": true
+ },
+ {
+  "slug": "connersville",
+  "name": "Connersville",
+  "lat": 39.6539,
+  "lon": -85.1377,
+  "valid": true
+ },
+ {
+  "slug": "dallas",
+  "name": "Dallas",
+  "lat": 32.7774,
+  "lon": -96.7977,
+  "valid": true
+ },
+ {
+  "slug": "dc",
+  "name": "Washington D.C.",
+  "lat": 38.8951,
+  "lon": -77.0367,
+  "valid": true
+ },
+ {
+  "slug": "decatur-il",
+  "name": "Decatur",
+  "lat": 39.8516,
+  "lon": -88.9442,
+  "valid": true
+ },
+ {
+  "slug": "denver",
+  "name": "Denver",
+  "lat": 39.7391,
+  "lon": -104.98360001,
+  "valid": true
+ },
+ {
+  "slug": "desmoines",
+  "name": "Des Moines",
+  "lat": 41.5909,
+  "lon": -93.6209,
+  "valid": true
+ },
+ {
+  "slug": "detroit",
+  "name": "Detroit",
+  "lat": 42.3368,
+  "lon": -83.0507,
+  "valid": true
+ },
+ {
+  "slug": "duluth",
+  "name": "Duluth",
+  "lat": 46.7838,
+  "lon": -92.1053,
+  "valid": true
+ },
+ {
+  "slug": "edmond",
+  "name": "Edmond",
+  "lat": 35.6547,
+  "lon": -97.4726,
+  "valid": true
+ },
+ {
+  "slug": "elpaso",
+  "name": "El Paso",
+  "lat": 31.7658,
+  "lon": -106.489,
+  "valid": true
+ },
+ {
+  "slug": "evansville",
+  "name": "Evansville",
+  "lat": 37.9772,
+  "lon": -87.5506,
+  "valid": true
+ },
+ {
+  "slug": "fort-myers-fl",
+  "name": "Fort Myers",
+  "lat": 26.6318,
+  "lon": -81.8571,
+  "valid": true
+ },
+ {
+  "slug": "fort-wayne",
+  "name": "Fort Wayne",
+  "lat": 41.0805,
+  "lon": -85.1392,
+  "valid": true
+ },
+ {
+  "slug": "fortworth",
+  "name": "Fort Worth",
+  "lat": 32.7574,
+  "lon": -97.3332,
+  "valid": true
+ },
+ {
+  "slug": "fresno",
+  "name": "Fresno",
+  "lat": 36.7398,
+  "lon": -119.7839,
+  "valid": true
+ },
+ {
+  "slug": "grandrapids",
+  "name": "Grand Rapids",
+  "lat": 42.9613,
+  "lon": -85.6557,
+  "valid": true
+ },
+ {
+  "slug": "greenbay",
+  "name": "Green Bay",
+  "lat": 44.513333333333,
+  "lon": -88.015833333333,
+  "valid": true
+ },
+ {
+  "slug": "greenville",
+  "name": "Greenville",
+  "lat": 34.8443,
+  "lon": -82.3854,
+  "valid": true
+ },
+ {
+  "slug": "honolulu",
+  "name": "Honolulu",
+  "lat": 21.3086,
+  "lon": -157.8615,
+  "valid": true
+ },
+ {
+  "slug": "houston",
+  "name": "Houston",
+  "lat": 29.7602,
+  "lon": -95.3694,
+  "valid": true
+ },
+ {
+  "slug": "huntsville",
+  "name": "Huntsville",
+  "lat": 34.7123,
+  "lon": -86.5963,
+  "valid": true
+ },
+ {
+  "slug": "indianapolis",
+  "name": "Indianapolis",
+  "lat": 39.7692,
+  "lon": -86.1582,
+  "valid": true
+ },
+ {
+  "slug": "iowa-city-ia",
+  "name": "Iowa City",
+  "lat": 41.6558,
+  "lon": -91.525,
+  "valid": true
+ },
+ {
+  "slug": "jackson-ms",
+  "name": "Jackson",
+  "lat": 32.298888888889,
+  "lon": -90.184722222222,
+  "valid": true
+ },
+ {
+  "slug": "jacksonville",
+  "name": "Jacksonville",
+  "lat": 30.3285,
+  "lon": -81.657,
+  "valid": true
+ },
+ {
+  "slug": "kansascity",
+  "name": "Kansas City",
+  "lat": 39.1022,
+  "lon": -94.5809,
+  "valid": true
+ },
+ {
+  "slug": "knoxville",
+  "name": "Knoxville",
+  "lat": 35.9642,
+  "lon": -83.9179,
+  "valid": true
+ },
+ {
+  "slug": "la",
+  "name": "Los Angeles",
+  "lat": 34.0564,
+  "lon": -118.2445,
+  "valid": true
+ },
+ {
+  "slug": "lake-charles-la",
+  "name": "Lake Charles",
+  "lat": 30.2147,
+  "lon": -93.2085,
+  "valid": true
+ },
+ {
+  "slug": "lexington",
+  "name": "Lexington",
+  "lat": 38.0297,
+  "lon": -84.4947,
+  "valid": true
+ },
+ {
+  "slug": "littlerock",
+  "name": "Little Rock",
+  "lat": 34.736,
+  "lon": -92.3311,
+  "valid": true
+ },
+ {
+  "slug": "louisville",
+  "name": "Louisville",
+  "lat": 38.2525,
+  "lon": -85.7554,
+  "valid": true
+ },
+ {
+  "slug": "lubbock-tx",
+  "name": "Lubbock",
+  "lat": 33.5647,
+  "lon": -101.878,
+  "valid": true
+ },
+ {
+  "slug": "madison",
+  "name": "Madison",
+  "lat": 43.074722222222,
+  "lon": -89.384444444444,
+  "valid": true
+ },
+ {
+  "slug": "mankato",
+  "name": "Mankato",
+  "lat": 44.1649,
+  "lon": -94.0032,
+  "valid": true
+ },
+ {
+  "slug": "memphis",
+  "name": "Memphis",
+  "lat": 35.1426,
+  "lon": -90.0524,
+  "valid": true
+ },
+ {
+  "slug": "mesa",
+  "name": "Mesa",
+  "lat": 33.414035,
+  "lon": -111.831562,
+  "valid": true
+ },
+ {
+  "slug": "miami",
+  "name": "Miami",
+  "lat": 25.7751,
+  "lon": -80.1936,
+  "valid": true
+ },
+ {
+  "slug": "milwaukee",
+  "name": "Milwaukee",
+  "lat": 43.0373,
+  "lon": -87.9188,
+  "valid": true
+ },
+ {
+  "slug": "minneapolis",
+  "name": "Minneapolis",
+  "lat": 44.9774,
+  "lon": -93.2645,
+  "valid": true
+ },
+ {
+  "slug": "mountain-view-ca",
+  "name": "Mountain View",
+  "lat": 37.3935,
+  "lon": -122.0791,
+  "valid": true
+ },
+ {
+  "slug": "myrtle-beach-sc",
+  "name": "Myrtle Beach",
+  "lat": 33.7042,
+  "lon": -78.8755,
+  "valid": true
+ },
+ {
+  "slug": "nashville",
+  "name": "Nashville",
+  "lat": 36.1651,
+  "lon": -86.7837,
+  "valid": true
+ },
+ {
+  "slug": "neworleans",
+  "name": "New Orleans",
+  "lat": 29.948479,
+  "lon": -90.070864,
+  "valid": true
+ },
+ {
+  "slug": "nyc",
+  "name": "New York City",
+  "lat": 40.7142,
+  "lon": -74.0064,
+  "valid": true
+ },
+ {
+  "slug": "oakland",
+  "name": "Oakland",
+  "lat": 37.8029,
+  "lon": -122.2721,
+  "valid": true
+ },
+ {
+  "slug": "ogden",
+  "name": "Ogden",
+  "lat": 41.2277,
+  "lon": -111.961,
+  "valid": true
+ },
+ {
+  "slug": "oklahoma",
+  "name": "Oklahoma City",
+  "lat": 35.4689,
+  "lon": -97.5195,
+  "valid": true
+ },
+ {
+  "slug": "omaha",
+  "name": "Omaha",
+  "lat": 41.2557,
+  "lon": -95.9304,
+  "valid": true
+ },
+ {
+  "slug": "orlando",
+  "name": "Orlando",
+  "lat": 28.5421,
+  "lon": -81.3775,
+  "valid": true
+ },
+ {
+  "slug": "pensacola",
+  "name": "Pensacola",
+  "lat": 30.437,
+  "lon": -87.2093,
+  "valid": true
+ },
+ {
+  "slug": "philly",
+  "name": "Philadelphia",
+  "lat": 39.9527,
+  "lon": -75.1651,
+  "valid": true
+ },
+ {
+  "slug": "phoenix",
+  "name": "Phoenix",
+  "lat": 33.4482,
+  "lon": -112.0777,
+  "valid": true
+ },
+ {
+  "slug": "pittsburgh",
+  "name": "Pittsburgh",
+  "lat": 40.4411,
+  "lon": -79.9975,
+  "valid": true
+ },
+ {
+  "slug": "portland",
+  "name": "Portland",
+  "lat": 45.518237,
+  "lon": -122.678249,
+  "valid": true
+ },
+ {
+  "slug": "providence",
+  "name": "Providence",
+  "lat": 41.8236,
+  "lon": -71.4221,
+  "valid": true
+ },
+ {
+  "slug": "raleigh",
+  "name": "Raleigh",
+  "lat": 35.7781,
+  "lon": -78.6349,
+  "valid": true
+ },
+ {
+  "slug": "redding-ca",
+  "name": "Redding",
+  "lat": 40.5876,
+  "lon": -122.39255,
+  "valid": true
+ },
+ {
+  "slug": "reno",
+  "name": "Reno",
+  "lat": 39.5271,
+  "lon": -119.822,
+  "valid": true
+ },
+ {
+  "slug": "richmond",
+  "name": "Richmond",
+  "lat": 37.5373,
+  "lon": -77.4371,
+  "valid": true
+ },
+ {
+  "slug": "roanoke-va",
+  "name": "Roanoke",
+  "lat": 37.2769,
+  "lon": -79.9557,
+  "valid": true
+ },
+ {
+  "slug": "rochester",
+  "name": "Rochester",
+  "lat": 43.1557,
+  "lon": -77.6204,
+  "valid": true
+ },
+ {
+  "slug": "sac",
+  "name": "Sacramento",
+  "lat": 38.577,
+  "lon": -121.4947,
+  "valid": true
+ },
+ {
+  "slug": "saltlakecity",
+  "name": "Salt Lake City",
+  "lat": 40.75,
+  "lon": -111.883,
+  "valid": true
+ },
+ {
+  "slug": "sanantonio",
+  "name": "San Antonio",
+  "lat": 29.4167,
+  "lon": -98.5,
+  "valid": true
+ },
+ {
+  "slug": "sandiego",
+  "name": "San Diego",
+  "lat": 32.7155,
+  "lon": -117.1585,
+  "valid": true
+ },
+ {
+  "slug": "sanfrancisco",
+  "name": "San Francisco",
+  "lat": 37.7793,
+  "lon": -122.419,
+  "valid": true
+ },
+ {
+  "slug": "sanjose",
+  "name": "San Jose",
+  "lat": 37.3376,
+  "lon": -121.8865,
+  "valid": true
+ },
+ {
+  "slug": "seattle",
+  "name": "Seattle",
+  "lat": 47.6046,
+  "lon": -122.3308,
+  "valid": true
+ },
+ {
+  "slug": "sioux-falls",
+  "name": "Sioux Falls",
+  "lat": 43.5473579,
+  "lon": -96.7302371,
+  "valid": true
+ },
+ {
+  "slug": "spokane",
+  "name": "Spokane",
+  "lat": 47.6589,
+  "lon": -117.425,
+  "valid": true
+ },
+ {
+  "slug": "stlouis",
+  "name": "St. Louis",
+  "lat": 38.669959286615,
+  "lon": -90.241270103862,
+  "valid": true
+ },
+ {
+  "slug": "suffolkcounty",
+  "name": "Suffolk County, New York",
+  "lat": 41.0327,
+  "lon": -72.208,
+  "valid": true
+ },
+ {
+  "slug": "syracuse",
+  "name": "Syracuse",
+  "lat": 43.046899,
+  "lon": -76.144423,
+  "valid": true
+ },
+ {
+  "slug": "tampa",
+  "name": "Tampa",
+  "lat": 27.9473,
+  "lon": -82.4558,
+  "valid": true
+ },
+ {
+  "slug": "tucson",
+  "name": "Tucson",
+  "lat": 32.219,
+  "lon": -110.9708,
+  "valid": true
+ },
+ {
+  "slug": "tulsa",
+  "name": "Tulsa",
+  "lat": 36.1502,
+  "lon": -95.9924,
+  "valid": true
+ },
+ {
+  "slug": "tyler-tx",
+  "name": "Tyler",
+  "lat": 32.3342,
+  "lon": -95.2999,
+  "valid": true
+ },
+ {
+  "slug": "vegas",
+  "name": "Las Vegas",
+  "lat": 36.1675,
+  "lon": -115.149,
+  "valid": true
+ },
+ {
+  "slug": "virginiabeach",
+  "name": "Virginia Beach",
+  "lat": 36.8497,
+  "lon": -75.9787,
+  "valid": true
+ },
+ {
+  "slug": "wenatchee",
+  "name": "Wenatchee",
+  "lat": 47.4233,
+  "lon": -120.325,
+  "valid": true
+ },
+ {
+  "slug": "westwheeling",
+  "name": "West Wheeling, Ohio",
+  "lat": 40.0608,
+  "lon": -80.7425,
+  "valid": true
+ },
+ {
+  "slug": "wichita",
+  "name": "Wichita",
+  "lat": 37.6933,
+  "lon": -97.3358,
+  "valid": true
+ },
+ {
+  "slug": "wilmington",
+  "name": "Wilmington",
+  "lat": 34.2232,
+  "lon": -77.9121,
+  "valid": true
+ }
+]
