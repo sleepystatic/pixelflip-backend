@@ -47,13 +47,40 @@ echo "   ✅ Chromium present"
 # Cloudflare but then renders 0 listings, so it is NOT a substitute — see the
 # note printed below if this step fails.
 echo "🕵️  Installing patchright + Google Chrome (Mercari)..."
+CHROME_DIR="${CHROME_DIR:-/opt/render/project/src/.chrome}"
+CHROME_BIN="$CHROME_DIR/opt/google/chrome/chrome"
+
 if patchright install chrome; then
-    echo "   ✅ Chrome installed — Mercari fully enabled"
+    echo "   ✅ Chrome installed via patchright — Mercari fully enabled"
 else
-    echo "   ⚠️  Chrome install failed (expected on Render's native runtime: it"
-    echo "   ⚠️  needs apt/root). Mercari will return 0 results until this service"
-    echo "   ⚠️  runs on a Docker image with Chrome preinstalled."
-    echo "   ⚠️  Set MERCARI_CHROME_CHANNEL=chromium to stop it retrying."
+    echo "   ℹ️  patchright install chrome failed (it shells out to apt, which"
+    echo "   ℹ️  needs root). Falling back to a rootless unpack of the .deb."
+
+    # `dpkg-deb -x` extracts without installing, so no root and no apt. This is
+    # the only reason a full Docker migration may not be necessary: Mercari
+    # needs REAL Chrome (bundled Chromium clears Cloudflare then renders zero
+    # listings), and this puts a real Chrome binary on disk.
+    if curl -fsSL -o /tmp/chrome.deb \
+         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+       && mkdir -p "$CHROME_DIR" \
+       && dpkg-deb -x /tmp/chrome.deb "$CHROME_DIR" \
+       && [ -x "$CHROME_BIN" ]; then
+        echo "   ✅ Chrome unpacked to $CHROME_BIN"
+        # Confirm it can actually start — extraction succeeds even when shared
+        # libraries are missing, and a Chrome that cannot run looks exactly like
+        # Mercari blocking us.
+        if "$CHROME_BIN" --headless=new --no-sandbox --dump-dom about:blank >/dev/null 2>&1; then
+            echo "   ✅ Chrome runs. SET THIS IN RENDER:"
+            echo "        MERCARI_CHROME_PATH=$CHROME_BIN"
+        else
+            echo "   ⚠️  Chrome unpacked but will not start (missing system libs)."
+            echo "   ⚠️  Mercari needs the Docker deploy — see Dockerfile."
+            "$CHROME_BIN" --version 2>&1 | head -3 || true
+        fi
+    else
+        echo "   ⚠️  Rootless Chrome unpack failed. Mercari will return 0 results"
+        echo "   ⚠️  until this service runs on the Docker image (see Dockerfile)."
+    fi
     patchright install chromium || true
 fi
 

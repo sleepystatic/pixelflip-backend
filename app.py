@@ -68,8 +68,17 @@ app = Flask(__name__)
 def _frontend_base_url(origin_header=None):
     """
     Stripe success/cancel URLs and billing portal return_url.
+
     Set FRONTEND_URL in production. For local dev, if unset, we accept the
-    browser Origin (e.g. http://localhost:3001) so cancel links match the port you use.
+    browser Origin (e.g. http://localhost:3001) so cancel links match the port
+    you use.
+
+    The final fallback is the PRODUCTION dashboard, not localhost. It used to be
+    http://localhost:3000, which meant an unset FRONTEND_URL on the server sent
+    real customers to a dead address — and because success_url and cancel_url
+    share this base, a paying customer was charged, redirected nowhere, and
+    never hit /api/complete-checkout. A forgotten env var must degrade to a
+    working link, never to localhost.
     """
     explicit = (os.getenv('FRONTEND_URL') or '').strip().rstrip('/')
     if explicit:
@@ -77,7 +86,7 @@ def _frontend_base_url(origin_header=None):
     oh = (origin_header or '').strip().rstrip('/')
     if oh.startswith('http://localhost:') or oh.startswith('http://127.0.0.1:'):
         return oh
-    return 'http://localhost:3000'
+    return 'https://dashboard.pixelflip.app'
 
 
 def _send_email_change_code_email(to_email, code):

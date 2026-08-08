@@ -2202,8 +2202,8 @@ def _patchright_clean_ua():
         with sync_playwright() as p:
             ctx = p.chromium.launch_persistent_context(
                 prof, headless=True,
-                channel=os.getenv('MERCARI_CHROME_CHANNEL', 'chrome'),
                 no_viewport=True,
+                **_mercari_chrome_kwargs(),
             )
             ua = ctx.new_page().evaluate('navigator.userAgent')
             ctx.close()
@@ -2215,6 +2215,26 @@ def _patchright_clean_ua():
             '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
         )
     return _PATCHRIGHT_UA_CACHE
+
+
+def _mercari_chrome_kwargs():
+    """
+    How to reach real Chrome: by channel, or by explicit path.
+
+    `channel='chrome'` asks Playwright to find a system-installed Chrome, which
+    on Render's native runtime does not exist — installing it needs apt and
+    root. MERCARI_CHROME_PATH points straight at a binary instead, so Chrome can
+    be unpacked from its .deb with `dpkg-deb -x` (no root) during the build.
+
+    The two are mutually exclusive in Playwright: passing both raises.
+    """
+    explicit = (os.getenv('MERCARI_CHROME_PATH') or '').strip()
+    if explicit:
+        if not os.path.isfile(explicit):
+            _emit(f"[mercari] MERCARI_CHROME_PATH set but no file at {explicit} — falling back to channel")
+        else:
+            return {'executable_path': explicit}
+    return {'channel': os.getenv('MERCARI_CHROME_CHANNEL', 'chrome')}
 
 
 def _mercari_fetch_with_patchright(url):
@@ -2267,10 +2287,10 @@ def _mercari_fetch_with_patchright(url):
 
     launch_kwargs = dict(
         headless=False,
-        channel=os.getenv('MERCARI_CHROME_CHANNEL', 'chrome'),
         no_viewport=True,
         args=args,
         user_agent=clean_ua,
+        **_mercari_chrome_kwargs(),
     )
     proxy_url = _get_proxy('mercari')
     if proxy_url:

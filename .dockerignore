@@ -1,0 +1,20 @@
+# Secrets must never enter the image — Render supplies env vars at runtime.
+.env*
+proxies.txt
+
+# The dashboard is a separate Vercel deploy; it would bloat the image badly.
+frontend/
+
+.git/
+.idea/
+.vscode/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local-only artifacts
+*_debug.html
+fb_debug.html
+test_scraper.py
+PIXELFLIP-HANDOFF.md
