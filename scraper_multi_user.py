@@ -1833,6 +1833,127 @@ _PW_LAUNCH_ARGS = [
     '--disable-extensions',
 ]
 
+# Extra flags for small containers (Render Starter is a hard 512MB, shared with
+# Flask and the scraper thread — an OOM kills the whole service mid-scrape).
+#
+# None of these change WHAT is scraped: no fewer pages, terms or platforms.
+# They cut what Chrome allocates per page.
+#
+#   --single-process        renderer in the browser process, so no second
+#                           ~150MB process per tab. The largest single saving,
+#                           and the least stable flag here — hence its own
+#                           toggle below.
+#   --renderer-process-limit=1  caps renderers when not single-process.
+#   --js-flags=--max-old-space-size=192  bounds V8's heap; marketplace pages
+#                           are DOM-heavy, not JS-heavy, so this is headroom
+#                           we are not using.
+#   --disable-software-rasterizer / --disable-background-* / --mute-audio
+#                           drop subsystems a headless scrape never touches.
+_PW_LOW_MEMORY_ARGS = [
+    '--renderer-process-limit=1',
+    '--js-flags=--max-old-space-size=192',
+    '--disable-software-rasterizer',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-client-side-phishing-detection',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
+    '--disable-sync',
+    '--no-first-run',
+    '--mute-audio',
+    '--metrics-recording-only',
+]
+
+
+def _pw_memory_args():
+    """Low-memory Chrome flags. PW_LOW_MEMORY=0 disables; on by default."""
+    if not _env_flag('PW_LOW_MEMORY', True):
+        return []
+    args = list(_PW_LOW_MEMORY_ARGS)
+    # Off by default: --single-process saves the most but is the flag most
+    # likely to destabilise a page. Turn it on only if OOMs continue.
+    if _env_flag('PW_SINGLE_PROCESS', False):
+        args.append('--single-process')
+    return args
+
+
+def _process_tree_rss_mb():
+    """
+    Resident memory of this process AND its children, in MB, or None off Linux.
+
+    Children matter more than the parent here: Chrome's renderers are separate
+    processes, and Render's OOM killer counts the whole container. Reading only
+    our own RSS would show a comfortable 150MB right up until the instance dies.
+    """
+    try:
+        pids = [os.getpid()]
+        children = os.path.join('/proc', str(os.getpid()), 'task')
+        # Walk /proc for anything whose parent chain reaches us. Cheap enough at
+        # the handful of processes a scrape creates.
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry}/stat', 'r') as f:
+                    ppid = int(f.read().split(') ')[1].split()[1])
+                if ppid in pids or ppid == os.getpid():
+                    pids.append(int(entry))
+            except Exception:
+                continue
+        total_kb = 0
+        for pid in set(pids):
+            try:
+                with open(f'/proc/{pid}/status', 'r') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            total_kb += int(line.split()[1])
+                            break
+            except Exception:
+                continue
+        return round(total_kb / 1024, 1) if total_kb else None
+    except Exception:
+        return None
+
+
+def _log_memory(label, log_callback=None, user_id=None):
+    """Report container memory at a platform boundary, when it is worth seeing."""
+    mb = _process_tree_rss_mb()
+    if mb is None:
+        return
+    try:
+        limit = int(os.getenv('MEMORY_LIMIT_MB', '512'))
+    except ValueError:
+        limit = 512
+    pct = (mb / limit) * 100 if limit else 0
+    msg = f"Memory after {label}: {mb:.0f}MB of {limit}MB ({pct:.0f}%)"
+    if pct >= 80:
+        print(f"⚠️  {msg}", flush=True)
+        if log_callback:
+            log_callback(user_id, msg + " — close to the container limit", 'error')
+    else:
+        print(msg, flush=True)
+        if log_callback and _env_flag('LOG_MEMORY_ALWAYS', False):
+            log_callback(user_id, msg, 'info')
+
+
+def _pw_viewport():
+    """
+    Viewport drives raster memory: it is width x height x 4 bytes per surface,
+    so 1280x800 costs roughly 2.6x what 800x600 does.
+
+    Kept at 1280 wide by default because marketplace grids drop to fewer columns
+    on narrow viewports and lazy-loading yields fewer tiles — a smaller window
+    would quietly return fewer listings, which is the one trade we are not
+    making. PW_VIEWPORT_WIDTH/HEIGHT exist if you decide otherwise.
+    """
+    try:
+        w = int(os.getenv('PW_VIEWPORT_WIDTH', '1280'))
+        h = int(os.getenv('PW_VIEWPORT_HEIGHT', '800'))
+    except ValueError:
+        w, h = 1280, 800
+    return {'width': w, 'height': h}
+
 
 def _pw_proxy_dict(proxy_url):
     """
@@ -1902,7 +2023,7 @@ def _pw_launch_kwargs(platform=None):
     fails authenticated launch-level proxies with ERR_PROXY_AUTH_UNSUPPORTED.
     Credentials only work on the context (see _pw_new_context).
     """
-    launch_kwargs = dict(headless=True, args=_PW_LAUNCH_ARGS)
+    launch_kwargs = dict(headless=True, args=_PW_LAUNCH_ARGS + _pw_memory_args())
     chromium_path = os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH') or None
     if chromium_path:
         launch_kwargs['executable_path'] = chromium_path
@@ -1921,7 +2042,7 @@ def _pw_new_context(browser, stealth=True, extra_headers=None, platform=None, st
     proxy_url = None if force_no_proxy else (proxy_override or _get_proxy(platform))
     ctx_kwargs = dict(
         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        viewport={'width': 1280, 'height': 800},
+        viewport=_pw_viewport(),
         locale='en-US',
         extra_http_headers={'Accept-Language': 'en-US,en;q=0.9', **(extra_headers or {})},
     )
