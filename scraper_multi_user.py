@@ -242,43 +242,49 @@ def get_db_connection():
 # USER DATA FUNCTIONS
 # ===========================
 def get_active_users():
-    """Get all users with active scraping enabled"""
+    """
+    Get all users with active scraping enabled.
+
+    try/finally is load-bearing, not style: without it a query that raises
+    leaks the connection, and Supabase's session-mode pooler allows only 15.
+    Fifteen leaks and every request 500s with 'max clients reached'.
+    """
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute('''
+            SELECT user_id, zip_code, search_radius, platforms,
+                   ai_enabled, ai_strictness, check_interval_minutes,
+                   plan_tier, is_pro,
+                   buyer_include_local, buyer_include_shipping
+            FROM user_settings
+            WHERE is_active = TRUE
+        ''')
 
-    cursor.execute('''
-        SELECT user_id, zip_code, search_radius, platforms,
-               ai_enabled, ai_strictness, check_interval_minutes,
-               plan_tier, is_pro,
-               buyer_include_local, buyer_include_shipping
-        FROM user_settings
-        WHERE is_active = TRUE
-    ''')
+        users = []
+        for row in cursor.fetchall():
+            tier = (row.get('plan_tier') or '').strip().lower()
+            if tier not in ('basic', 'pro'):
+                tier = 'pro' if row.get('is_pro') else 'inactive'
+            # Pro-only AI image pipeline (Basic never runs Vision, regardless of DB flag)
+            eff_ai = bool(row.get('ai_enabled')) and tier == 'pro'
 
-    users = []
-    for row in cursor.fetchall():
-        tier = (row.get('plan_tier') or '').strip().lower()
-        if tier not in ('basic', 'pro'):
-            tier = 'pro' if row.get('is_pro') else 'inactive'
-        # Pro-only AI image pipeline (Basic never runs Vision, regardless of DB flag)
-        eff_ai = bool(row.get('ai_enabled')) and tier == 'pro'
-
-        users.append({
-            'user_id': row['user_id'],
-            'zip_code': row['zip_code'] or '95212',
-            'search_radius': row['search_radius'] or 25,
-            'platforms': _coerce_platforms_dict(row.get('platforms')),
-            'buyer_include_local': bool(row.get('buyer_include_local', True)),
-            'buyer_include_shipping': bool(row.get('buyer_include_shipping', True)),
-            'ai_enabled': eff_ai,
-            'ai_strictness': row['ai_strictness'] or 'balanced',
-            'check_interval': row['check_interval_minutes'] or 10,
-            'plan_tier': tier,
-        })
-
-    cursor.close()
-    conn.close()
-    return users
+            users.append({
+                'user_id': row['user_id'],
+                'zip_code': row['zip_code'] or '95212',
+                'search_radius': row['search_radius'] or 25,
+                'platforms': _coerce_platforms_dict(row.get('platforms')),
+                'buyer_include_local': bool(row.get('buyer_include_local', True)),
+                'buyer_include_shipping': bool(row.get('buyer_include_shipping', True)),
+                'ai_enabled': eff_ai,
+                'ai_strictness': row['ai_strictness'] or 'balanced',
+                'check_interval': row['check_interval_minutes'] or 10,
+                'plan_tier': tier,
+            })
+        return users
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def get_user_search_terms(user_id):
@@ -290,27 +296,28 @@ def get_user_search_terms(user_id):
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT search_term, min_price, max_price FROM user_search_terms WHERE user_id = %s', (user_id,))
-    terms = {
-        row[0]: {
-            'min': float(row[1]) if row[1] is not None else None,
-            'max': float(row[2]) if row[2] is not None else None,
-            'exclusions': [],
+    try:
+        cursor.execute('SELECT search_term, min_price, max_price FROM user_search_terms WHERE user_id = %s', (user_id,))
+        terms = {
+            row[0]: {
+                'min': float(row[1]) if row[1] is not None else None,
+                'max': float(row[2]) if row[2] is not None else None,
+                'exclusions': [],
+            }
+            for row in cursor.fetchall()
         }
-        for row in cursor.fetchall()
-    }
 
-    cursor.execute(
-        'SELECT keyword, search_term FROM user_exclusions WHERE user_id = %s AND search_term IS NOT NULL',
-        (user_id,),
-    )
-    for keyword, term in cursor.fetchall():
-        if term in terms:
-            terms[term]['exclusions'].append(keyword)
-
-    cursor.close()
-    conn.close()
-    return terms
+        cursor.execute(
+            'SELECT keyword, search_term FROM user_exclusions WHERE user_id = %s AND search_term IS NOT NULL',
+            (user_id,),
+        )
+        for keyword, term in cursor.fetchall():
+            if term in terms:
+                terms[term]['exclusions'].append(keyword)
+        return terms
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def get_user_exclusions(user_id):
@@ -324,11 +331,12 @@ def get_user_exclusions(user_id):
 def get_seen_listings(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT link FROM listings WHERE user_id = %s', (user_id,))
-    seen = set(row[0] for row in cursor.fetchall())
-    cursor.close()
-    conn.close()
-    return seen
+    try:
+        cursor.execute('SELECT DISTINCT link FROM listings WHERE user_id = %s', (user_id,))
+        return set(row[0] for row in cursor.fetchall())
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def get_user_notification_prefs(user_id):
@@ -465,6 +473,10 @@ def get_recent_listing_signatures(user_id):
 
 def save_listing(user_id, listing):
     """Persist listing; `console_type` column holds the matched search term (legacy name)."""
+    # Bound before the try so the finally can reference them even when
+    # get_db_connection() itself raises.
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -490,12 +502,23 @@ def save_listing(user_id, listing):
             listing.get('threshold'), listing.get('image_url'), listing.get('location'), listing.get('title_fingerprint')))
         inserted = cursor.rowcount > 0
         conn.commit()
-        cursor.close()
-        conn.close()
         return inserted
     except Exception as e:
         print(f"❌ Save error: {e}", flush=True)
         return False
+    finally:
+        # Previously closed only on the success path, so any raise leaked a
+        # pooler slot — 15 of those and every request 500s.
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 _BULK_COLUMNS = ('user_id', 'title', 'price', 'link', 'platform', 'console_type',
