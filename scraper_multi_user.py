@@ -3876,6 +3876,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             scrape_craigslist_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                        user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
                                        known_links=known_links))
+        _log_memory('Craigslist', log_callback, user_id)
 
     if user_config['platforms'].get('offerup') and _delivery_allows('offerup'):
         if not is_user_active(user_id):
@@ -3886,6 +3887,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             scrape_offerup_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                     user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
                                     known_links=known_links))
+        _log_memory('OfferUp', log_callback, user_id)
 
     if user_config['platforms'].get('mercari') and _delivery_allows('mercari'):
         if not is_user_active(user_id):
@@ -3896,6 +3898,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             scrape_mercari_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                     user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
                                     known_links=known_links))
+        _log_memory('Mercari', log_callback, user_id)
 
     if user_config['platforms'].get('facebook') and _delivery_allows('facebook'):
         if not is_user_active(user_id):
@@ -3907,6 +3910,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
                 scrape_facebook_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
                                          user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
                                          known_links=known_links))
+            _log_memory('Facebook', log_callback, user_id)
         elif log_callback:
             log_callback(user_id, "Facebook Marketplace requires a Pro plan.", "info")
 
