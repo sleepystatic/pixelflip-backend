@@ -8,6 +8,7 @@ import re
 import json
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import psycopg2
 from psycopg2 import errorcodes
@@ -196,27 +197,24 @@ def get_db_connection():
     if not database_url:
         raise Exception("DATABASE_URL not set")
 
-    url = urlparse(database_url)
     try:
         attempts = int(os.getenv('DB_CONNECT_RETRIES', '3'))
     except ValueError:
         attempts = 3
 
+    # Borrowed from the shared pool rather than dialled fresh: the handshake to
+    # Supabase costs ~287ms against ~44ms for the query, and once users are
+    # scraped in parallel a connection-per-call also blows the pooler's client
+    # limit. conn.close() returns it to the pool, so callers are unchanged.
+    from db_pool import get_pooled_connection
+
     last_err = None
     conn = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            conn = psycopg2.connect(
-                host=url.hostname,
-                port=url.port or 5432,
-                database=url.path[1:],
-                user=url.username,
-                password=url.password,
-                sslmode='require',
-                connect_timeout=10
-            )
+            conn = get_pooled_connection()
             break
-        except psycopg2.OperationalError as e:
+        except (psycopg2.OperationalError, RuntimeError) as e:
             last_err = e
             if attempt >= attempts:
                 break
@@ -227,12 +225,16 @@ def get_db_connection():
     if conn is None:
         raise last_err if last_err else Exception('Database connection failed')
     try:
-        from db_schema import ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user
+        from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
+                               ensure_priority_term_columns)
         ensure_buyer_delivery_columns(conn)
         # save_listing lives in this module and targets ON CONFLICT (user_id, link),
         # so the matching index has to be guaranteed on the scraper's own
         # connection — test_scraper.py never goes through app.py's.
         ensure_listing_uniqueness_per_user(conn)
+        # The scheduler reads is_priority / last_scraped_at on every cycle, and
+        # the worker may reach the database before app.py ever does.
+        ensure_priority_term_columns(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -297,12 +299,16 @@ def get_user_search_terms(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute('SELECT search_term, min_price, max_price FROM user_search_terms WHERE user_id = %s', (user_id,))
+        cursor.execute('SELECT search_term, min_price, max_price, is_priority, '
+                       'EXTRACT(EPOCH FROM last_scraped_at) '
+                       'FROM user_search_terms WHERE user_id = %s', (user_id,))
         terms = {
             row[0]: {
                 'min': float(row[1]) if row[1] is not None else None,
                 'max': float(row[2]) if row[2] is not None else None,
                 'exclusions': [],
+                'is_priority': bool(row[3]),
+                'last_scraped_ts': float(row[4]) if row[4] is not None else 0.0,
             }
             for row in cursor.fetchall()
         }
@@ -1186,6 +1192,7 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
             url = f"https://{subdomain}.craigslist.org/search/{cl_cat}?query={term.replace(' ', '+')}&sort=date&postal={zip_code}&search_distance={search_radius}"
             try:
                 response = session.get(url, timeout=15)
+                _record_bytes('craigslist', len(response.content or b''))
                 soup = BeautifulSoup(response.content, 'html.parser')
                 items = soup.find_all('li', class_='cl-static-search-result')
                 if debug and log_callback:
@@ -1878,6 +1885,90 @@ def _pw_memory_args():
     return args
 
 
+# ===========================
+# BANDWIDTH ACCOUNTING
+#
+# Residential proxy bandwidth is the dominant marginal cost of this product and
+# the number nobody had. Facebook and Mercari use the expensive pool; OfferUp
+# goes direct via GraphQL and Craigslist is plain requests, so both are free.
+#
+# Counted per platform per scrape so a real day of running yields a real
+# monthly projection instead of an extrapolation from test traffic.
+# ===========================
+_BYTES = {}
+_BYTES_LOCK = threading.Lock()
+
+# Which platforms spend residential bandwidth. Used only for reporting.
+_PROXIED_PLATFORMS = {'facebook', 'mercari'}
+
+
+def _record_bytes(platform, n):
+    if not n or n <= 0:
+        return
+    with _BYTES_LOCK:
+        _BYTES[platform] = _BYTES.get(platform, 0) + int(n)
+
+
+def _reset_bytes():
+    with _BYTES_LOCK:
+        _BYTES.clear()
+
+
+def _bytes_snapshot():
+    with _BYTES_LOCK:
+        return dict(_BYTES)
+
+
+def _attach_byte_counter(page, platform):
+    """
+    Sum response sizes for one page.
+
+    'requestfinished' rather than 'response' because request.sizes() is only
+    populated once the transfer completes — reading it earlier reports zero.
+    Wrapped in try/except throughout: byte accounting must never be able to
+    break a scrape.
+    """
+    def on_finished(request):
+        try:
+            sizes = request.sizes()
+            total = (sizes.get('responseBodySize') or 0) + (sizes.get('responseHeadersSize') or 0)
+            _record_bytes(platform, total)
+        except Exception:
+            pass
+
+    try:
+        page.on('requestfinished', on_finished)
+    except Exception:
+        pass
+
+
+def _format_bytes(n):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if abs(n) < 1024 or unit == 'GB':
+            return f"{n:.1f}{unit}" if unit != 'B' else f"{int(n)}B"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
+def _log_bandwidth(log_callback=None, user_id=None):
+    """Report this scrape's traffic, and what it implies at 5-minute intervals."""
+    snap = _bytes_snapshot()
+    if not snap:
+        return
+    total = sum(snap.values())
+    proxied = sum(v for k, v in snap.items() if k in _PROXIED_PLATFORMS)
+    parts = ', '.join(f"{k} {_format_bytes(v)}" for k, v in sorted(snap.items(), key=lambda x: -x[1]))
+
+    # 288 scans/day at a 5-minute interval, 30 days.
+    monthly_gb = (proxied * 288 * 30) / (1024 ** 3)
+    msg = (f"Bandwidth this scan: {_format_bytes(total)} total ({parts}). "
+           f"Residential (Facebook+Mercari): {_format_bytes(proxied)} "
+           f"-> ~{monthly_gb:.1f}GB/month per user at 5-minute scans.")
+    print(f"📊 {msg}", flush=True)
+    if log_callback and _env_flag('LOG_BANDWIDTH', False):
+        log_callback(user_id, msg, 'info')
+
+
 def _process_tree_rss_mb():
     """
     Resident memory of this process AND its children, in MB, or None off Linux.
@@ -1982,7 +2073,7 @@ _BLOCKED_HOSTS = (
 )
 
 
-def _pw_block_heavy_requests(ctx):
+def _pw_block_heavy_requests(ctx, block_scripts=False):
     """
     Drop request types whose bytes we never use. Image *URLs* survive this —
     they live in the <img src> attribute, and the DOM keeps them whether or not
@@ -1992,10 +2083,18 @@ def _pw_block_heavy_requests(ctx):
 
     First-party JS is deliberately left alone: lazy-loaded listings and the
     antibot checks depend on it.
+
+    `block_scripts` is the exception, used only by Facebook's lean fetch. There
+    the listings are server-rendered as JSON inside the HTML document, so the
+    1.9MB of JS renders a DOM we would only parse back into the data we already
+    had. Measured 2026-08-11: 1,651KB -> 111KB with identical listings. It stays
+    opt-in because dropping JS is exactly what breaks scrapers that DO need it.
     """
     blocked_types = {'image', 'media', 'font'}
     if _env_flag('PW_BLOCK_CSS', True):
         blocked_types.add('stylesheet')
+    if block_scripts:
+        blocked_types.add('script')
 
     def _route(route, request):
         try:
@@ -2031,13 +2130,16 @@ def _pw_launch_kwargs(platform=None):
 
 
 def _pw_new_context(browser, stealth=True, extra_headers=None, platform=None, storage_state=None,
-                    force_no_proxy=False, proxy_override=None):
+                    force_no_proxy=False, proxy_override=None, block_scripts=False):
     """
     New browser context with per-platform proxy routing (see _get_proxy).
 
     `proxy_override` bypasses that routing for a single context. It exists for
     retrying on a different sticky session after a block — see
     _rotate_sticky_session.
+
+    `block_scripts` additionally drops JS. Only Facebook's lean fetch sets it —
+    see _pw_block_heavy_requests.
     """
     proxy_url = None if force_no_proxy else (proxy_override or _get_proxy(platform))
     ctx_kwargs = dict(
@@ -2054,7 +2156,11 @@ def _pw_new_context(browser, stealth=True, extra_headers=None, platform=None, st
     if stealth:
         ctx.add_init_script(_PW_STEALTH_INIT)
     if _env_flag('PW_BLOCK_HEAVY_REQUESTS', True):
-        _pw_block_heavy_requests(ctx)
+        _pw_block_heavy_requests(ctx, block_scripts=block_scripts)
+    elif block_scripts:
+        # The lean fetch's saving IS the script block, so honour it even when
+        # the general heavy-request router is turned off.
+        _pw_block_heavy_requests(ctx, block_scripts=True)
     return ctx
 
 
@@ -2199,6 +2305,60 @@ def _offerup_tiles_to_items(payload):
     return out
 
 
+def _offerup_gql_call(page, query, term, lat, lon):
+    """One GetModularFeed call on an already-warmed page. Returns (items, err)."""
+    res = page.evaluate(_OFFERUP_GQL_JS, [query, term, lat, lon, 60])
+    if res.get('status') != 200:
+        return None, f"graphql HTTP {res.get('status')}"
+    try:
+        payload = json.loads(res.get('text') or '{}')
+    except Exception:
+        return None, 'unparseable graphql response'
+    if payload.get('errors'):
+        return None, 'graphql errors: ' + json.dumps(payload['errors'])[:160]
+    return _offerup_tiles_to_items(payload), None
+
+
+def _offerup_lean_attempt(browser, query, term, lat, lon, force_no_proxy):
+    """
+    GetModularFeed behind the cheapest warm-up that still carries a session.
+
+    The API refuses a plain requests POST, but what it is actually checking is
+    the session cookie, the origin and Chromium's TLS fingerprint — none of
+    which come from OfferUp's own JavaScript. So the warm-up does not have to be
+    the homepage, and does not have to run scripts.
+
+    Measured 2026-08-11, identical 5 items from all three:
+
+        homepage,   scripts on   14,860KB   <- what this used to do
+        homepage,   scripts off      91KB
+        robots.txt, scripts off       2.5KB  <- this
+
+    The homepage was fetching ~13MB of feed XHR we then threw away. Returns
+    (items, err); any error sends the caller to the full path.
+    """
+    ctx = _pw_new_context(browser, stealth=True, platform='offerup',
+                          force_no_proxy=force_no_proxy, block_scripts=True)
+    try:
+        page = ctx.new_page()
+        _attach_byte_counter(page, 'offerup')
+        warm_url = os.getenv('OFFERUP_WARMUP_URL', 'https://offerup.com/robots.txt')
+        try:
+            page.goto(warm_url, wait_until='domcontentloaded', timeout=40000)
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            return None, f'lean warm-up navigation failed: {e}'
+        try:
+            return _offerup_gql_call(page, query, term, lat, lon)
+        except Exception as e:
+            return None, f'lean evaluate failed: {type(e).__name__}: {e}'
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
 def _offerup_fetch_via_graphql(term, lat, lon, force_no_proxy=False):
     """Search OfferUp at explicit coordinates. Returns (items, error_or_None)."""
     try:
@@ -2213,9 +2373,22 @@ def _offerup_fetch_via_graphql(term, lat, lon, force_no_proxy=False):
         except Exception as e:
             return [], f'launch failed: {e}'
         try:
+            # Lean warm-up needs a stored query document: re-capturing one means
+            # intercepting the request OfferUp's own JS issues, and lean mode
+            # does not load that JS. No document -> go straight to the full path,
+            # which can self-heal.
+            if query and _env_flag('OFFERUP_LEAN_WARMUP', True):
+                items, err = _offerup_lean_attempt(browser, query, term, lat, lon,
+                                                   force_no_proxy)
+                if not err:
+                    return items, None
+                _emit(f"[offerup] lean warm-up failed ({err}) — "
+                      "retrying with a full page load")
+
             ctx = _pw_new_context(browser, stealth=True, platform='offerup',
                                   force_no_proxy=force_no_proxy)
             page = ctx.new_page()
+            _attach_byte_counter(page, 'offerup')
             # One real page load first: the API rejects requests that don't
             # carry a browser session.
             try:
@@ -2230,24 +2403,16 @@ def _offerup_fetch_via_graphql(term, lat, lon, force_no_proxy=False):
                     return [], 'no GetModularFeed query available'
 
             for attempt in (1, 2):
-                res = page.evaluate(_OFFERUP_GQL_JS, [query, term, lat, lon, 60])
-                if res.get('status') != 200:
-                    if attempt == 1:
-                        query = _offerup_capture_query(page) or query
-                        continue
-                    return [], f"graphql HTTP {res.get('status')}"
-                try:
-                    payload = json.loads(res.get('text') or '{}')
-                except Exception:
-                    return [], 'unparseable graphql response'
-                if payload.get('errors'):
-                    msg = json.dumps(payload['errors'])[:160]
-                    if attempt == 1:
-                        # Most likely our stored document drifted from theirs.
-                        query = _offerup_capture_query(page) or query
-                        continue
-                    return [], f'graphql errors: {msg}'
-                return _offerup_tiles_to_items(payload), None
+                items, err = _offerup_gql_call(page, query, term, lat, lon)
+                if not err:
+                    return items, None
+                if 'unparseable' in err:
+                    return [], err
+                if attempt == 1:
+                    # Most likely our stored document drifted from theirs.
+                    query = _offerup_capture_query(page) or query
+                    continue
+                return [], err
             return [], 'graphql retry exhausted'
         finally:
             try:
@@ -2278,6 +2443,7 @@ def _offerup_fetch_with_playwright(url, stealth=False, force_no_proxy=False):
         ctx = _pw_new_context(browser, stealth=stealth, platform='offerup',
                               force_no_proxy=force_no_proxy)
         page = ctx.new_page()
+        _attach_byte_counter(page, 'offerup')
         try:
             try:
                 page.goto(url, wait_until='domcontentloaded', timeout=30000)
@@ -2447,6 +2613,7 @@ def _mercari_fetch_with_patchright(url):
             _emit(f"[mercari patchright launch error] {e}")
             return ''
         page = ctx.new_page()
+        _attach_byte_counter(page, 'mercari')
         try:
             try:
                 page.goto(url, wait_until='domcontentloaded', timeout=45000)
@@ -2502,6 +2669,7 @@ def _mercari_fetch_with_playwright(url):
             return ''
         ctx = _pw_new_context(browser, stealth=True, platform='mercari')
         page = ctx.new_page()
+        _attach_byte_counter(page, 'mercari')
         try:
             # Mercari holds long-lived connections open, so 'networkidle' never
             # fires and the nav times out even though the page rendered fine.
@@ -2782,6 +2950,103 @@ def _effective_check_interval_minutes_for_user(row_or_cfg):
     return max(stored, interval_floor_for_tier(tier))
 
 
+# Priority terms. Keep in sync with app.py and frontend/src/App.js.
+PLAN_MAX_PRIORITY_TERMS = {'pro': 3, 'basic': 0}
+PLAN_STANDARD_FLOOR_MINUTES = {'pro': 15}
+
+
+def max_priority_for_tier(tier):
+    return PLAN_MAX_PRIORITY_TERMS.get((tier or '').strip().lower(), 0)
+
+
+def standard_floor_for_tier(tier):
+    """
+    Floor for a term the user did NOT mark priority.
+
+    Tiers without the priority feature fall through to their ordinary floor, so
+    a Basic user — whose terms are all technically 'standard' — keeps their
+    10-minute cadence instead of silently dropping to 15.
+    """
+    t = (tier or '').strip().lower()
+    return PLAN_STANDARD_FLOOR_MINUTES.get(t, interval_floor_for_tier(t))
+
+
+def term_interval_minutes(term_cfg, user_cfg):
+    """
+    How often THIS term should scan.
+
+    The user's own chosen interval still wins when it is slower: someone on Pro
+    who picked 30 minutes wants 30, not 5. The floors only stop them going
+    faster than their plan allows.
+    """
+    tier = (user_cfg.get('plan_tier') or _tier_from_db_row(user_cfg) or '').strip().lower()
+    try:
+        stored = int(user_cfg.get('check_interval_minutes') or DEFAULT_INTERVAL_FLOOR_MINUTES)
+    except (TypeError, ValueError):
+        stored = DEFAULT_INTERVAL_FLOOR_MINUTES
+    floor = (interval_floor_for_tier(tier) if (term_cfg or {}).get('is_priority')
+             else standard_floor_for_tier(tier))
+    return max(stored, floor)
+
+
+def due_terms_for_user(search_terms, user_cfg, now=None):
+    """
+    Split a user's terms into (due_now, next_due_epoch).
+
+    The scheduler used to ask one question per user. With priority terms a user
+    can be due for their 5-minute terms and not their 15-minute ones, so the
+    question moves to the term and the user is due when ANY term is.
+
+    Returns the terms to scrape this cycle and, when nothing is due, the epoch
+    of the soonest one, so the caller can report a real countdown instead of
+    going quiet.
+    """
+    now = now or time.time()
+    due = {}
+    soonest = None
+    for term, cfg in (search_terms or {}).items():
+        interval_s = term_interval_minutes(cfg, user_cfg) * 60
+        last = float((cfg or {}).get('last_scraped_ts') or 0.0)
+        ready_at = last + interval_s
+        if now >= ready_at:
+            due[term] = cfg
+        elif soonest is None or ready_at < soonest:
+            soonest = ready_at
+    return due, soonest
+
+
+def stamp_terms_scraped(user_id, terms):
+    """Mark these terms scanned. Best-effort: a failure must not fail the scrape."""
+    if not user_id or not terms:
+        return
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE user_search_terms SET last_scraped_at = NOW() "
+            "WHERE user_id = %s AND search_term = ANY(%s)",
+            (user_id, list(terms)),
+        )
+        conn.commit()
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print(f"[terms] could not stamp last_scraped_at for {str(user_id)[:8]}: {e}", flush=True)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
+
+
 _FB_REGIONS = None
 _FB_ZIP_CACHE = {}
 
@@ -2949,7 +3214,17 @@ def fb_region_for_zip(zip_code):
 #   FB_MAX_ROWS_PER_TERM    — listings to parse per keyword (default 40)
 #   FB_MAX_LISTING_AGE_DAYS — age gate in days (default 45)
 #   FB_PLAYWRIGHT_WAIT_MS   — selector wait after navigation (default 8000)
-#   FB_SCROLL_COUNT         — scroll-to-load passes before parsing (default 4)
+#   FB_SCROLL_COUNT         — scroll-to-load passes before parsing (default 4);
+#                             ignored by the lean path, which loads no JS
+#   FB_LEAN_FETCH           — 1 to block JS and parse the server-rendered JSON
+#                             instead of the DOM. ~93% less proxy bandwidth for
+#                             the same listings. Default off. See
+#                             _fb_collect_from_json.
+#   FB_LEAN_FALLBACK        — on a lean fetch that finds no listing JSON, spend
+#                             one full render to distinguish a payload change
+#                             from a genuinely empty result (default on)
+#   FB_LEAN_SETTLE_MS       — pause after navigation before reading the document
+#                             (default 0; measured unnecessary — see the function)
 #
 # No-login path: leave FB_COOKIES_FILE unset. Logged-out Marketplace shows a
 # login modal over the results; the fetcher dismisses it and scrapes what
@@ -2982,7 +3257,7 @@ def _rotate_sticky_session(proxy_url):
     return rotated if replaced else None
 
 
-def _fb_html_is_blocked(html):
+def _fb_html_is_blocked(html, lean=False):
     # The presence of login text is NOT itself a block: logged-out Marketplace
     # renders listings behind a login modal, and _fb_fetch_with_playwright
     # dismisses it. Only the absence of actual item links means we got nothing
@@ -2990,8 +3265,13 @@ def _fb_html_is_blocked(html):
     if not html or len(html) < 3000:
         _emit(f"[facebook debug] page size {len(html or '')} chars — too small, treating as blocked", "info")
         return True
-    if 'marketplace/item/' not in html.lower():
-        _emit(f"[facebook debug] page size {len(html):,} chars — no item links found", "info")
+    # A lean page has no rendered anchors by construction — React never ran — so
+    # the marker is the JSON key the server streamed. Testing for item links here
+    # would report every successful lean fetch as a block.
+    marker = _FB_JSON_TITLE_KEY if lean else 'marketplace/item/'
+    if marker.lower() not in html.lower():
+        _emit(f"[facebook debug] page size {len(html):,} chars — no "
+              f"{'listing JSON' if lean else 'item links'} found", "info")
         return True
     return False
 
@@ -3049,7 +3329,330 @@ def _fb_collect_from_html(html_text):
     return out
 
 
-def _fb_fetch_with_playwright(url, proxy_override=None):
+# ---------------------------------------------------------------------------
+# Facebook lean path: parse the server-rendered JSON, don't render the page.
+#
+# Measured 2026-08-11 against zip 95210 / 10001, three terms:
+#
+#   scripts on, 4 scrolls   1,651KB   21 listings   (production today)
+#   scripts blocked           111KB   21 listings   (this path)
+#
+# 93% less residential bandwidth for identical output. Facebook streams the
+# search results into the HTML document as Relay JSON — every listing is a
+# GroupCommerceProductItem object carrying marketplace_listing_title,
+# listing_price, location.reverse_geocode, delivery_types and creation_time.
+# The 1.9MB of JS exists to turn that JSON into a DOM, which _fb_collect_from_html
+# then turns back into the same fields. Skipping the round trip is free.
+#
+# Checked first: the logged-out page issues NO /api/graphql POSTs at all and
+# exposes no fb_dtsg token, so the OfferUp-style API replay this was originally
+# scoped as is not available on the no-login path. This is the better answer
+# anyway — no CSRF token to keep fresh and no doc_id to self-heal.
+# ---------------------------------------------------------------------------
+
+# The DOM path stores the anchor's href verbatim, tracking params and all, and
+# `listings` is UNIQUE (user_id, link) with dedup on exact string match. The lean
+# path must emit the SAME string or every listing a user already has reads as new
+# on their first lean scan — one burst of duplicate alerts each. These params are
+# constant across every card Facebook renders; if they ever change, the DOM path's
+# links change with them, so the two stay in step.
+_FB_ITEM_LINK_SUFFIX = '/?ref=search&referral_code=null&referral_story_type=post&__tn__=!%3AD'
+
+_FB_JSON_TITLE_KEY = '"marketplace_listing_title"'
+
+
+def _fb_json_object_at(text, key_idx):
+    """
+    Smallest balanced {...} containing the character at key_idx.
+
+    Facebook ships these payloads as several streamed chunks whose envelopes
+    differ between page loads, so anchoring on the enclosing object of a known
+    key is far more durable than walking a fixed path from the document root.
+    """
+    start = key_idx
+    depth = 0
+    while start >= 0:
+        c = text[start]
+        if c == '}':
+            depth += 1
+        elif c == '{':
+            if depth == 0:
+                break
+            depth -= 1
+        start -= 1
+    if start < 0:
+        return None
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _fb_collect_from_json(html_text):
+    """
+    Listings from the inline Relay JSON, in the shape _fb_collect_from_html returns.
+
+    Adds three fields the DOM has no way to provide:
+      * creation_time  — makes FB_MAX_LISTING_AGE_DAYS actually enforceable
+                         (it is currently read and then never used, because a
+                         rendered card carries no timestamp).
+      * delivery_types — authoritative local-vs-shipping, so Facebook stops
+                         guessing from title phrases the way OfferUp used to.
+      * is_sold / is_pending — drop dead listings before they reach Vision.
+    """
+    out = []
+    if not html_text:
+        return out
+    seen = set()
+    for m in re.finditer(re.escape(_FB_JSON_TITLE_KEY) + r'\s*:', html_text):
+        try:
+            blob = _fb_json_object_at(html_text, m.start())
+            if not blob:
+                continue
+            obj = json.loads(blob)
+            title = (obj.get('marketplace_listing_title') or '').strip()
+            listing_id = str(obj.get('id') or '').strip()
+            if not (title and listing_id.isdigit()):
+                continue
+            if listing_id in seen:
+                continue
+
+            # A sold or pending listing is not actionable, and alerting on one
+            # is worse than missing it.
+            if obj.get('is_sold') or obj.get('is_pending') or obj.get('is_hidden'):
+                continue
+            if obj.get('is_live') is False:
+                continue
+
+            # Bare numeric string, like OfferUp's — extract_price expects a
+            # currency symbol and would return None for every row.
+            try:
+                price = float((obj.get('listing_price') or {}).get('amount'))
+            except (TypeError, ValueError):
+                continue
+            # A free listing is kept at its real price of 0, not dropped and not
+            # rewritten. The DOM path gets this wrong: Facebook renders a free
+            # item as the WORD "Free" followed by the struck-through old price,
+            # so extract_price takes the strikethrough and a free item is stored
+            # at what it used to cost. Measured 2026-08-11 — "Egg case phone
+            # iPhone 8", listing_price 0.00, strikethrough $1, recorded as $1.00.
+            # check_price_threshold compares only against bounds the user
+            # actually set, so 0 flows through correctly; anyone who does not
+            # want free items sets a min price.
+            if price < 0:
+                continue
+
+            geo = ((obj.get('location') or {}).get('reverse_geocode') or {})
+            city, state = geo.get('city'), geo.get('state')
+            photo = (obj.get('primary_listing_photo') or {}).get('image') or {}
+            delivery = [str(d).upper() for d in (obj.get('delivery_types') or [])]
+
+            seen.add(listing_id)
+            out.append({
+                'title': title,
+                'price': price,
+                'link': f'https://www.facebook.com/marketplace/item/{listing_id}{_FB_ITEM_LINK_SUFFIX}',
+                'image_url': photo.get('uri'),
+                'city': f'{city}, {state}' if (city and state) else (city or None),
+                'creation_time': obj.get('creation_time'),
+                'is_local': 'IN_PERSON' in delivery,
+                'is_shipping': any('SHIPPING' in d for d in delivery),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _fb_cookie_config():
+    """
+    (storage_state, plain_cookies) from FB_COOKIES_FILE, or (None, None).
+
+    capture_fb_cookies.py writes storage_state (a dict with a 'cookies' key plus
+    localStorage); a plain cookie array exported from a browser extension also
+    works. One definition, used by both the DOM and lean paths — a duplicated
+    copy of this is exactly how a previous session broke OfferUp.
+    """
+    cookies_file = os.getenv('FB_COOKIES_FILE', '').strip()
+    if not (cookies_file and os.path.isfile(cookies_file)):
+        return None, None
+    try:
+        with open(cookies_file, 'r') as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and 'cookies' in raw:
+            return cookies_file, None
+        return None, (raw if isinstance(raw, list) else raw.get('cookies') or [])
+    except Exception:
+        return None, None
+
+
+class _FbLeanSession:
+    """
+    One browser and one context, reused across every term in a user's scrape.
+
+    The lean fetch made each term cheap in BYTES (111KB vs 2.1MB) but every term
+    still paid a full Chromium launch. Measured 2026-08-11: 9.7s per term across
+    10 terms, and the navigation itself is only a fraction of that — the rest is
+    process startup. Ten terms meant ten launches.
+
+    Only the lean path uses this. On the DOM path the page render dominates the
+    time anyway, and holding a context open across ten full Marketplace renders
+    is a memory risk on a 512MB box, which is the failure mode that actually
+    takes the API down.
+
+    Cold start still applies: the first navigation in a fresh process can come
+    back empty, and the context is dead rather than slow, so recovery is a full
+    relaunch (see _fb_fetch_with_playwright). Here that is amortised too — it
+    happens once for the session rather than once per term.
+    """
+
+    def __init__(self, proxy_override=None):
+        self._pw = None
+        self._browser = None
+        self._ctx = None
+        self._proxy = proxy_override
+        self._settle_ms = _fb_lean_settle_ms()
+
+    def _open(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(**_pw_launch_kwargs('facebook'))
+        storage_state, plain_cookies = _fb_cookie_config()
+        self._ctx = _pw_new_context(
+            self._browser, stealth=True, platform='facebook',
+            storage_state=storage_state, proxy_override=self._proxy,
+            block_scripts=True,
+        )
+        if plain_cookies:
+            try:
+                self._ctx.add_cookies(plain_cookies)
+            except Exception:
+                pass
+
+    def _ensure(self):
+        if self._browser is None:
+            self._open()
+
+    def rotate(self, proxy_override):
+        """Rebuild on a different exit IP after a block."""
+        self.close()
+        self._proxy = proxy_override
+
+    def fetch(self, url):
+        """One term's HTML, relaunching once if the browser came back empty."""
+        attempts = _fb_fetch_attempts()
+        html = ''
+        for attempt in range(1, attempts + 1):
+            try:
+                self._ensure()
+                html = self._fetch_once(url)
+            except Exception as e:
+                _emit(f"[facebook lean] fetch failed: {type(e).__name__}: {e}")
+                html = ''
+            if len(html or '') >= 3000:
+                return html
+            if attempt < attempts:
+                _emit(f"[facebook lean] attempt {attempt}/{attempts} returned "
+                      f"{len(html or '')} chars — relaunching browser")
+                self.close()
+        return html or ''
+
+    def _fetch_once(self, url):
+        page = self._ctx.new_page()
+        _attach_byte_counter(page, 'facebook')
+        try:
+            try:
+                page.goto(url, wait_until='domcontentloaded',
+                          timeout=_fb_nav_timeout_ms())
+            except Exception as e:
+                _emit(f"[facebook nav warning] {e}")
+            # No JS loaded, so there is no modal to dismiss, nothing to scroll
+            # and no anchor to wait for. domcontentloaded already guarantees the
+            # document (and the listings inline in it) arrived — see
+            # _fb_lean_settle_ms, which defaults to no wait at all.
+            if self._settle_ms:
+                page.wait_for_timeout(self._settle_ms)
+            return page.content() or ''
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def close(self):
+        for obj, name in ((self._ctx, 'context'), (self._browser, 'browser')):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+        self._ctx = self._browser = self._pw = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _fb_fetch_attempts():
+    try:
+        return max(1, int(os.getenv('FB_FETCH_ATTEMPTS', '2')))
+    except ValueError:
+        return 2
+
+
+def _fb_nav_timeout_ms():
+    try:
+        return int(os.getenv('FB_NAV_TIMEOUT_MS', '30000'))
+    except ValueError:
+        return 30000
+
+
+def _fb_lean_settle_ms():
+    """
+    Pause after navigation before reading the document. Default 0.
+
+    It was 2500ms on the assumption that Facebook's Relay payload streams in
+    after navigation. Measured 2026-08-11 across three terms, sampling at
+    0/250/500/1000/2000/3000ms: the listing count is identical at every value,
+    including 0. That follows from wait_until='domcontentloaded' — the event
+    does not fire until the document has been fully parsed, and the listings are
+    inline in that document, so there is nothing left to arrive.
+
+    2.5s per term was the single largest cost on the lean path, ahead of the
+    browser launch. Kept as an env var in case a slow exit ever needs it.
+    """
+    try:
+        return max(0, int(os.getenv('FB_LEAN_SETTLE_MS', '0')))
+    except ValueError:
+        return 0
+
+
+def _fb_fetch_with_playwright(url, proxy_override=None, lean=False):
     """
     Fetch a Facebook Marketplace search page, relaunching the browser if the
     first attempt comes back empty.
@@ -3071,7 +3674,7 @@ def _fb_fetch_with_playwright(url, proxy_override=None):
 
     html = ''
     for attempt in range(1, attempts + 1):
-        html = _fb_fetch_once(url, proxy_override=proxy_override)
+        html = _fb_fetch_once(url, proxy_override=proxy_override, lean=lean)
         if len(html or '') >= 3000:
             return html
         if attempt < attempts:
@@ -3080,13 +3683,16 @@ def _fb_fetch_with_playwright(url, proxy_override=None):
     return html or ''
 
 
-def _fb_fetch_once(url, proxy_override=None):
+def _fb_fetch_once(url, proxy_override=None, lean=False):
     """
     One Playwright fetch of a Facebook Marketplace search page.
 
     `proxy_override` forces one specific proxy for this fetch instead of the
     configured FB_PROXY_URL — used to retry a blocked page on a fresh sticky
     session (see _rotate_sticky_session).
+
+    `lean` blocks JS and skips every step that only exists to drive it. See
+    _fb_collect_from_json.
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -3105,30 +3711,17 @@ def _fb_fetch_once(url, proxy_override=None):
         except Exception as e:
             _emit(f"[facebook] chromium launch failed: {e}")
             return ''
-        # capture_fb_cookies.py writes storage_state (dict with a 'cookies' key,
-        # plus localStorage); a plain cookie array from a browser extension also works.
-        cookies_file = os.getenv('FB_COOKIES_FILE', '').strip()
-        storage_state = None
-        plain_cookies = None
-        if cookies_file and os.path.isfile(cookies_file):
-            try:
-                with open(cookies_file, 'r') as f:
-                    raw = json.load(f)
-                if isinstance(raw, dict) and 'cookies' in raw:
-                    storage_state = cookies_file
-                else:
-                    plain_cookies = raw if isinstance(raw, list) else raw.get('cookies') or []
-            except Exception:
-                pass
+        storage_state, plain_cookies = _fb_cookie_config()
 
         ctx = _pw_new_context(browser, stealth=True, platform='facebook', storage_state=storage_state,
-                              proxy_override=proxy_override)
+                              proxy_override=proxy_override, block_scripts=lean)
         if plain_cookies:
             try:
                 ctx.add_cookies(plain_cookies)
             except Exception:
                 pass
         page = ctx.new_page()
+        _attach_byte_counter(page, 'facebook')
         try:
             # Facebook keeps long-lived connections open, so 'networkidle' can
             # never fire and the whole navigation times out even though the page
@@ -3165,6 +3758,19 @@ def _fb_fetch_once(url, proxy_override=None):
             if len(early) < 3000:
                 _emit(f"[facebook] navigation produced {len(early)} chars — giving up early")
                 return early
+
+            if lean:
+                # Everything below this point exists to drive JS we did not load:
+                # the login modal is inert, scrolling lazy-loads nothing, and
+                # wait_for_selector on an anchor React never renders would burn
+                # the full nav_wait_ms every single term.
+                try:
+                    settle = _fb_lean_settle_ms()
+                    if settle:
+                        page.wait_for_timeout(settle)
+                    return page.content()
+                except Exception:
+                    return early
 
             # Logged-out Marketplace renders listings behind a dismissible login
             # modal. Closing it (rather than treating it as a block) is what makes
@@ -3255,9 +3861,18 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
     except Exception as e:
         _emit(f"[facebook] region lookup failed: {e}")
 
+    # Lean fetch: block JS and read the server-rendered JSON instead of the
+    # rendered DOM. ~93% less residential bandwidth for identical listings —
+    # see _fb_collect_from_json. Opt-in until it has production miles on it.
+    lean = _env_flag('FB_LEAN_FETCH', False)
+    lean_fallback = _env_flag('FB_LEAN_FALLBACK', True)
+    if lean and debug and log_callback:
+        log_callback(user_id, 'Facebook: lean fetch enabled (JSON, no page render)', 'info')
+
     # Needed to apply the distance slider ourselves — see the filter below.
     user_coords = _zip_to_latlon(zip_code)
     skipped_far = 0
+    skipped_stale = 0
     if search_radius and not user_coords and log_callback:
         log_callback(
             user_id,
@@ -3265,125 +3880,173 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
             'info',
         )
 
-    for term in search_terms.keys():
-        if not is_user_active(user_id):
-            if debug and log_callback:
-                log_callback(user_id, 'Facebook stopped by user.', 'info')
-            return listings
-        try:
-            q = quote_plus(term)
-            # Without a region slug Facebook redirects to whatever region it
-            # infers from the exit IP, so results come from wherever the proxy
-            # happens to be rather than near the user. Query params (latitude/
-            # longitude/radius) and browser geolocation are both ignored — the
-            # slug in the path is the only thing that works.
-            if fb_region is None:
-                url = f'https://www.facebook.com/marketplace/search/?query={q}'
-            else:
-                url = f'https://www.facebook.com/marketplace/{fb_region}/search/?query={q}'
+    # One browser for the whole term loop instead of one per term. Only the
+    # lean path: it made each fetch cheap in bytes but every term still paid a
+    # full Chromium launch, which then dominated the time. See _FbLeanSession.
+    session = _FbLeanSession() if lean else None
+    try:
+        for term in search_terms.keys():
+            if not is_user_active(user_id):
+                if debug and log_callback:
+                    log_callback(user_id, 'Facebook stopped by user.', 'info')
+                return listings
+            try:
+                q = quote_plus(term)
+                # Without a region slug Facebook redirects to whatever region it
+                # infers from the exit IP, so results come from wherever the proxy
+                # happens to be rather than near the user. Query params (latitude/
+                # longitude/radius) and browser geolocation are both ignored — the
+                # slug in the path is the only thing that works.
+                if fb_region is None:
+                    url = f'https://www.facebook.com/marketplace/search/?query={q}'
+                else:
+                    url = f'https://www.facebook.com/marketplace/{fb_region}/search/?query={q}'
 
-            html = _fb_fetch_with_playwright(url)
-            rotated = None
-            if _fb_html_is_blocked(html):
-                # A block is usually the exit IP, not the page. Retry once on a
-                # fresh sticky session before calling it a failure — this is the
-                # difference between an intermittently broken platform and a
-                # reliable one.
-                rotated = _rotate_sticky_session(os.getenv('FB_PROXY_URL'))
-                if rotated:
+                html = session.fetch(url) if session else _fb_fetch_with_playwright(url)
+                rotated = None
+                if _fb_html_is_blocked(html, lean=lean):
+                    # A block is usually the exit IP, not the page. Retry once on a
+                    # fresh sticky session before calling it a failure — this is the
+                    # difference between an intermittently broken platform and a
+                    # reliable one.
+                    rotated = _rotate_sticky_session(os.getenv('FB_PROXY_URL'))
+                    if rotated:
+                        if log_callback:
+                            log_callback(
+                                user_id,
+                                f"Facebook '{term}': nothing rendered on this exit IP — "
+                                "retrying once on a fresh proxy session.",
+                                'info',
+                            )
+                        if session:
+                            # Rebuild the shared browser on the new exit IP. Every
+                            # later term in this scrape then reuses it, so a
+                            # rotation costs one relaunch, not one per term.
+                            session.rotate(rotated)
+                            html = session.fetch(url)
+                        else:
+                            html = _fb_fetch_with_playwright(url, proxy_override=rotated)
+
+                if lean and _fb_html_is_blocked(html, lean=True) and lean_fallback:
+                    # Two exits produced no listing JSON. Before reporting a failure,
+                    # spend one full render: it is the only way to tell "Facebook
+                    # changed the payload" (fixable) from "this term genuinely has no
+                    # results" (not). Costs ~1.6MB, so it must stay the exception —
+                    # if this fires routinely, the lean parser needs updating, not
+                    # more retries.
+                    _emit("[facebook] lean fetch found no listing JSON — "
+                          "falling back to a full render once")
+                    html = _fb_fetch_with_playwright(url, proxy_override=rotated)
+                    lean_this_term = False
+                else:
+                    lean_this_term = lean
+
+                if _fb_html_is_blocked(html, lean=lean_this_term):
                     if log_callback:
                         log_callback(
                             user_id,
-                            f"Facebook '{term}': nothing rendered on this exit IP — "
-                            "retrying once on a fresh proxy session.",
-                            'info',
+                            f"Facebook '{term}': no listings returned"
+                            + (" after retrying on a second proxy session" if rotated else "")
+                            + ". Two independent exits failing points at the request, not the IP — "
+                            "check the exit ASN with: curl.exe -x <FB_PROXY_URL> https://ipinfo.io/json "
+                            "before touching selectors. If it persists, set FB_COOKIES_FILE "
+                            "for authenticated access.",
+                            'error',
                         )
-                    html = _fb_fetch_with_playwright(url, proxy_override=rotated)
+                    continue
 
-            if _fb_html_is_blocked(html):
+                raw_items = (_fb_collect_from_json(html) if lean_this_term
+                             else _fb_collect_from_html(html))
+                if debug and log_callback:
+                    how = 'lean JSON' if lean_this_term else 'Playwright'
+                    log_callback(user_id, f"Facebook '{term}': scanned {len(raw_items)} rows ({how})", 'info')
+
+                for item in raw_items[:max(1, max_rows)]:
+                    if not is_user_active(user_id):
+                        return listings
+                    try:
+                        title = item.get('title', '')
+                        price = item.get('price')
+                        link = item.get('link', '')
+                        if not (title and price is not None and link):
+                            continue
+                        # Already have it — do not pay ~1.3s of Vision to rediscover.
+                        if known_links and link in known_links:
+                            continue
+                        # FB_MAX_LISTING_AGE_DAYS has been read and then ignored for
+                        # as long as this scraper has existed, because a rendered card
+                        # carries no timestamp. The JSON does, so on the lean path the
+                        # setting finally means something.
+                        created = item.get('creation_time')
+                        if created:
+                            try:
+                                if (time.time() - float(created)) > max_age_days * 86400:
+                                    skipped_stale += 1
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+                        meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
+                        if not meets_threshold:
+                            continue
+                        if is_excluded(title, price, exclusions, search_terms, matched_term):
+                            continue
+                        if not check_image_with_ai(
+                            item.get('image_url'), ai_enabled, ai_strictness,
+                            debug, log_callback, user_id, platform_name='facebook',
+                            matched_term=matched_term,
+                            term_exclusions=(search_terms.get(matched_term) or {}).get('exclusions'),
+                        ):
+                            continue
+                        # Facebook regions are metro-sized and FB ignores every
+                        # radius parameter, so the user's distance slider has to be
+                        # applied here. A listing whose city we can't geocode is
+                        # kept — better an occasional far result than silently
+                        # dropping good ones.
+                        city = item.get('city')
+                        distance_mi = None
+                        if city and user_coords and search_radius:
+                            cc = city_to_latlon(city)
+                            if cc:
+                                distance_mi = _haversine_miles(user_coords[0], user_coords[1], cc[0], cc[1])
+                                if distance_mi > float(search_radius):
+                                    skipped_far += 1
+                                    continue
+
+                        listings.append({
+                            'title': title,
+                            'price': price,
+                            'link': link,
+                            'platform': 'Facebook',
+                            'console_type': matched_term,
+                            'threshold': max_price,
+                            'image_url': item.get('image_url'),
+                            # Epoch seconds on the lean path, None on the DOM path —
+                            # _parse_source_datetime handles both.
+                            'listed_at': _parse_source_datetime(item.get('creation_time')),
+                            'location': (f'{city} · {distance_mi:.0f} mi' if (city and distance_mi is not None)
+                                         else (city or f'Facebook · {zip_code}')),
+                        })
+                    except Exception:
+                        continue
+                time.sleep(2)
+            except Exception as e:
                 if log_callback:
                     log_callback(
                         user_id,
-                        f"Facebook '{term}': no listings returned"
-                        + (" after retrying on a second proxy session" if rotated else "")
-                        + ". Two independent exits failing points at the request, not the IP — "
-                        "check the exit ASN with: curl.exe -x <FB_PROXY_URL> https://ipinfo.io/json "
-                        "before touching selectors. If it persists, set FB_COOKIES_FILE "
-                        "for authenticated access.",
+                        f"Facebook (Playwright) error on '{term}': {e.__class__.__name__}: {str(e)[:220]}",
                         'error',
                     )
-                continue
 
-            raw_items = _fb_collect_from_html(html)
-            if debug and log_callback:
-                log_callback(user_id, f"Facebook '{term}': scanned {len(raw_items)} rows (Playwright)", 'info')
-
-            for item in raw_items[:max(1, max_rows)]:
-                if not is_user_active(user_id):
-                    return listings
-                try:
-                    title = item.get('title', '')
-                    price = item.get('price')
-                    link = item.get('link', '')
-                    if not (title and price is not None and link):
-                        continue
-                    # Already have it — do not pay ~1.3s of Vision to rediscover.
-                    if known_links and link in known_links:
-                        continue
-                    meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
-                    if not meets_threshold:
-                        continue
-                    if is_excluded(title, price, exclusions, search_terms, matched_term):
-                        continue
-                    if not check_image_with_ai(
-                        item.get('image_url'), ai_enabled, ai_strictness,
-                        debug, log_callback, user_id, platform_name='facebook',
-                        matched_term=matched_term,
-                        term_exclusions=(search_terms.get(matched_term) or {}).get('exclusions'),
-                    ):
-                        continue
-                    # Facebook regions are metro-sized and FB ignores every
-                    # radius parameter, so the user's distance slider has to be
-                    # applied here. A listing whose city we can't geocode is
-                    # kept — better an occasional far result than silently
-                    # dropping good ones.
-                    city = item.get('city')
-                    distance_mi = None
-                    if city and user_coords and search_radius:
-                        cc = city_to_latlon(city)
-                        if cc:
-                            distance_mi = _haversine_miles(user_coords[0], user_coords[1], cc[0], cc[1])
-                            if distance_mi > float(search_radius):
-                                skipped_far += 1
-                                continue
-
-                    listings.append({
-                        'title': title,
-                        'price': price,
-                        'link': link,
-                        'platform': 'Facebook',
-                        'console_type': matched_term,
-                        'threshold': max_price,
-                        'image_url': item.get('image_url'),
-                        'listed_at': None,
-                        'location': (f'{city} · {distance_mi:.0f} mi' if (city and distance_mi is not None)
-                                     else (city or f'Facebook · {zip_code}')),
-                    })
-                except Exception:
-                    continue
-            time.sleep(2)
-        except Exception as e:
-            if log_callback:
-                log_callback(
-                    user_id,
-                    f"Facebook (Playwright) error on '{term}': {e.__class__.__name__}: {str(e)[:220]}",
-                    'error',
-                )
-
-    if debug and log_callback:
-        far_note = f' ({skipped_far} beyond {search_radius} mi)' if skipped_far else ''
-        log_callback(user_id, f'Facebook complete: {len(listings)} candidate matches{far_note}', 'info')
-    return listings
+        if debug and log_callback:
+            far_note = f' ({skipped_far} beyond {search_radius} mi)' if skipped_far else ''
+            stale_note = f' ({skipped_stale} older than {max_age_days}d)' if skipped_stale else ''
+            log_callback(user_id,
+                         f'Facebook complete: {len(listings)} candidate matches{far_note}{stale_note}',
+                         'info')
+        return listings
+    finally:
+        if session is not None:
+            session.close()
 
 
 # ===========================
@@ -3770,6 +4433,11 @@ def scrape_for_user(user_config, log_callback=None, debug=False):
 def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     user_id = user_config['user_id']
     zip_code = user_config['zip_code']
+    # Per-scrape, so the figure reported at the end is this run's traffic.
+    # NOTE: with SCRAPE_MAX_WORKERS > 1 the counter is shared across concurrent
+    # scrapes, so the number is per-cycle rather than strictly per-user. Fine
+    # for costing — it is the total that gets billed.
+    _reset_bytes()
     user_config = {
         **user_config,
         'platforms': _coerce_platforms_dict(user_config.get('platforms')),
@@ -3792,10 +4460,30 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         enabled = [name for name in ('craigslist', 'offerup', 'mercari', 'facebook') if plat.get(name)]
         log_callback(user_id, f"Scanning: {', '.join(enabled) or 'no platforms'}", 'info')
 
-    search_terms = get_user_search_terms(user_id)
-    if not search_terms:
+    all_terms = get_user_search_terms(user_id)
+    if not all_terms:
         if log_callback: log_callback(user_id, "No search terms found. Scanner idle.", "error")
         return 0
+
+    # Only scan the terms whose own interval has elapsed. A Pro user's 3 priority
+    # terms come round every 5 minutes while the other 7 wait for 15, so scanning
+    # the whole set whenever any one is due would throw the saving away.
+    search_terms, next_term_due = due_terms_for_user(all_terms, user_config)
+    if not search_terms:
+        if log_callback and next_term_due:
+            wait_s = max(0, int(next_term_due - time.time()))
+            mins, secs = divmod(wait_s, 60)
+            log_callback(user_id, f"No terms due yet — next in {mins}m {secs:02d}s.", 'info')
+        return 0
+
+    if len(search_terms) < len(all_terms) and log_callback:
+        held = len(all_terms) - len(search_terms)
+        log_callback(
+            user_id,
+            f"Scanning {len(search_terms)} of {len(all_terms)} terms "
+            f"({held} not due yet on the standard interval).",
+            'info',
+        )
 
     if log_callback:
         parts = []
@@ -3813,7 +4501,8 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
                 bounds = f'${lo:g}-${hi:g}'
             excl = rng.get('exclusions') or []
             suffix = f", excl: {', '.join(excl[:3])}" if excl else ''
-            parts.append(f"{t!r} ({bounds}{suffix})")
+            fast = ' ⚡' if rng.get('is_priority') else ''
+            parts.append(f"{t!r}{fast} ({bounds}{suffix})")
         preview = ", ".join(parts[:12])
         if len(parts) > 12:
             preview += f" … (+{len(parts) - 12} more)"
@@ -3995,6 +4684,14 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     if log_callback and len(new_listings) == 0:
         log_callback(user_id, "Scan complete. No new matches found.", "info")
 
+    # Stamp only the terms actually scanned. Doing this at the end rather than up
+    # front means a crash mid-scrape leaves the terms due, matching how
+    # _clear_scrape_stamp_for_retry gives the user their interval back instead of
+    # burning it on a failed run.
+    stamp_terms_scraped(user_id, list(search_terms.keys()))
+
+    _log_bandwidth(log_callback, user_id)
+
     return len(new_listings)
 
 
@@ -4021,24 +4718,54 @@ def main(log_callback=None, health_callback=None):
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"\n[{timestamp}] 🔄 Master Cycle #{cycle}", flush=True)
 
+            # Release the connection BEFORE scraping. It used to stay open for
+            # the whole cycle — hours with several users — pinning a pooler slot
+            # the entire time for a query that takes milliseconds.
             conn = get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
+            try:
+                # 1. Pull all active users AND their last scraped times!
+                cursor.execute("""
+                    SELECT user_id, zip_code, search_radius, platforms,
+                           ai_enabled, ai_strictness, check_interval_minutes,
+                           plan_tier, is_pro,
+                           buyer_include_local, buyer_include_shipping,
+                           EXTRACT(EPOCH FROM last_scraped_at) as last_scraped_ts
+                    FROM user_settings
+                    WHERE is_active = TRUE;
+                """)
+                active_users = cursor.fetchall()
 
-            # 1. Pull all active users AND their last scraped times!
-            cursor.execute("""
-                SELECT user_id, zip_code, search_radius, platforms, 
-                       ai_enabled, ai_strictness, check_interval_minutes,
-                       plan_tier, is_pro,
-                       buyer_include_local, buyer_include_shipping,
-                       EXTRACT(EPOCH FROM last_scraped_at) as last_scraped_ts 
-                FROM user_settings 
-                WHERE is_active = TRUE;
-            """)
-            active_users = cursor.fetchall()
+                # Every active user's terms in ONE query. Asking per user inside
+                # the loop below would be a round-trip per user per cycle — 60
+                # users is 60 extra queries a minute purely to decide who to skip.
+                cursor.execute("""
+                    SELECT t.user_id, t.search_term, t.is_priority,
+                           EXTRACT(EPOCH FROM t.last_scraped_at) AS last_scraped_ts
+                    FROM user_search_terms t
+                    JOIN user_settings s ON s.user_id = t.user_id
+                    WHERE s.is_active = TRUE;
+                """)
+                all_terms_by_user = {}
+                for row in cursor.fetchall():
+                    all_terms_by_user.setdefault(row['user_id'], {})[row['search_term']] = {
+                        'is_priority': bool(row['is_priority']),
+                        'last_scraped_ts': (float(row['last_scraped_ts'])
+                                            if row['last_scraped_ts'] is not None else 0.0),
+                    }
+            finally:
+                cursor.close()
+                conn.close()
 
             current_time = time.time()
             total_new = 0
 
+            # 2. THE CLOCK: decide who is due before running anything, so the
+            #    due users can be scraped concurrently instead of queueing
+            #    behind each other. Sequentially, one 5-minute user delayed
+            #    everyone after them — with 30 users a cycle took hours and the
+            #    5-minute Pro promise was unmeetable.
+            due = []
             for user in active_users:
                 uid = user['user_id']
                 if is_user_scraping(uid):
@@ -4051,31 +4778,22 @@ def main(log_callback=None, health_callback=None):
                 interval_min = _effective_check_interval_minutes_for_user(user_cfg)
                 interval_seconds = int(interval_min) * 60
 
-                # 2. THE CLOCK: Has enough time passed since their last scrape?
-                if current_time - last_scraped >= interval_seconds:
-                    try:
-                        new_count = scrape_for_user(user_cfg, log_callback=log_callback, debug=True)
-                        total_new += new_count
-                    except Exception as e:
-                        # A crash here used to be invisible: it printed to server
-                        # stdout only, while the finally-block stamp started the
-                        # user's countdown. From the dashboard that looked like a
-                        # scan that ran in 0s and found nothing. Surface it to the
-                        # user AND give the interval back.
-                        print(f"  ❌ [{uid}] Error: {e}", flush=True)
-                        traceback.print_exc()
-                        if log_callback:
-                            log_callback(
-                                uid,
-                                f"Scan failed: {type(e).__name__}: {e}",
-                                'error',
-                            )
-                            log_callback(
-                                uid,
-                                "This scan did not count against your interval — retrying shortly.",
-                                'info',
-                            )
-                        _clear_scrape_stamp_for_retry(uid)
+                # With priority terms the user-level interval is only a first
+                # gate: a Pro user is due as soon as ANY term is, which for their
+                # 3 priority terms is every 5 minutes even though the other 7 sit
+                # on 15. Checking per term here avoids waking a user whose fast
+                # terms are all still cooling down, which would otherwise cost a
+                # full browser launch to discover there was nothing to do.
+                terms_for_user = all_terms_by_user.get(uid)
+                if max_priority_for_tier(tier) > 0 and terms_for_user:
+                    due_now, _ = due_terms_for_user(terms_for_user, user_cfg,
+                                                    now=current_time)
+                    term_due = bool(due_now)
+                else:
+                    term_due = current_time - last_scraped >= interval_seconds
+
+                if term_due:
+                    due.append(user_cfg)
                 else:
                     # Waiting for this user's interval. Say so rather than going
                     # silent — an unexplained quiet dashboard is indistinguishable
@@ -4090,11 +4808,63 @@ def main(log_callback=None, health_callback=None):
                                 'info',
                             )
 
+            def _run_one(cfg):
+                """One user's scrape, with the per-user error handling intact."""
+                uid = cfg['user_id']
+                try:
+                    return scrape_for_user(cfg, log_callback=log_callback, debug=True)
+                except Exception as e:
+                    # A crash here used to be invisible: it printed to server
+                    # stdout only, while the finally-block stamp started the
+                    # user's countdown. From the dashboard that looked like a
+                    # scan that ran in 0s and found nothing. Surface it to the
+                    # user AND give the interval back.
+                    print(f"  ❌ [{uid}] Error: {e}", flush=True)
+                    traceback.print_exc()
+                    if log_callback:
+                        log_callback(uid, f"Scan failed: {type(e).__name__}: {e}", 'error')
+                        log_callback(
+                            uid,
+                            "This scan did not count against your interval — retrying shortly.",
+                            'info',
+                        )
+                    _clear_scrape_stamp_for_retry(uid)
+                    return 0
+
+            if due:
+                # Bounded by MEMORY, not by CPU. Measured peak per concurrent
+                # scrape, 2026-08-11 (peak working set of the whole
+                # chrome-headless-shell process group):
+                #
+                #   lean path (FB_LEAN_FETCH=1)   206MB over 4 processes
+                #   DOM path  (renders Facebook)  455MB over 6 processes
+                #
+                # The DOM figure is why 512MB instances die: one scrape alone
+                # peaks at 455MB of a 512MB container that also holds Python and
+                # Flask. The ceiling is roughly (container RAM - 200MB) / peak,
+                # so 512MB is 1 worker either way, 2GB is 8 lean, 4GB is 18.
+                # Raise this only alongside RAM — queueing is survivable, an OOM
+                # kill takes the whole process down including the API.
+                try:
+                    max_workers = max(1, int(os.getenv('SCRAPE_MAX_WORKERS', '3')))
+                except ValueError:
+                    max_workers = 3
+                workers = min(max_workers, len(due))
+                print(f"  ▶ {len(due)} user(s) due — running {workers} at a time", flush=True)
+
+                with ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix='scrape') as pool:
+                    futures = [pool.submit(_run_one, cfg) for cfg in due]
+                    for fut in as_completed(futures):
+                        try:
+                            total_new += fut.result() or 0
+                        except Exception as e:
+                            # _run_one already handles per-user failures; this is
+                            # only for something raised outside it.
+                            print(f"  ❌ worker future failed: {e}", flush=True)
+
             print(f"\n✅ Total new listings this cycle: {total_new}", flush=True)
             print(f"⏳ Cycle complete. Waiting 1 minute...", flush=True)
-
-            cursor.close()
-            conn.close()
             sys.stdout.flush()
 
             # Report health check timestamp

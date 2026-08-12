@@ -16,6 +16,9 @@ _tour_applied = False
 _listing_uniq_lock = threading.Lock()
 _listing_uniq_applied = False
 
+_priority_lock = threading.Lock()
+_priority_applied = False
+
 BUYER_DELIVERY_PREFS_DDL = """
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS buyer_include_local BOOLEAN NOT NULL DEFAULT TRUE,
@@ -131,6 +134,45 @@ def ensure_listing_uniqueness_per_user(conn):
             cur.execute(LISTING_UNIQUE_DDL)
             conn.commit()
             _listing_uniq_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+PRIORITY_TERMS_DDL = """
+ALTER TABLE user_search_terms
+  ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE user_search_terms
+  ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_user_search_terms_user_priority
+  ON user_search_terms (user_id, is_priority);
+"""
+
+
+def ensure_priority_term_columns(conn):
+    """
+    Apply migration 011 if it was not run yet.
+
+    is_priority marks the (max 3) terms a Pro user wants at the 5-minute floor;
+    everything else falls to the 15-minute floor. last_scraped_at is per TERM
+    because the scheduler now has to decide due-ness per term rather than per
+    user — see _due_terms_for_user in scraper_multi_user.py.
+    """
+    global _priority_applied
+    if _priority_applied:
+        return
+    with _priority_lock:
+        if _priority_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(PRIORITY_TERMS_DDL)
+            conn.commit()
+            _priority_applied = True
         except Exception:
             conn.rollback()
             raise

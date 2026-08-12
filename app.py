@@ -282,15 +282,16 @@ def _effective_plan_tier(us):
 def _plan_limits(tier):
     t = (tier or 'inactive').lower()
     if t == 'pro':
-        return {'max_search_terms': 10, 'ai_image_allowed': True}
+        return {'max_search_terms': 10, 'ai_image_allowed': True, 'max_priority_terms': 3}
     if t == 'basic':
-        return {'max_search_terms': 3, 'ai_image_allowed': False}
+        return {'max_search_terms': 3, 'ai_image_allowed': False, 'max_priority_terms': 0}
     try:
         # Pre-beta / trial: allow a few terms before checkout; set to 0 in production if you require payment first.
         inactive_cap = int(os.getenv('MAX_SEARCH_TERMS_INACTIVE', '3'))
     except ValueError:
         inactive_cap = 3
-    return {'max_search_terms': max(0, inactive_cap), 'ai_image_allowed': False}
+    return {'max_search_terms': max(0, inactive_cap), 'ai_image_allowed': False,
+            'max_priority_terms': 0}
 
 
 def _effective_limits(us):
@@ -308,6 +309,12 @@ def _effective_limits(us):
     oa = us.get('ai_image_allowed_override')
     if oa is not None:
         lim['ai_image_allowed'] = bool(oa)
+    op = us.get('max_priority_terms_override')
+    if op is not None:
+        try:
+            lim['max_priority_terms'] = max(0, int(op))
+        except (TypeError, ValueError):
+            pass
     return lim
 
 
@@ -321,6 +328,39 @@ PLAN_INTERVAL_OPTIONS = {
     'basic': [10, 15, 30, 60],
 }
 DEFAULT_INTERVAL_FLOOR_MINUTES = 10
+
+# Priority terms: a Pro user picks up to 3 terms that keep the 5-minute floor;
+# their remaining terms drop to a 15-minute floor. Basic sees the control as an
+# upsell but cannot enable it, so PLAN_MAX_PRIORITY_TERMS is 0 there and the
+# standard floor never applies — all Basic terms use PLAN_INTERVAL_FLOOR_MINUTES.
+#
+# This is a bandwidth lever as much as a feature: 7 of 10 terms going from 288
+# to 96 scans/day is the difference between $9.11 and $4.86 a month in
+# residential proxy spend per Pro account (measured 2026-08-11 at 110.6KB/term).
+#
+# Keep in sync with the identical tables in scraper_multi_user.py AND with
+# frontend/src/App.js.
+PLAN_MAX_PRIORITY_TERMS = {'pro': 3, 'basic': 0}
+PLAN_STANDARD_FLOOR_MINUTES = {'pro': 15}
+DEFAULT_MAX_PRIORITY_TERMS = 0
+
+
+def _max_priority_terms_for_tier(tier):
+    return PLAN_MAX_PRIORITY_TERMS.get(
+        (tier or '').strip().lower(), DEFAULT_MAX_PRIORITY_TERMS
+    )
+
+
+def _standard_floor_for_tier(tier):
+    """
+    Floor for a NON-priority term.
+
+    Tiers with no priority feature fall back to their normal floor, so nothing
+    changes for them — a Basic user's terms are all 'standard' but must not
+    silently slow to 15 minutes.
+    """
+    t = (tier or '').strip().lower()
+    return PLAN_STANDARD_FLOOR_MINUTES.get(t, _interval_floor_for_tier(t))
 
 
 def _interval_floor_for_tier(tier):
@@ -549,7 +589,11 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 
 def get_db_connection():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        # Pooled: /api/status is polled every 2s per open dashboard, and a fresh
+        # TLS handshake per poll both wasted ~287ms and burned a pooler slot.
+        # The returned object proxies a real connection; .close() hands it back.
+        from db_pool import get_pooled_connection
+        conn = get_pooled_connection()
         try:
             from db_schema import (
                 ensure_buyer_delivery_columns,
@@ -557,12 +601,14 @@ def get_db_connection():
                 ensure_per_term_exclusion_columns,
                 ensure_tour_column,
                 ensure_listing_uniqueness_per_user,
+                ensure_priority_term_columns,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
             ensure_per_term_exclusion_columns(conn)
             ensure_tour_column(conn)
             ensure_listing_uniqueness_per_user(conn)
+            ensure_priority_term_columns(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -633,21 +679,19 @@ except ValueError:
 
 
 def add_log(user_id, message, log_type="info"):
-    """Saves a log to the specific user's buffer to be sent to React.
-    `ts` is UTC epoch seconds so the browser can format in the viewer's local timezone."""
-    if user_id not in user_logs:
-        user_logs[user_id] = []
+    """
+    Record a console line for this user.
 
-    now_utc = datetime.now(timezone.utc)
-    ts = now_utc.timestamp()
-    # Legacy `time` kept as UTC label so old cached clients are not misleading vs local `ts` display.
-    time_utc = now_utc.strftime("%I:%M:%S %p UTC")
-    logs = user_logs[user_id]
-    logs.append({"ts": ts, "time": time_utc, "message": message, "type": log_type})
+    Writes go to the scrape_logs table, not a process dict, so the API can serve
+    logs produced by a scraper running in a DIFFERENT process. That is what
+    makes the worker/API split possible — and it also removes the failure mode
+    where two backend processes each kept their own buffer and the dashboard
+    read whichever one happened to win the port.
 
-    # Trim in one slice rather than repeated pop(0), which is O(n) per call.
-    if len(logs) > MAX_USER_LOGS:
-        del logs[:len(logs) - MAX_USER_LOGS]
+    Batched by scrape_logs, so this stays cheap despite being per-line.
+    """
+    import scrape_logs
+    scrape_logs.add_log(user_id, message, log_type)
 
 
 def cleanup_old_listings():
@@ -664,6 +708,15 @@ def cleanup_old_listings():
                 conn.commit()
                 if deleted > 0:
                     print(f"🧹 Cleanup removed {deleted} old listings", flush=True)
+                # Console lines are now rows, so they need retention too or the
+                # table grows without bound.
+                try:
+                    import scrape_logs
+                    purged = scrape_logs.purge_old()
+                    if purged:
+                        print(f"🧹 Cleanup removed {purged} old log lines", flush=True)
+                except Exception as log_err:
+                    print(f"log purge warning: {log_err}", flush=True)
         except Exception as e:
             print(f"cleanup_old_listings error: {e}", flush=True)
         finally:
@@ -708,6 +761,10 @@ _scraper_thread = None
 _scraper_thread_started = False
 _cleanup_thread = None
 _cleanup_thread_started = False
+
+def _env_flag_true(name):
+    return (os.getenv(name, '') or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
 
 def ensure_scraper_thread_started():
     """
@@ -857,17 +914,17 @@ def get_status(user_id):
         # hundreds of lines. A client that passes `since` (the newest ts it
         # already has) gets only what is new; omitting it returns a full
         # snapshot, which is what a fresh page load wants.
-        activity = user_logs.get(user_id, [])
+        import scrape_logs
         activity_partial = False
+        since_ts = None
         since_raw = request.args.get('since')
         if since_raw:
             try:
                 since_ts = float(since_raw)
-            except (TypeError, ValueError):
-                pass  # malformed cursor: fall back to a full snapshot
-            else:
-                activity = [l for l in activity if float(l.get('ts') or 0) > since_ts]
                 activity_partial = True
+            except (TypeError, ValueError):
+                since_ts = None  # malformed cursor: fall back to a full snapshot
+        activity = scrape_logs.get_logs(user_id, since_ts=since_ts, limit=MAX_USER_LOGS)
 
         return jsonify({
             "status": "running" if is_running else "stopped",
@@ -909,13 +966,15 @@ def handle_settings(user_id):
 
             # NULL min/max means "any price" — an unset bound, not zero. Keep it
             # as None all the way to the client so the input renders empty.
-            cursor.execute("SELECT search_term, max_price, min_price FROM user_search_terms WHERE user_id = %s;",
+            cursor.execute("SELECT search_term, max_price, min_price, is_priority "
+                           "FROM user_search_terms WHERE user_id = %s;",
                            (user_id,))
             terms = {
                 row['search_term']: {
                     'max': float(row['max_price']) if row['max_price'] is not None else None,
                     'min': float(row['min_price']) if row['min_price'] is not None else None,
                     'exclusions': [],
+                    'priority': bool(row.get('is_priority')),
                 } for row in cursor.fetchall()
             }
 
@@ -946,6 +1005,7 @@ def handle_settings(user_id):
                     "plan_tier": "inactive",
                     "plan_name": None,
                     "max_search_terms": _plan_limits('inactive')['max_search_terms'],
+                    "max_priority_terms": _plan_limits('inactive')['max_priority_terms'],
                     "ai_image_allowed": False,
                     "subscription_current_period_end": None,
                     "subscription_cancel_at_period_end": False,
@@ -980,6 +1040,7 @@ def handle_settings(user_id):
                 "plan_tier": pt,
                 "plan_name": _plan_display_name(pt),
                 "max_search_terms": limits['max_search_terms'],
+                "max_priority_terms": limits['max_priority_terms'],
                 "ai_image_allowed": ai_allowed,
                 "subscription_current_period_end": us.get('subscription_current_period_end'),
                 "subscription_cancel_at_period_end": bool(us.get('subscription_cancel_at_period_end')),
@@ -1062,6 +1123,19 @@ def handle_settings(user_id):
 
             # REPLACE Search Terms
             # POST: Save both max and min to the database
+            #
+            # The rows are deleted and rewritten, which would also discard each
+            # term's last_scraped_at and restart every countdown on any settings
+            # save. Capture them first and carry them across for terms that
+            # survive — otherwise a user editing a price re-triggers a full scan
+            # of all their terms, and an autosaving dashboard makes that
+            # constant.
+            cursor.execute(
+                "SELECT search_term, last_scraped_at FROM user_search_terms WHERE user_id = %s;",
+                (user_id,),
+            )
+            prev_scraped = {r['search_term']: r['last_scraped_at'] for r in cursor.fetchall()}
+
             cursor.execute("DELETE FROM user_search_terms WHERE user_id = %s;", (user_id,))
 
             def _price_or_none(v):
@@ -1073,11 +1147,29 @@ def handle_settings(user_id):
                 except (TypeError, ValueError):
                     return None
 
+            # Priority is a paid feature and the cap is enforced HERE, not in the
+            # UI: a crafted POST would otherwise buy a Basic account ten
+            # 5-minute terms. Anything over the cap falls back to standard rather
+            # than erroring, so a stale client cannot lock a user out of saving.
+            max_priority = limits.get('max_priority_terms', 0)
+            requested_priority = [
+                t for t, p in thresholds_in.items() if bool((p or {}).get('priority'))
+            ]
+            granted_priority = set(sorted(requested_priority)[:max(0, int(max_priority))])
+            if len(requested_priority) > len(granted_priority):
+                print(f"[settings] {user_id[:8]} requested {len(requested_priority)} priority "
+                      f"terms, cap is {max_priority} — granting {len(granted_priority)}",
+                      flush=True)
+
             for term, prices in thresholds_in.items():
                 prices = prices or {}
                 cursor.execute(
-                    "INSERT INTO user_search_terms (user_id, search_term, max_price, min_price) VALUES (%s, %s, %s, %s);",
-                    (user_id, term, _price_or_none(prices.get('max')), _price_or_none(prices.get('min')))
+                    "INSERT INTO user_search_terms "
+                    "(user_id, search_term, max_price, min_price, is_priority, last_scraped_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s);",
+                    (user_id, term, _price_or_none(prices.get('max')),
+                     _price_or_none(prices.get('min')), term in granted_priority,
+                     prev_scraped.get(term))
                 )
 
             # REPLACE Exclusions — all per-term. The DELETE also clears any
@@ -2746,12 +2838,20 @@ if __name__ == '__main__':
     # damage when a second instance slips through.
     _preflight_or_die(port)
 
-    # ensure_scraper_thread_started() already runs at import time and starts the
-    # loop when ENABLE_SCRAPER_THREAD=1. Starting another here would give this
-    # single process TWO scraper threads competing over the same users — the
-    # ghost-scrape failure, but inside one PID, where the port guard cannot see
-    # it. ENABLE_SCRAPER_THREAD exists for gunicorn, where __main__ never runs.
-    if _scraper_thread_started:
+    # DISABLE_SCRAPER_THREAD=1 makes this process API-only. Set it on the Render
+    # WEB service once worker.py runs as its own Background Worker — otherwise
+    # both processes run the scrape loop, every user gets scraped twice, and
+    # each interval is burned twice. That is the ghost-scrape failure again, now
+    # split across two services where no in-process guard can detect it.
+    if _env_flag_true('DISABLE_SCRAPER_THREAD'):
+        print("Scraper thread disabled (DISABLE_SCRAPER_THREAD=1) — API only. "
+              "The scrape loop is expected to run in a separate worker service.",
+              flush=True)
+    elif _scraper_thread_started:
+        # ensure_scraper_thread_started() already runs at import time and starts
+        # the loop when ENABLE_SCRAPER_THREAD=1. Starting another here would give
+        # this single process TWO scraper threads competing over the same users.
+        # ENABLE_SCRAPER_THREAD exists for gunicorn, where __main__ never runs.
         print("Scraper thread already started via ENABLE_SCRAPER_THREAD "
               "(that flag is for gunicorn; it is not needed with `python app.py`).",
               flush=True)
