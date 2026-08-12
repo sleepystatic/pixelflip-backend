@@ -2684,6 +2684,14 @@ def mercari_prefetch_cycle(terms, max_rows=None):
     return len(items or {}), err
 
 
+def _mercari_in_cooldown():
+    """Seconds left on the Mercari back-off, or 0 if it is clear to try."""
+    if _MERCARI_API_CTX is not None:
+        return 0
+    left = _MERCARI_API_COOLDOWN_UNTIL - time.time()
+    return int(left) if left > 0 else 0
+
+
 def _mercari_cycle_items(term):
     """This cycle's listings for `term`, or None if not fetched / too old."""
     with _MERCARI_CYCLE_LOCK:
@@ -2842,6 +2850,15 @@ def _mercari_fetch_via_api(terms, max_rows):
     """
     global _MERCARI_API_COOLDOWN_UNTIL
 
+    # Check the cooldown HERE and return without touching it. Doing this inside
+    # the session made "in cooldown" look like a fresh failure: the caller then
+    # ran the bundled retry (also in cooldown) and re-armed the timer for another
+    # 900s, so the cooldown extended itself on every scrape and could never
+    # expire. Observed in production 2026-08-12.
+    if _MERCARI_API_CTX is None and time.time() < _MERCARI_API_COOLDOWN_UNTIL:
+        wait = int(_MERCARI_API_COOLDOWN_UNTIL - time.time())
+        return {}, f'search API in cooldown for another {wait}s'
+
     items, err = _mercari_api_session(terms, max_rows, bundled=False)
     if not err:
         return items, None
@@ -2879,10 +2896,6 @@ def _mercari_api_session(terms, max_rows, bundled=False):
         from patchright.sync_api import sync_playwright
     except ImportError as e:
         return {}, f'patchright missing ({e})'
-
-    if _MERCARI_API_CTX is None and time.time() < _MERCARI_API_COOLDOWN_UNTIL:
-        wait = int(_MERCARI_API_COOLDOWN_UNTIL - time.time())
-        return {}, f'search API in cooldown for another {wait}s after a failed capture'
 
     results = {}
     # Separate profiles per engine: a profile carries the cf_clearance bound to
@@ -3284,6 +3297,28 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
     _set_active_log(user_id, log_callback)
     if log_callback:
         log_callback(user_id, "Waking up Mercari scraper...", "info")
+
+    # If the API capture just failed, the browser cannot reach Mercari — and the
+    # page-rendering fallback below uses that SAME browser, only far more slowly
+    # (a 45s navigation timeout per URL variant per term). Falling back then
+    # burns minutes to reach a conclusion we already have.
+    #
+    # That mattered far more than it looks: listings are saved once, AFTER every
+    # platform finishes, so a Mercari stall discarded everything Craigslist,
+    # OfferUp and Facebook had already found. Observed in production 2026-08-12
+    # as a scan that "froze" and saved nothing. Skipping costs Mercari for one
+    # cooldown; not skipping cost the entire scrape.
+    cooling = _mercari_in_cooldown()
+    if cooling:
+        if log_callback:
+            mins, secs = divmod(cooling, 60)
+            log_callback(
+                user_id,
+                f"Mercari is unreachable from this server — skipping it for "
+                f"{mins}m {secs:02d}s so it cannot delay your other marketplaces.",
+                'info',
+            )
+        return listings
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -4572,7 +4607,16 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                         })
                     except Exception:
                         continue
-                time.sleep(2)
+                # Politeness pause between terms, same reasoning as OfferUp's:
+                # on the lean path a term is one ~110KB document fetch, not a
+                # 2MB render, so 2s per term was a large share of the total.
+                # Configurable so it can be raised if blocks reappear.
+                try:
+                    fb_term_delay = float(os.getenv('FB_TERM_DELAY_SEC', '0.75'))
+                except ValueError:
+                    fb_term_delay = 0.75
+                if fb_term_delay > 0:
+                    time.sleep(fb_term_delay)
             except Exception as e:
                 if log_callback:
                     log_callback(
@@ -4627,10 +4671,16 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
             'error',
         )
 
+    # Politeness pause between terms. Was 12s, set when every term meant a full
+    # ~400KB page render and hammering that looked abusive. A term is now a
+    # single ~4KB GraphQL call, so 12s of sleep per term dwarfed the work itself:
+    # 10 terms spent ~108s waiting to do ~30s of fetching. Lowered to 3s, still
+    # slower than a human clicking through results, and still tunable — raise it
+    # if OfferUp starts returning the "turn off your proxy" page.
     try:
-        offerup_term_delay = float(os.getenv('OFFERUP_TERM_DELAY_SEC', '12'))
+        offerup_term_delay = float(os.getenv('OFFERUP_TERM_DELAY_SEC', '3'))
     except ValueError:
-        offerup_term_delay = 12.0
+        offerup_term_delay = 3.0
 
     try:
         for term_index, term in enumerate(search_terms.keys()):
