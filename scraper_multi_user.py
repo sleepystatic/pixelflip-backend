@@ -13,7 +13,7 @@ import requests
 import psycopg2
 from psycopg2 import errorcodes
 from psycopg2.extras import RealDictCursor
-from urllib.parse import urlparse, quote, quote_plus, urlencode
+from urllib.parse import urlparse, quote, quote_plus, urlencode, unquote, parse_qs
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -2547,6 +2547,269 @@ def _mercari_chrome_kwargs():
     return {'channel': os.getenv('MERCARI_CHROME_CHANNEL', 'chrome')}
 
 
+# ---------------------------------------------------------------------------
+# Mercari via its own search API (searchFacetQuery)
+#
+# Measured 2026-08-11, direct from a residential IP:
+#
+#   full search page render      4,251 KB   (script 3,225, image 468, font 123)
+#   searchFacetQuery replay          4.5 KB wire  (54 KB uncompressed)
+#
+# 945x less per term. The page downloads 3.2MB of JavaScript whose entire job is
+# to issue this one API call and render its result, which we then parse back out
+# of the DOM. Same shape as the OfferUp and Facebook work.
+#
+# Three things make it possible:
+#   * The call must come from INSIDE the page. Mercari 403s /v1/api for a plain
+#     request — it is checking the session cookie, the Cloudflare clearance and
+#     Chromium's TLS fingerprint, none of which a `requests` call has.
+#   * The persistent profile already holds cf_clearance, so the bootstrap can be
+#     robots.txt (0.8 KB) rather than a search page.
+#   * `authorization: Bearer <jwt>` is NOT in any cookie or localStorage — it
+#     comes from Mercari's app JS. So it has to be captured from one real page
+#     load and reused, and re-captured when it expires.
+#
+# Two response-shrinking parameters, both measured:
+#   facetTypes: []  200KB -> 138KB   (category/brand/price filter UI we never read)
+#   length: 40      138KB ->  55KB   (MERCARI_MAX_ROWS_PER_TERM is 30)
+#
+# The captured token is kept in memory ONLY. It is a session credential, and
+# writing it next to the source would put a live bearer token on disk for no
+# benefit — a restart needs a fresh capture regardless, since it expires.
+# ---------------------------------------------------------------------------
+
+_MERCARI_API_CTX = None            # {'headers': {...}, 'variables': {...}, 'ext': str}
+_MERCARI_API_LOCK = threading.Lock()
+
+_MERCARI_REPLAY_JS = """
+async ([url, headers]) => {
+  const res = await fetch(url, {method: 'GET', headers, credentials: 'include'});
+  const text = await res.text();
+  return {status: res.status, text: text};
+}
+"""
+
+
+def _mercari_api_capture(page, term='ds lite'):
+    """
+    Capture searchFacetQuery's headers and variables from one real page load.
+
+    Returns the context dict, or None. This is the expensive path (a full search
+    render) and exists only to mint a bearer token, so it runs once per process
+    and again only when the token stops working.
+    """
+    captured = {}
+
+    def on_request(r):
+        if 'searchFacetQuery' in r.url and not captured:
+            try:
+                qs = parse_qs(urlparse(r.url).query)
+                captured['variables'] = json.loads(unquote(qs['variables'][0]))
+                captured['ext'] = unquote(qs['extensions'][0])
+                # Drop per-request tracing headers: replaying a stale
+                # sentry-trace/baggage is pointless and marks us as a replay.
+                captured['headers'] = {
+                    k: v for k, v in r.headers.items()
+                    if k.lower() not in ('host', 'content-length', 'baggage',
+                                         'sentry-trace', 'mercari-client-request-id')
+                }
+            except Exception:
+                pass
+
+    page.on('request', on_request)
+    try:
+        page.goto(f'https://www.mercari.com/search/?keyword={quote(term, safe="")}',
+                  wait_until='domcontentloaded',
+                  timeout=int(os.getenv('MERCARI_NAV_TIMEOUT_MS', '45000')))
+        # The API call fires during hydration; give it a moment.
+        for _ in range(10):
+            if captured:
+                break
+            page.wait_for_timeout(1000)
+    except Exception as e:
+        _emit(f"[mercari] api capture navigation failed: {e}")
+    finally:
+        try:
+            page.remove_listener('request', on_request)
+        except Exception:
+            pass
+
+    if captured.get('headers') and captured.get('variables'):
+        _emit("[mercari] captured searchFacetQuery context", 'info')
+        return captured
+    return None
+
+
+def _mercari_api_url(ctx, term, length):
+    """searchFacetQuery URL for one term, with the payload trimmed to what we use."""
+    variables = json.loads(json.dumps(ctx['variables']))     # deep copy
+    criteria = variables.get('criteria')
+    if not isinstance(criteria, dict):
+        return None
+    criteria['query'] = term
+    criteria['length'] = max(1, int(length))
+    criteria['offset'] = 0
+    # Filter-UI payload we never read — worth ~30% of the response on its own.
+    criteria['facetTypes'] = []
+    return ('https://www.mercari.com/v1/api?operationName=searchFacetQuery'
+            f'&variables={quote(json.dumps(variables))}'
+            f'&extensions={quote(ctx["ext"])}')
+
+
+def _mercari_items_from_api(payload):
+    """searchFacetQuery itemsList -> the listing dicts the pipeline expects."""
+    out = []
+    try:
+        items = ((payload.get('data') or {}).get('search') or {}).get('itemsList') or []
+    except Exception:
+        return out
+    for it in items:
+        try:
+            lid = str(it.get('id') or '').strip()
+            title = (it.get('name') or '').strip()
+            if not (lid and title):
+                continue
+            # Sold and closed listings are not actionable; alerting on one is
+            # worse than missing it.
+            if str(it.get('status') or '').lower() not in ('on_sale', ''):
+                continue
+            # PRICE IS IN CENTS. Verified 2026-08-11 against the DOM parser on
+            # the same page: 10/10 items matched at price/100, 0/10 as-is.
+            # Getting this backwards silently multiplies every price by 100 and
+            # every user's max-price filter stops matching anything.
+            try:
+                price = float(it.get('price')) / 100.0
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            photos = it.get('photos') or []
+            image_url = None
+            if photos and isinstance(photos[0], dict):
+                image_url = photos[0].get('imageUrl') or photos[0].get('thumbnail')
+            out.append({
+                'title': title,
+                'price': price,
+                'link': f'https://www.mercari.com/us/item/{lid}/',
+                'image_url': image_url,
+                'listed_at': None,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _mercari_fetch_via_api(terms, max_rows):
+    """
+    Search Mercari for several terms over one browser session.
+
+    Returns {term: [items]} for whatever succeeded, plus an error string or None.
+    Terms are batched deliberately: the browser launch and the bootstrap are the
+    only meaningful costs left, so paying them once for ten terms is the point.
+    """
+    global _MERCARI_API_CTX
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError as e:
+        return {}, f'patchright missing ({e})'
+
+    results = {}
+    # NOTE (pre-existing, matters at scale): Chrome takes a SingletonLock on a
+    # profile directory, so two concurrent scrapes sharing this path will
+    # conflict. Harmless at SCRAPE_MAX_WORKERS=1, but raising the worker count
+    # needs a per-worker profile dir — otherwise Mercari fails for every user
+    # after the first, and the Cloudflare clearance the profile exists to retain
+    # is what gets lost.
+    profile_dir = (os.getenv('PATCHRIGHT_PROFILE_DIR') or '').strip() or \
+        os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_profile')
+
+    clean_ua = _patchright_clean_ua()
+    args = ['--window-size=1920,1080']
+    if _env_flag('MERCARI_HEADLESS', True):
+        args.insert(0, '--headless=new')
+    if _env_flag('MERCARI_CONTAINER_FLAGS', not sys.platform.startswith('win')):
+        args += ['--no-sandbox', '--disable-dev-shm-usage']
+    args.append(f'--user-agent={clean_ua}')
+
+    launch_kwargs = dict(headless=False, no_viewport=True, args=args,
+                         user_agent=clean_ua, **_mercari_chrome_kwargs())
+    proxy_url = _get_proxy('mercari')
+    if proxy_url:
+        launch_kwargs['proxy'] = _pw_proxy_dict(proxy_url)
+
+    with sync_playwright() as p:
+        try:
+            ctx = p.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
+        except Exception as e:
+            return {}, f'patchright launch failed: {e}'
+        try:
+            # Mercari is the one platform that never blocked heavy requests, so
+            # a page render also pulled 468KB of images, 123KB of fonts and 46KB
+            # of CSS. Only the capture render loads a real page now, but that
+            # render is the expensive one, so it is worth blocking there too.
+            if _env_flag('PW_BLOCK_HEAVY_REQUESTS', True):
+                _pw_block_heavy_requests(ctx)
+            page = ctx.new_page()
+            _attach_byte_counter(page, 'mercari')
+
+            with _MERCARI_API_LOCK:
+                api_ctx = _MERCARI_API_CTX
+
+            if api_ctx is None:
+                api_ctx = _mercari_api_capture(page)
+                if not api_ctx:
+                    return {}, 'could not capture searchFacetQuery context'
+                with _MERCARI_API_LOCK:
+                    _MERCARI_API_CTX = api_ctx
+            else:
+                # Cheapest page that still puts us on the origin with the
+                # profile's cookies — see the OfferUp warm-up for the same trick.
+                try:
+                    page.goto('https://www.mercari.com/robots.txt',
+                              wait_until='domcontentloaded', timeout=30000)
+                except Exception as e:
+                    _emit(f"[mercari] bootstrap navigation failed: {e}")
+
+            for term in terms:
+                url = _mercari_api_url(api_ctx, term, max_rows)
+                if not url:
+                    return results, 'unexpected variables shape'
+                for attempt in (1, 2):
+                    try:
+                        res = page.evaluate(_MERCARI_REPLAY_JS, [url, api_ctx['headers']])
+                    except Exception as e:
+                        return results, f'replay failed: {type(e).__name__}: {e}'
+                    if res.get('status') == 200:
+                        try:
+                            payload = json.loads(res.get('text') or '{}')
+                        except Exception:
+                            break
+                        if not payload.get('errors'):
+                            results[term] = _mercari_items_from_api(payload)
+                            break
+                    # A dead token (401/403) or a rotated persisted-query hash
+                    # both land here. Re-capture once — that is the whole
+                    # self-healing story, and it costs one page render.
+                    if attempt == 1:
+                        _emit(f"[mercari] api replay returned {res.get('status')} — "
+                              "re-capturing the search context")
+                        fresh = _mercari_api_capture(page, term)
+                        if not fresh:
+                            return results, 'api replay failed and re-capture failed'
+                        api_ctx = fresh
+                        with _MERCARI_API_LOCK:
+                            _MERCARI_API_CTX = fresh
+                        url = _mercari_api_url(api_ctx, term, max_rows) or url
+                        continue
+                    return results, f"api replay HTTP {res.get('status')}"
+            return results, None
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def _mercari_fetch_with_patchright(url):
     """
     Fetch Mercari via patchright (an undetected Playwright fork).
@@ -2592,6 +2855,19 @@ def _mercari_fetch_with_patchright(url):
     args = ['--window-size=1920,1080']
     if _env_flag('MERCARI_HEADLESS', True):
         args.insert(0, '--headless=new')
+    # Container flags. Render has no root (so Chrome's sandbox cannot initialise)
+    # and a 64MB /dev/shm (so Chrome's default shared-memory use fails). Without
+    # these the browser LAUNCHES but its renderers never start, and page.goto
+    # then hangs until the timeout — which reads exactly like Cloudflare blocking
+    # us, and sent debugging toward proxies and stealth instead of flags.
+    # render-build.sh verifies the unpacked Chrome with --no-sandbox for this
+    # same reason; the runtime simply was not passing it.
+    #
+    # Safe for the four-part config: neither flag is observable from page JS, so
+    # neither changes what Cloudflare fingerprints. Defaults on everywhere except
+    # Windows, where the sandbox works and the local setup is known good.
+    if _env_flag('MERCARI_CONTAINER_FLAGS', not sys.platform.startswith('win')):
+        args += ['--no-sandbox', '--disable-dev-shm-usage']
     clean_ua = _patchright_clean_ua()
     args.append(f'--user-agent={clean_ua}')
 
@@ -2616,9 +2892,26 @@ def _mercari_fetch_with_patchright(url):
         _attach_byte_counter(page, 'mercari')
         try:
             try:
-                page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                nav_timeout_ms = int(os.getenv('MERCARI_NAV_TIMEOUT_MS', '45000'))
+            except ValueError:
+                nav_timeout_ms = 45000
+
+            navigated = True
+            try:
+                page.goto(url, wait_until='domcontentloaded', timeout=nav_timeout_ms)
             except Exception as e:
+                navigated = False
                 _emit(f"[mercari nav warning] {e}")
+
+            if not navigated:
+                # Waiting on Cloudflare cannot help when navigation never
+                # completed — there is no page to clear. This path used to cost
+                # nav_timeout + cf_wait + settle = ~94s PER TERM to return
+                # nothing, making a broken Mercari more expensive than every
+                # working platform combined and delaying Facebook behind it.
+                _emit("[mercari] navigation never completed — skipping the "
+                      "Cloudflare wait and settle")
+                return ''
 
             # Cloudflare's interstitial clears itself for an undetected browser;
             # poll the title until it stops saying "Just a moment...".
@@ -2827,6 +3120,25 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
     except ValueError:
         mercari_max_rows = 30
 
+    # One browser session for every term, hitting the search API directly
+    # instead of rendering a 4.2MB page per term. See _mercari_fetch_via_api.
+    api_items_by_term = {}
+    if _env_flag('MERCARI_USE_API', False):
+        api_items_by_term, api_err = _mercari_fetch_via_api(
+            list(search_terms.keys()), mercari_max_rows)
+        if api_err:
+            _emit(f"[mercari] search API unavailable ({api_err}) — "
+                  "falling back to page rendering")
+            if debug and log_callback:
+                log_callback(user_id,
+                             f"Mercari: search API unavailable ({api_err[:80]}) — "
+                             "using the slower page path.", 'info')
+        elif debug and log_callback:
+            total = sum(len(v) for v in api_items_by_term.values())
+            log_callback(user_id,
+                         f"Mercari: {total} rows across {len(api_items_by_term)} "
+                         "terms via search API", 'info')
+
     for term in search_terms.keys():
         if not is_user_active(user_id):
             if debug and log_callback:
@@ -2838,9 +3150,12 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
             f"https://www.mercari.com/search/?keyword={q}&sortBy=2",
         ]
         try:
-            raw_items, fetch_mode = _mercari_collect_from_search_urls(
-                urls, headers, log_callback=log_callback, user_id=user_id, term=term, debug=debug,
-            )
+            if term in api_items_by_term:
+                raw_items, fetch_mode = api_items_by_term[term], 'search API'
+            else:
+                raw_items, fetch_mode = _mercari_collect_from_search_urls(
+                    urls, headers, log_callback=log_callback, user_id=user_id, term=term, debug=debug,
+                )
             if debug and log_callback:
                 log_callback(
                     user_id,
