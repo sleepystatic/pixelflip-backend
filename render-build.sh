@@ -66,16 +66,29 @@ else
        && dpkg-deb -x /tmp/chrome.deb "$CHROME_DIR" \
        && [ -x "$CHROME_BIN" ]; then
         echo "   ✅ Chrome unpacked to $CHROME_BIN"
-        # Confirm it can actually start — extraction succeeds even when shared
-        # libraries are missing, and a Chrome that cannot run looks exactly like
-        # Mercari blocking us.
-        if "$CHROME_BIN" --headless=new --no-sandbox --dump-dom about:blank >/dev/null 2>&1; then
-            echo "   ✅ Chrome runs. SET THIS IN RENDER:"
+        # Confirm it can actually BROWSE, not merely start.
+        #
+        # This used to check `--dump-dom about:blank`, which needs no network and
+        # no TLS — so it passed on a Chrome that could not load a single HTTPS
+        # page. dpkg-deb -x unpacks without installing dependencies, and the ones
+        # that go missing (libnss3 and friends) are exactly the certificate and
+        # crypto libraries. The result was a Chrome that launched, hung on every
+        # navigation, and looked identical to Cloudflare blocking us.
+        if "$CHROME_BIN" --headless=new --no-sandbox --disable-dev-shm-usage \
+             --virtual-time-budget=15000 --dump-dom https://example.com 2>/dev/null \
+             | grep -qi 'example domain'; then
+            echo "   ✅ Chrome can load HTTPS. SET THIS IN RENDER:"
             echo "        MERCARI_CHROME_PATH=$CHROME_BIN"
         else
-            echo "   ⚠️  Chrome unpacked but will not start (missing system libs)."
-            echo "   ⚠️  Mercari needs the Docker deploy — see Dockerfile."
-            "$CHROME_BIN" --version 2>&1 | head -3 || true
+            echo "   ⚠️  Chrome unpacked but cannot load an HTTPS page."
+            "$CHROME_BIN" --version 2>&1 | head -2 || true
+            echo "   ⚠️  Missing shared libraries (dpkg-deb -x does not install them):"
+            ldd "$CHROME_BIN" 2>/dev/null | grep -i 'not found' | head -12 \
+                || echo "        (ldd unavailable)"
+            echo "   ℹ️  Do NOT set MERCARI_CHROME_PATH — leave it unset."
+            echo "   ℹ️  Mercari's search API works on patchright's OWN Chromium"
+            echo "   ℹ️  (measured: same results as real Chrome), so set:"
+            echo "        MERCARI_BUNDLED_CHROMIUM=1"
         fi
     else
         echo "   ⚠️  Rootless Chrome unpack failed. Mercari will return 0 results"

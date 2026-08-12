@@ -1,5 +1,6 @@
 import time
 import tempfile
+import shutil
 import uuid
 import traceback
 import os
@@ -2487,6 +2488,7 @@ def _offerup_fetch_with_playwright(url, stealth=False, force_no_proxy=False):
 
 
 _PATCHRIGHT_UA_CACHE = None
+_PATCHRIGHT_UA_LOCK = threading.Lock()
 
 
 def _patchright_clean_ua():
@@ -2506,28 +2508,46 @@ def _patchright_clean_ua():
     if override:
         _PATCHRIGHT_UA_CACHE = override
         return _PATCHRIGHT_UA_CACHE
-    try:
-        from patchright.sync_api import sync_playwright
-        prof = os.path.join(tempfile.gettempdir(), 'pixelflip_ua_probe')
-        with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(
-                prof, headless=True,
-                no_viewport=True,
-                **_mercari_chrome_kwargs(),
+
+    # Serialised, and on a private directory. Measured with 10 concurrent
+    # scrapes: every worker saw an empty cache, all ten launched Chrome on the
+    # SAME probe profile, Chrome's SingletonLock rejected most of them, and they
+    # all fell back to the static UA below — which pins Chrome/150 while the real
+    # browser is 151. A UA/client-hint version mismatch is exactly the signal
+    # this function exists to avoid, so under load the evasion silently undid
+    # itself. Double-checked so the winner's result is reused, not re-probed.
+    with _PATCHRIGHT_UA_LOCK:
+        if _PATCHRIGHT_UA_CACHE is not None:
+            return _PATCHRIGHT_UA_CACHE
+        prof = None
+        try:
+            from patchright.sync_api import sync_playwright
+            prof = tempfile.mkdtemp(prefix='pixelflip_ua_probe_')
+            with sync_playwright() as p:
+                ctx = p.chromium.launch_persistent_context(
+                    prof, headless=True,
+                    no_viewport=True,
+                    **_mercari_chrome_kwargs(),
+                )
+                ua = ctx.new_page().evaluate('navigator.userAgent')
+                ctx.close()
+            _PATCHRIGHT_UA_CACHE = (ua or '').replace('HeadlessChrome', 'Chrome')
+        except Exception as e:
+            print(f"[mercari] UA probe failed ({e}); falling back to static UA", flush=True)
+            _PATCHRIGHT_UA_CACHE = (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
             )
-            ua = ctx.new_page().evaluate('navigator.userAgent')
-            ctx.close()
-        _PATCHRIGHT_UA_CACHE = (ua or '').replace('HeadlessChrome', 'Chrome')
-    except Exception as e:
-        print(f"[mercari] UA probe failed ({e}); falling back to static UA", flush=True)
-        _PATCHRIGHT_UA_CACHE = (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
-        )
+        finally:
+            if prof:
+                try:
+                    shutil.rmtree(prof, ignore_errors=True)
+                except Exception:
+                    pass
     return _PATCHRIGHT_UA_CACHE
 
 
-def _mercari_chrome_kwargs():
+def _mercari_chrome_kwargs(bundled=False):
     """
     How to reach real Chrome: by channel, or by explicit path.
 
@@ -2537,7 +2557,22 @@ def _mercari_chrome_kwargs():
     be unpacked from its .deb with `dpkg-deb -x` (no root) during the build.
 
     The two are mutually exclusive in Playwright: passing both raises.
+
+    `bundled=True` returns neither, so patchright uses its OWN Chromium. That is
+    viable for the search-API path — measured 2026-08-12, all three combinations
+    against the same term:
+
+        patchright + real Chrome        28 items
+        patchright + bundled Chromium   28 items
+        playwright + bundled Chromium   HTTP 403
+
+    So patchright is the load-bearing part, not the Chrome binary. This matters
+    because the rootless `dpkg-deb -x` unpack cannot install Chrome's shared
+    library dependencies, and a Chrome that starts (about:blank works) but
+    cannot do TLS looks exactly like Cloudflare blocking us.
     """
+    if bundled or _env_flag('MERCARI_BUNDLED_CHROMIUM', False):
+        return {}
     explicit = (os.getenv('MERCARI_CHROME_PATH') or '').strip()
     if explicit:
         if not os.path.isfile(explicit):
@@ -2580,6 +2615,102 @@ def _mercari_chrome_kwargs():
 
 _MERCARI_API_CTX = None            # {'headers': {...}, 'variables': {...}, 'ext': str}
 _MERCARI_API_LOCK = threading.Lock()
+# Set when a capture fails, so a broken environment costs one attempt per
+# cooldown rather than one per scrape. Without this, an environment where
+# mercari.com is unreachable (observed on Render 2026-08-12) burns the full
+# navigation timeout every single cycle BEFORE falling back — which is how a
+# broken platform ends up delaying every working one behind it.
+_MERCARI_API_COOLDOWN_UNTIL = 0.0
+
+# ---------------------------------------------------------------------------
+# Cross-user batching
+#
+# Mercari's search API is user-independent: no per-user session, no location, no
+# auth — only the query string changes. So thirty users tracking "gameboy
+# advance sp" is thirty identical requests, and one answer serves all of them.
+#
+# This matters most for MEMORY, which is what actually caps concurrency.
+# Measured 2026-08-12 with 10 concurrent users: 6,439MB peak, ~644MB each,
+# because every user opened its own real-Chrome persistent context. Batching
+# collapses that to ONE browser per cycle regardless of user count, so Mercari
+# stops being the reason SCRAPE_MAX_WORKERS has to stay small.
+#
+# Only the FETCH is shared. Price bounds, exclusions, distance, delivery prefs,
+# known_links and Vision all still run per user on the fan-out, so no user sees
+# another user's filtering.
+# ---------------------------------------------------------------------------
+_MERCARI_CYCLE = {'stamp': 0.0, 'items': {}}
+_MERCARI_CYCLE_LOCK = threading.Lock()
+
+
+def _mercari_cycle_ttl():
+    """
+    How long a shared fetch stays usable.
+
+    Bounded below the 5-minute priority floor so a term is never served from a
+    cache older than its own scan interval — otherwise a Pro user's 5-minute
+    term could be answered with 12-minute-old listings and the speed promise
+    quietly stops being true.
+    """
+    try:
+        return max(0, int(os.getenv('MERCARI_SHARED_TTL_SEC', '240')))
+    except ValueError:
+        return 240
+
+
+def mercari_prefetch_cycle(terms, max_rows=None):
+    """
+    Fetch every unique term once for this cycle. Returns (n_terms, error).
+
+    Called from the scheduler before users fan out to the thread pool, so the
+    one browser this opens is the only one Mercari needs for the whole cycle.
+    """
+    global _MERCARI_CYCLE
+    terms = sorted({(t or '').strip() for t in (terms or []) if (t or '').strip()})
+    if not terms:
+        return 0, None
+    if not (_env_flag('MERCARI_USE_API', True) and _env_flag('MERCARI_SHARED_FETCH', True)):
+        return 0, None
+    if max_rows is None:
+        try:
+            max_rows = int(os.getenv('MERCARI_MAX_ROWS_PER_TERM', '30'))
+        except ValueError:
+            max_rows = 30
+
+    items, err = _mercari_fetch_via_api(terms, max_rows)
+    if items:
+        with _MERCARI_CYCLE_LOCK:
+            _MERCARI_CYCLE = {'stamp': time.time(), 'items': items}
+    return len(items or {}), err
+
+
+def _mercari_cycle_items(term):
+    """This cycle's listings for `term`, or None if not fetched / too old."""
+    with _MERCARI_CYCLE_LOCK:
+        stamp = _MERCARI_CYCLE.get('stamp') or 0.0
+        if not stamp or (time.time() - stamp) > _mercari_cycle_ttl():
+            return None
+        return _MERCARI_CYCLE.get('items', {}).get(term)
+
+
+def _mercari_profile_dir():
+    """
+    Chrome profile directory for THIS worker.
+
+    Chrome takes a SingletonLock on its profile directory, so concurrent scrapes
+    sharing one path collide: the second launch fails or corrupts the profile,
+    and what gets lost is the cf_clearance cookie the profile exists to retain —
+    so the symptom is Cloudflare challenges returning, not an obvious crash.
+
+    Keyed on the thread name because ThreadPoolExecutor reuses a bounded set of
+    threads (scrape_0 .. scrape_N-1, see main()), so this yields exactly one
+    profile per worker SLOT rather than one per scrape — profiles stay warm and
+    their count is capped by SCRAPE_MAX_WORKERS instead of growing forever.
+    """
+    base = (os.getenv('PATCHRIGHT_PROFILE_DIR') or '').strip() or \
+        os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_profile')
+    worker = re.sub(r'[^A-Za-z0-9_.-]', '_', threading.current_thread().name)
+    return f'{base}_{worker}'
 
 _MERCARI_REPLAY_JS = """
 async ([url, headers]) => {
@@ -2701,27 +2832,63 @@ def _mercari_items_from_api(payload):
 
 def _mercari_fetch_via_api(terms, max_rows):
     """
-    Search Mercari for several terms over one browser session.
+    Search Mercari for several terms, retrying on bundled Chromium if needed.
+
+    The retry exists for Render: the rootless Chrome unpack cannot install shared
+    library dependencies, so real Chrome launches and then hangs on any HTTPS
+    navigation. Since patchright's own Chromium is measurably sufficient for this
+    path (see _mercari_chrome_kwargs), falling back to it turns a hard failure
+    into a slower success rather than requiring an env var nobody knew to set.
+    """
+    global _MERCARI_API_COOLDOWN_UNTIL
+
+    items, err = _mercari_api_session(terms, max_rows, bundled=False)
+    if not err:
+        return items, None
+
+    already_bundled = _env_flag('MERCARI_BUNDLED_CHROMIUM', False)
+    if _env_flag('MERCARI_CHROMIUM_FALLBACK', True) and not already_bundled:
+        _emit(f"[mercari] real Chrome path failed ({err}) — retrying on bundled Chromium")
+        items2, err2 = _mercari_api_session(terms, max_rows, bundled=True)
+        if not err2:
+            _emit("[mercari] bundled Chromium worked. Set MERCARI_BUNDLED_CHROMIUM=1 "
+                  "to skip the failing attempt entirely.", 'info')
+            return items2, None
+        items, err = items2, f'{err} (bundled retry: {err2})'
+
+    # Both engines failed. Back off so a broken environment costs one attempt
+    # per cooldown instead of one per scrape, blocking every other platform.
+    try:
+        cool = int(os.getenv('MERCARI_API_COOLDOWN_SEC', '900'))
+    except ValueError:
+        cool = 900
+    _MERCARI_API_COOLDOWN_UNTIL = time.time() + max(0, cool)
+    return items, f'{err} — not retrying for {cool}s'
+
+
+def _mercari_api_session(terms, max_rows, bundled=False):
+    """
+    Search Mercari for several terms over ONE browser session.
 
     Returns {term: [items]} for whatever succeeded, plus an error string or None.
     Terms are batched deliberately: the browser launch and the bootstrap are the
-    only meaningful costs left, so paying them once for ten terms is the point.
+    only meaningful costs left, so paying them once for many terms is the point.
     """
-    global _MERCARI_API_CTX
+    global _MERCARI_API_CTX, _MERCARI_API_COOLDOWN_UNTIL
     try:
         from patchright.sync_api import sync_playwright
     except ImportError as e:
         return {}, f'patchright missing ({e})'
 
+    if _MERCARI_API_CTX is None and time.time() < _MERCARI_API_COOLDOWN_UNTIL:
+        wait = int(_MERCARI_API_COOLDOWN_UNTIL - time.time())
+        return {}, f'search API in cooldown for another {wait}s after a failed capture'
+
     results = {}
-    # NOTE (pre-existing, matters at scale): Chrome takes a SingletonLock on a
-    # profile directory, so two concurrent scrapes sharing this path will
-    # conflict. Harmless at SCRAPE_MAX_WORKERS=1, but raising the worker count
-    # needs a per-worker profile dir — otherwise Mercari fails for every user
-    # after the first, and the Cloudflare clearance the profile exists to retain
-    # is what gets lost.
-    profile_dir = (os.getenv('PATCHRIGHT_PROFILE_DIR') or '').strip() or \
-        os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_profile')
+    # Separate profiles per engine: a profile carries the cf_clearance bound to
+    # the browser that earned it, so reusing one across engines invites a
+    # challenge instead of avoiding one.
+    profile_dir = _mercari_profile_dir() + ('_chromium' if bundled else '')
 
     clean_ua = _patchright_clean_ua()
     args = ['--window-size=1920,1080']
@@ -2732,7 +2899,7 @@ def _mercari_fetch_via_api(terms, max_rows):
     args.append(f'--user-agent={clean_ua}')
 
     launch_kwargs = dict(headless=False, no_viewport=True, args=args,
-                         user_agent=clean_ua, **_mercari_chrome_kwargs())
+                         user_agent=clean_ua, **_mercari_chrome_kwargs(bundled=bundled))
     proxy_url = _get_proxy('mercari')
     if proxy_url:
         launch_kwargs['proxy'] = _pw_proxy_dict(proxy_url)
@@ -2752,18 +2919,32 @@ def _mercari_fetch_via_api(terms, max_rows):
             page = ctx.new_page()
             _attach_byte_counter(page, 'mercari')
 
-            with _MERCARI_API_LOCK:
-                api_ctx = _MERCARI_API_CTX
-
+            # Capture under the lock, double-checked. Measured with 10 concurrent
+            # scrapes: all ten found the cache empty and each paid its own ~3.4MB
+            # capture render — a thundering herd that also drove peak memory to
+            # 5.4GB because ten heavyweight renders overlapped. Serialising it
+            # means one render per process instead of one per worker, and the
+            # nine that wait are cheaper than the nine that rendered.
+            api_ctx = _MERCARI_API_CTX
+            captured_here = False
             if api_ctx is None:
-                api_ctx = _mercari_api_capture(page)
-                if not api_ctx:
-                    return {}, 'could not capture searchFacetQuery context'
                 with _MERCARI_API_LOCK:
-                    _MERCARI_API_CTX = api_ctx
-            else:
-                # Cheapest page that still puts us on the origin with the
-                # profile's cookies — see the OfferUp warm-up for the same trick.
+                    api_ctx = _MERCARI_API_CTX
+                    if api_ctx is None:
+                        api_ctx = _mercari_api_capture(page)
+                        if not api_ctx:
+                            # Cooldown is the CALLER's decision — setting it here
+                            # would make a real-Chrome failure block the bundled
+                            # Chromium retry that is meant to rescue it.
+                            return {}, 'could not capture searchFacetQuery context'
+                        _MERCARI_API_CTX = api_ctx
+                        captured_here = True
+
+            if not captured_here:
+                # Capturing already left this page on a Mercari search URL. If we
+                # reused a cached context, the page is still blank, so put it on
+                # the origin cheaply — fetch() needs the page's cookies and
+                # origin, not its content. Same trick as the OfferUp warm-up.
                 try:
                     page.goto('https://www.mercari.com/robots.txt',
                               wait_until='domcontentloaded', timeout=30000)
@@ -2846,9 +3027,8 @@ def _mercari_fetch_with_patchright(url):
     except ValueError:
         cf_wait_s = 45
 
-    profile_dir = (os.getenv('PATCHRIGHT_PROFILE_DIR') or '').strip()
-    if not profile_dir:
-        profile_dir = os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_profile')
+    # Per-worker, for the same SingletonLock reason as the API path.
+    profile_dir = _mercari_profile_dir()
 
     # Headless is requested via the Chrome flag rather than Playwright's
     # headless=True, so patchright doesn't layer old-headless flags on top.
@@ -3122,10 +3302,35 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
 
     # One browser session for every term, hitting the search API directly
     # instead of rendering a 4.2MB page per term. See _mercari_fetch_via_api.
+    # Defaults ON. Any failure falls through to the page path below, so the
+    # downside is bounded — and the page path is what returns 0 on Render today,
+    # so this cannot regress production. Set MERCARI_USE_API=0 to force the old
+    # path. (The cost of a FAILED api attempt is a capture render plus the
+    # fallback, i.e. roughly double; the cost of a successful one is 4KB against
+    # 963KB, which is the trade being made.)
     api_items_by_term = {}
-    if _env_flag('MERCARI_USE_API', False):
-        api_items_by_term, api_err = _mercari_fetch_via_api(
-            list(search_terms.keys()), mercari_max_rows)
+    if _env_flag('MERCARI_USE_API', True):
+        # Terms the scheduler already fetched this cycle for somebody — usually
+        # everything, since it prefetches the union of all due users' terms.
+        # A hit costs no browser at all.
+        pending = []
+        shared_hits = 0
+        for t in search_terms.keys():
+            cached = _mercari_cycle_items(t)
+            if cached is not None:
+                api_items_by_term[t] = cached
+                shared_hits += 1
+            else:
+                pending.append(t)
+        if shared_hits and debug and log_callback:
+            log_callback(user_id,
+                         f"Mercari: {shared_hits}/{len(search_terms)} terms served "
+                         "from this cycle's shared fetch", 'info')
+
+        api_err = None
+        if pending:
+            fetched, api_err = _mercari_fetch_via_api(pending, mercari_max_rows)
+            api_items_by_term.update(fetched or {})
         if api_err:
             _emit(f"[mercari] search API unavailable ({api_err}) — "
                   "falling back to page rendering")
@@ -3421,27 +3626,51 @@ def _haversine_miles(lat1, lon1, lat2, lon2):
 _CITY_CACHE = {}
 _CITY_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'city_coords_cache.json')
 _CITY_CACHE_LOADED = False
+# Guards both the dict and the file. Every concurrent scrape geocodes cities, so
+# above one worker this is genuinely contended.
+_CITY_CACHE_LOCK = threading.RLock()
 
 
 def _load_city_cache():
     global _CITY_CACHE, _CITY_CACHE_LOADED
-    if _CITY_CACHE_LOADED:
-        return
-    _CITY_CACHE_LOADED = True
-    try:
-        if os.path.isfile(_CITY_CACHE_PATH):
-            with open(_CITY_CACHE_PATH, 'r', encoding='utf-8') as f:
-                _CITY_CACHE = {k: tuple(v) if v else None for k, v in json.load(f).items()}
-    except Exception:
-        _CITY_CACHE = {}
+    with _CITY_CACHE_LOCK:
+        if _CITY_CACHE_LOADED:
+            return
+        _CITY_CACHE_LOADED = True
+        try:
+            if os.path.isfile(_CITY_CACHE_PATH):
+                with open(_CITY_CACHE_PATH, 'r', encoding='utf-8') as f:
+                    _CITY_CACHE = {k: tuple(v) if v else None for k, v in json.load(f).items()}
+        except Exception:
+            _CITY_CACHE = {}
 
 
 def _save_city_cache():
-    try:
-        with open(_CITY_CACHE_PATH, 'w', encoding='utf-8') as f:
-            json.dump({k: list(v) if v else None for k, v in _CITY_CACHE.items()}, f, indent=0)
-    except Exception:
-        pass
+    """
+    Persist the geocode cache. Safe to call from several scrapes at once.
+
+    Two separate hazards above one worker, both fixed here:
+      * open(path,'w') truncates before writing, so a second writer starting
+        mid-write leaves a half-file that _load_city_cache then discards — the
+        cache silently empties and every city gets re-geocoded at 1.05s each.
+      * json.dump iterates the dict; another thread inserting during that
+        iteration raises "dictionary changed size during iteration".
+    Snapshot under the lock, then write to a temp file and rename, so a reader
+    only ever sees a complete file.
+    """
+    with _CITY_CACHE_LOCK:
+        snapshot = {k: list(v) if v else None for k, v in _CITY_CACHE.items()}
+        tmp = f'{_CITY_CACHE_PATH}.{os.getpid()}.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f, indent=0)
+            os.replace(tmp, _CITY_CACHE_PATH)      # atomic on POSIX and Windows
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
 
 def city_to_latlon(city_state):
@@ -5147,6 +5376,35 @@ def main(log_callback=None, health_callback=None):
                     return 0
 
             if due:
+                # Mercari once for everybody, BEFORE the pool fans out. The
+                # search API is user-independent, so N users sharing a term is N
+                # identical requests — and each one would otherwise open its own
+                # real-Chrome context at ~644MB. One browser per cycle here is
+                # what stops Mercari dictating SCRAPE_MAX_WORKERS.
+                try:
+                    shared_terms = set()
+                    for cfg in due:
+                        plats = _coerce_platforms_dict(cfg.get('platforms'))
+                        if not plats.get('mercari'):
+                            continue
+                        if (cfg.get('plan_tier') or '').strip().lower() == 'inactive':
+                            continue
+                        user_terms = all_terms_by_user.get(cfg['user_id']) or {}
+                        due_now, _ = due_terms_for_user(user_terms, cfg, now=current_time)
+                        shared_terms.update(due_now.keys() if due_now else user_terms.keys())
+                    if shared_terms:
+                        n, mc_err = mercari_prefetch_cycle(shared_terms)
+                        if mc_err:
+                            print(f"  ⚠ Mercari shared fetch failed ({mc_err}) — "
+                                  "users will fetch individually", flush=True)
+                        else:
+                            print(f"  🛒 Mercari: {n} unique term(s) fetched once for "
+                                  f"{len(due)} user(s)", flush=True)
+                except Exception as e:
+                    # Never let the optimisation break the cycle; a failure here
+                    # just means each user fetches for itself, as before.
+                    print(f"  ⚠ Mercari prefetch skipped: {type(e).__name__}: {e}", flush=True)
+
                 # Bounded by MEMORY, not by CPU. Measured peak per concurrent
                 # scrape, 2026-08-11 (peak working set of the whole
                 # chrome-headless-shell process group):

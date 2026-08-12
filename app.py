@@ -892,6 +892,45 @@ def get_status(user_id):
         # Calculate when the next check SHOULD be (countdown starts after last scrape *finished*)
         next_check_timestamp = last_scraped + interval_secs
 
+        # With priority terms the user-level interval is no longer the whole
+        # story: a Pro user's 3 fast terms come round every 5 minutes while the
+        # rest wait 15, so a single user-level countdown would tick to zero and
+        # then sit there while nothing happened. The scan the user is waiting for
+        # is the SOONEST term, so the countdown targets that — and
+        # `next_check_terms` says how many terms that scan will actually cover,
+        # which is what makes one timer honest instead of ambiguous.
+        next_check_terms = None
+        next_check_scope = None
+        try:
+            tier_for_terms = _effective_plan_tier(us)
+            if _max_priority_terms_for_tier(tier_for_terms) > 0:
+                cursor.execute(
+                    "SELECT search_term, is_priority, "
+                    "EXTRACT(EPOCH FROM last_scraped_at) AS last_ts "
+                    "FROM user_search_terms WHERE user_id = %s;", (user_id,))
+                soonest = None
+                due_at = {}
+                for row in cursor.fetchall():
+                    floor_min = (_interval_floor_for_tier(tier_for_terms)
+                                 if row['is_priority']
+                                 else _standard_floor_for_tier(tier_for_terms))
+                    every = max(int(interval_min), floor_min) * 60
+                    ready = (float(row['last_ts']) if row['last_ts'] is not None else 0.0) + every
+                    due_at[row['search_term']] = ready
+                    if soonest is None or ready < soonest:
+                        soonest = ready
+                if soonest is not None:
+                    next_check_timestamp = soonest
+                    # Terms that will be due within a few seconds of the soonest
+                    # one ride along in the same scan.
+                    next_check_terms = sum(1 for r in due_at.values() if r <= soonest + 5)
+                    next_check_scope = ('all terms'
+                                        if next_check_terms >= len(due_at)
+                                        else f'{next_check_terms} priority')
+        except Exception as e:
+            # A countdown is not worth failing /api/status over.
+            print(f"[status] per-term countdown failed for {user_id[:8]}: {e}", flush=True)
+
         current_now = time.time()
         scraping_in_progress = is_user_scraping(user_id)
 
@@ -935,6 +974,11 @@ def get_status(user_id):
             "items_scanned_today": 0,
             "matches_found_today": 0,
             "next_check_timestamp": next_check_timestamp_out,
+            # What the next scan will cover, so one timer can say "3 priority"
+            # vs "all terms" instead of leaving the user guessing. None for tiers
+            # without priority terms, where every scan covers everything.
+            "next_check_terms": next_check_terms,
+            "next_check_scope": next_check_scope,
             "scraping_in_progress": scraping_in_progress,
             "recent_activity": activity,
             # True when `activity` is a delta the client should APPEND. False
