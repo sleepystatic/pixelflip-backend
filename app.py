@@ -1665,8 +1665,26 @@ def start_scraper(user_id):
     if not conn: return jsonify({"error": "DB error"}), 500
     try:
         cursor = conn.cursor()
-        # WE NOW FLIP THE CORRECT SWITCH
-        cursor.execute("UPDATE user_settings SET is_active = TRUE WHERE user_id = %s;", (user_id,))
+        # Conditional, so rowcount tells us whether this was a real OFF->ON
+        # arming or a START pressed on a scanner that was already running.
+        cursor.execute("UPDATE user_settings SET is_active = TRUE "
+                       "WHERE user_id = %s AND is_active IS DISTINCT FROM TRUE;",
+                       (user_id,))
+        armed_now = cursor.rowcount > 0
+
+        # Arming has to make the terms DUE, or the message below is simply false.
+        # The scheduler works off each term's own last_scraped_at, so a user
+        # whose terms were stamped a few minutes ago sat through the remainder of
+        # their interval — up to a full hour on a 60-minute term — while the
+        # console said "begins shortly" and nothing happened. Clearing the stamps
+        # makes the next cycle pick every term up.
+        #
+        # Only on a genuine transition: without that guard, holding down START
+        # would re-arm every term on every press, which is a free way to hammer
+        # the marketplaces and get us blocked.
+        if armed_now:
+            cursor.execute("UPDATE user_search_terms SET last_scraped_at = NULL "
+                           "WHERE user_id = %s;", (user_id,))
         conn.commit()
 
         # Immediate console feedback. Starting is only a flag flip — the scraper
@@ -1677,7 +1695,11 @@ def start_scraper(user_id):
         # than up to the TTL later.
         try:
             import scrape_logs
-            scrape_logs.add_log(user_id, "Scanner armed — your first scan begins shortly.", "info")
+            scrape_logs.add_log(
+                user_id,
+                "Scanner armed — your first scan begins shortly." if armed_now
+                else "Scanner is already running.",
+                "info")
         except Exception:
             pass
         try:

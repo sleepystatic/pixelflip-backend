@@ -227,7 +227,7 @@ def get_db_connection():
         raise last_err if last_err else Exception('Database connection failed')
     try:
         from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
-                               ensure_priority_term_columns)
+                               ensure_priority_term_columns, ensure_term_interval_column)
         ensure_buyer_delivery_columns(conn)
         # save_listing lives in this module and targets ON CONFLICT (user_id, link),
         # so the matching index has to be guaranteed on the scraper's own
@@ -236,6 +236,12 @@ def get_db_connection():
         # The scheduler reads is_priority / last_scraped_at on every cycle, and
         # the worker may reach the database before app.py ever does.
         ensure_priority_term_columns(conn)
+        # Same reason, for interval_minutes (migration 012). The master cycle
+        # selects it on the FIRST cycle, seconds after start-up — long before
+        # any HTTP request has caused app.py to run its own ensure chain. Miss
+        # this and every cycle dies on UndefinedColumn, which surfaces as a
+        # scanner that says "armed" and then never scrapes anything.
+        ensure_term_interval_column(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -5662,29 +5668,38 @@ def main(log_callback=None, health_callback=None):
                 interval_min = _effective_check_interval_minutes_for_user(user_cfg)
                 interval_seconds = int(interval_min) * 60
 
-                # With priority terms the user-level interval is only a first
-                # gate: a Pro user is due as soon as ANY term is, which for their
-                # 3 priority terms is every 5 minutes even though the other 7 sit
-                # on 15. Checking per term here avoids waking a user whose fast
-                # terms are all still cooling down, which would otherwise cost a
-                # full browser launch to discover there was nothing to do.
+                # Cadence is per TERM on every tier now, so this is the whole
+                # gate — a user is due as soon as ANY of their terms is. It used
+                # to run only for tiers with priority terms and fall back to the
+                # user-level interval otherwise, which after migration 012 meant
+                # Basic users were scheduled by check_interval_minutes, the
+                # column the per-term rates replaced.
+                #
+                # due_terms_for_user also hands back the soonest term's ready
+                # time, which is what the idle message has to quote. Quoting the
+                # user-level interval showed a Pro user "next scan in 25m" while
+                # their terms were genuinely due in 10 — a countdown that
+                # disagrees with reality reads as a broken scanner.
                 terms_for_user = all_terms_by_user.get(uid)
-                if max_priority_for_tier(tier) > 0 and terms_for_user:
-                    due_now, _ = due_terms_for_user(terms_for_user, user_cfg,
-                                                    now=current_time)
+                next_due_ts = None
+                if terms_for_user:
+                    due_now, next_due_ts = due_terms_for_user(
+                        terms_for_user, user_cfg, now=current_time)
                     term_due = bool(due_now)
                 else:
-                    term_due = current_time - last_scraped >= interval_seconds
+                    # No terms is nothing to schedule. Waking the user anyway
+                    # bought a full browser launch to discover there was no work.
+                    term_due = False
 
                 if term_due:
                     due.append(user_cfg)
                 else:
-                    # Waiting for this user's interval. Say so rather than going
+                    # Waiting on a term's interval. Say so rather than going
                     # silent — an unexplained quiet dashboard is indistinguishable
                     # from a broken scraper.
-                    if log_callback:
-                        wait_s = int(interval_seconds - (current_time - last_scraped))
-                        if wait_s > 0 and cycle % 5 == 1:
+                    if log_callback and next_due_ts and cycle % 5 == 1:
+                        wait_s = int(next_due_ts - current_time)
+                        if wait_s > 0:
                             mins, secs = divmod(wait_s, 60)
                             log_callback(
                                 uid,
