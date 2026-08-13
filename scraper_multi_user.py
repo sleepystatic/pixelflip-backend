@@ -301,6 +301,7 @@ def get_user_search_terms(user_id):
     cursor = conn.cursor()
     try:
         cursor.execute('SELECT search_term, min_price, max_price, is_priority, '
+                       'interval_minutes, '
                        'EXTRACT(EPOCH FROM last_scraped_at) '
                        'FROM user_search_terms WHERE user_id = %s', (user_id,))
         terms = {
@@ -308,8 +309,12 @@ def get_user_search_terms(user_id):
                 'min': float(row[1]) if row[1] is not None else None,
                 'max': float(row[2]) if row[2] is not None else None,
                 'exclusions': [],
+                # is_priority is derived from the interval now and kept only so
+                # a rollback still finds the column populated.
                 'is_priority': bool(row[3]),
-                'last_scraped_ts': float(row[4]) if row[4] is not None else 0.0,
+                'interval_minutes': (int(row[4]) if row[4] is not None
+                                     else DEFAULT_TERM_INTERVAL_MINUTES),
+                'last_scraped_ts': float(row[5]) if row[5] is not None else 0.0,
             }
             for row in cursor.fetchall()
         }
@@ -2891,17 +2896,33 @@ def _mercari_api_capture(page, term='ds lite'):
             except Exception:
                 pass
 
+    # searchFacetQuery fires during HYDRATION, which is CPU-bound: Mercari ships
+    # ~1.9MB of app JS and `domcontentloaded` returns long before any of it has
+    # run. This budget was a hardcoded 10s — generous on a laptop, short on a
+    # 0.5-CPU container that needs 15-20s just to launch the browser (measured
+    # on Render 2026-08-13, where a trivial example.com load took 22-24s).
+    #
+    # Raising the ceiling is free on the happy path: the loop exits the moment
+    # the request arrives, so a fast environment never waits longer than it did.
+    # It only spends the extra time when capture is already failing.
+    try:
+        budget_ms = int(os.getenv('MERCARI_CAPTURE_WAIT_MS', '30000'))
+    except ValueError:
+        budget_ms = 30000
+
     page.on('request', on_request)
+    nav_ok = True
     try:
         page.goto(f'https://www.mercari.com/search/?keyword={quote(term, safe="")}',
                   wait_until='domcontentloaded',
                   timeout=int(os.getenv('MERCARI_NAV_TIMEOUT_MS', '45000')))
-        # The API call fires during hydration; give it a moment.
-        for _ in range(10):
+        deadline = time.time() + max(1.0, budget_ms / 1000.0)
+        while time.time() < deadline:
             if captured:
                 break
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
     except Exception as e:
+        nav_ok = False
         _emit(f"[mercari] api capture navigation failed: {e}")
     finally:
         try:
@@ -2912,6 +2933,25 @@ def _mercari_api_capture(page, term='ds lite'):
     if captured.get('headers') and captured.get('variables'):
         _emit("[mercari] captured searchFacetQuery context", 'info')
         return captured
+
+    # Exhausting the budget raises nothing, so this returned None in total
+    # silence: the caller reported 'could not capture searchFacetQuery context'
+    # with no way to tell slow hydration from a Cloudflare block, and the one
+    # message the docs tell you to grep for — 'api capture navigation failed' —
+    # is only ever printed when the NAVIGATION itself throws. Say which it was.
+    if nav_ok:
+        try:
+            title = (page.title() or '')[:80]
+        except Exception:
+            title = '<unavailable>'
+        low = title.lower()
+        blocked = 'moment' in low or 'attention' in low or 'checking' in low
+        _emit(f"[mercari] searchFacetQuery never fired within {budget_ms}ms — "
+              f"page title {title!r} "
+              + ('(Cloudflare challenge did not clear — this is a BLOCK)'
+                 if blocked else
+                 '(page loaded but hydration never reached the search call — '
+                 'try raising MERCARI_CAPTURE_WAIT_MS)'))
     return None
 
 
@@ -2978,11 +3018,17 @@ def _mercari_fetch_via_api(terms, max_rows):
     """
     Search Mercari for several terms, retrying on bundled Chromium if needed.
 
-    The retry exists for Render: the rootless Chrome unpack cannot install shared
-    library dependencies, so real Chrome launches and then hangs on any HTTPS
-    navigation. Since patchright's own Chromium is measurably sufficient for this
-    path (see _mercari_chrome_kwargs), falling back to it turns a hard failure
-    into a slower success rather than requiring an env var nobody knew to set.
+    The retry was written for a Render failure mode that has since been measured
+    and DISPROVEN: the theory was that the rootless Chrome unpack leaves shared
+    libraries missing, so real Chrome launches and then hangs on HTTPS. Running
+    diagnose_mercari.py on Render on 2026-08-13 showed `ldd` clean, and real
+    Chrome loading both example.com and mercari.com successfully. Do not
+    reintroduce that explanation.
+
+    The fallback is still worth keeping — patchright's own Chromium is
+    measurably sufficient for this path (see _mercari_chrome_kwargs), so trying
+    it costs one extra attempt and can only turn a failure into a success — but
+    it is no longer evidence of anything about shared libraries.
     """
     global _MERCARI_API_COOLDOWN_UNTIL
 
@@ -3642,8 +3688,23 @@ def _effective_check_interval_minutes_for_user(row_or_cfg):
 
 
 # Priority terms. Keep in sync with app.py and frontend/src/App.js.
+#
+# Cadence is per TERM now (user_search_terms.interval_minutes, migration 012),
+# not one interval per user. A term runs at whatever rate the user picked for
+# it, clamped up to the fastest rate their plan allows.
+# PLAN_MAX_PRIORITY_TERMS is how many terms may sit at that fastest tier.
 PLAN_MAX_PRIORITY_TERMS = {'pro': 3, 'basic': 0}
-PLAN_STANDARD_FLOOR_MINUTES = {'pro': 15}
+
+# Floor for a term that is NOT at the plan's fastest tier. 10 everywhere now: a
+# Pro user's ordinary terms run at the same 10 minutes a Basic user's do, and
+# the only thing priority buys is the right to put 5 on a few of them. This was
+# 15 for Pro, which meant the paid plan's default cadence was SLOWER than the
+# cheaper one's.
+PLAN_STANDARD_FLOOR_MINUTES = {'pro': 10}
+
+# What a term scans at when it carries no interval of its own: a row written
+# before migration 012, or one saved by a client that does not send the field.
+DEFAULT_TERM_INTERVAL_MINUTES = 10
 
 
 def max_priority_for_tier(tier):
@@ -3652,11 +3713,11 @@ def max_priority_for_tier(tier):
 
 def standard_floor_for_tier(tier):
     """
-    Floor for a term the user did NOT mark priority.
+    Floor for a term that is not at the plan's fastest tier.
 
-    Tiers without the priority feature fall through to their ordinary floor, so
-    a Basic user — whose terms are all technically 'standard' — keeps their
-    10-minute cadence instead of silently dropping to 15.
+    Tiers with no priority feature fall through to their ordinary floor, which
+    is the same 10 minutes — so this only ever differs for a tier that sells a
+    faster rate than its own default.
     """
     t = (tier or '').strip().lower()
     return PLAN_STANDARD_FLOOR_MINUTES.get(t, interval_floor_for_tier(t))
@@ -3664,20 +3725,29 @@ def standard_floor_for_tier(tier):
 
 def term_interval_minutes(term_cfg, user_cfg):
     """
-    How often THIS term should scan.
+    How often THIS term should scan, in minutes.
 
-    The user's own chosen interval still wins when it is slower: someone on Pro
-    who picked 30 minutes wants 30, not 5. The floors only stop them going
-    faster than their plan allows.
+    Reads the term's own interval_minutes (migration 012). The user's choice
+    wins whenever it is slower — someone who picked 30 wants 30, not 5. The
+    floor only stops a term going FASTER than its plan allows.
+
+    Only the tier floor is applied here. How MANY terms may sit at the fastest
+    rate is capped on save in app.py, which is the one place that can see the
+    whole term set and can keep the terms already at that rate rather than
+    demoting an arbitrary one. This mirrors how is_priority worked: the scraper
+    clamps by tier, the write path counts.
     """
     tier = (user_cfg.get('plan_tier') or _tier_from_db_row(user_cfg) or '').strip().lower()
     try:
-        stored = int(user_cfg.get('check_interval_minutes') or DEFAULT_INTERVAL_FLOOR_MINUTES)
+        every = int((term_cfg or {}).get('interval_minutes')
+                    or DEFAULT_TERM_INTERVAL_MINUTES)
     except (TypeError, ValueError):
-        stored = DEFAULT_INTERVAL_FLOOR_MINUTES
-    floor = (interval_floor_for_tier(tier) if (term_cfg or {}).get('is_priority')
+        every = DEFAULT_TERM_INTERVAL_MINUTES
+    # A tier that sells the fast rate may reach it; one that does not is held at
+    # its standard floor, so a forged 5 on Basic still scans at 10.
+    floor = (interval_floor_for_tier(tier) if max_priority_for_tier(tier) > 0
              else standard_floor_for_tier(tier))
-    return max(stored, floor)
+    return max(every, floor)
 
 
 def due_terms_for_user(search_terms, user_cfg, now=None):
@@ -5275,6 +5345,12 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
 
     if log_callback:
         parts = []
+        # Cadence is per term now, so the console shows each term's own rate.
+        # ⚡ still means "on the plan's fastest tier" — derived from the interval
+        # rather than the is_priority flag, which is no longer authoritative.
+        tier_for_log = (user_config.get('plan_tier')
+                        or _tier_from_db_row(user_config) or '').strip().lower()
+        standard_min = standard_floor_for_tier(tier_for_log)
         for t, rng in search_terms.items():
             lo = rng.get('min')
             hi = rng.get('max')
@@ -5289,8 +5365,9 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
                 bounds = f'${lo:g}-${hi:g}'
             excl = rng.get('exclusions') or []
             suffix = f", excl: {', '.join(excl[:3])}" if excl else ''
-            fast = ' ⚡' if rng.get('is_priority') else ''
-            parts.append(f"{t!r}{fast} ({bounds}{suffix})")
+            every = term_interval_minutes(rng, user_config)
+            fast = ' ⚡' if every < standard_min else ''
+            parts.append(f"{t!r}{fast} ({every}m, {bounds}{suffix})")
         preview = ", ".join(parts[:12])
         if len(parts) > 12:
             preview += f" … (+{len(parts) - 12} more)"
@@ -5544,7 +5621,7 @@ def main(log_callback=None, health_callback=None):
                 # the loop below would be a round-trip per user per cycle — 60
                 # users is 60 extra queries a minute purely to decide who to skip.
                 cursor.execute("""
-                    SELECT t.user_id, t.search_term, t.is_priority,
+                    SELECT t.user_id, t.search_term, t.is_priority, t.interval_minutes,
                            EXTRACT(EPOCH FROM t.last_scraped_at) AS last_scraped_ts
                     FROM user_search_terms t
                     JOIN user_settings s ON s.user_id = t.user_id
@@ -5554,6 +5631,9 @@ def main(log_callback=None, health_callback=None):
                 for row in cursor.fetchall():
                     all_terms_by_user.setdefault(row['user_id'], {})[row['search_term']] = {
                         'is_priority': bool(row['is_priority']),
+                        'interval_minutes': (int(row['interval_minutes'])
+                                             if row['interval_minutes'] is not None
+                                             else DEFAULT_TERM_INTERVAL_MINUTES),
                         'last_scraped_ts': (float(row['last_scraped_ts'])
                                             if row['last_scraped_ts'] is not None else 0.0),
                     }

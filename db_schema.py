@@ -19,6 +19,9 @@ _listing_uniq_applied = False
 _priority_lock = threading.Lock()
 _priority_applied = False
 
+_term_interval_lock = threading.Lock()
+_term_interval_applied = False
+
 BUYER_DELIVERY_PREFS_DDL = """
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS buyer_include_local BOOLEAN NOT NULL DEFAULT TRUE,
@@ -173,6 +176,45 @@ def ensure_priority_term_columns(conn):
             cur.execute(PRIORITY_TERMS_DDL)
             conn.commit()
             _priority_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+TERM_INTERVAL_DDL = """
+ALTER TABLE user_search_terms
+  ADD COLUMN IF NOT EXISTS interval_minutes INT NOT NULL DEFAULT 10;
+"""
+
+
+def ensure_term_interval_column(conn):
+    """
+    Apply migration 012 if it was not run yet.
+
+    Scan cadence is per TERM now, not per user: interval_minutes replaces the
+    combination of user_settings.check_interval_minutes and the is_priority
+    boolean. ADD COLUMN ... DEFAULT 10 backfills existing rows to 10, which is
+    what we want — there are no production users whose cadence needs preserving.
+
+    is_priority stays, derived as (interval_minutes == 5), so a rollback or a
+    half-deployed frontend degrades instead of breaking.
+
+    Deliberately DDL-only. Everything in here runs on every boot, so a data
+    UPDATE would re-apply on each deploy and reset every user's choices.
+    """
+    global _term_interval_applied
+    if _term_interval_applied:
+        return
+    with _term_interval_lock:
+        if _term_interval_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(TERM_INTERVAL_DDL)
+            conn.commit()
+            _term_interval_applied = True
         except Exception:
             conn.rollback()
             raise

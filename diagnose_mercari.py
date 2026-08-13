@@ -194,6 +194,27 @@ print("""  example.com fails, mercari.com untested
       -> Cloudflare is blocking this browser fingerprint, not the network.
          Check that patchright (not playwright) is the one launching.
 
-  everything OK here but the scraper still fails
-      -> the failure is in the capture step, not connectivity. Look for
-         '[mercari] api capture navigation failed' in the logs.""")
+  everything OK here but the scraper still fails    <-- RENDER, 2026-08-13
+      -> the failure is in the CAPTURE step, not connectivity.
+         This script only fetches robots.txt, which is a static file needing no
+         JavaScript. The scraper has to load the search SPA and wait for it to
+         HYDRATE and fire searchFacetQuery — roughly 1.9MB of app JS, and
+         `domcontentloaded` returns long before any of it has run.
+         Grep the scraper's logs for these, in this order:
+           '[mercari] captured searchFacetQuery context' -> capture SUCCEEDED
+           '[mercari] searchFacetQuery never fired'      -> says which: a
+                                                           Cloudflare block, or
+                                                           hydration too slow
+                                                           (raise
+                                                           MERCARI_CAPTURE_WAIT_MS)
+           '[mercari] api capture navigation failed'     -> ONLY printed when
+                                                           page.goto() throws
+           'could not capture searchFacetQuery context'  -> the caller's summary
+
+  NOTE ON THE TIMINGS ABOVE
+      Each figure is browser LAUNCH + navigate, not navigate alone. Launch
+      dominates on a small instance: measured on Render, example.com — the
+      lightest page there is, no proxy, no Cloudflare — took 22-24s, against
+      0.9-2.3s on a laptop. Read a slow number here as a slow CPU, not a slow
+      network, and remember that every fixed timeout in the scraper was sized
+      on a machine roughly ten times faster at browser work.""")

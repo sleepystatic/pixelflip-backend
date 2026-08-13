@@ -1,0 +1,39 @@
+-- 012: per-term scan intervals.
+--
+-- Scan cadence moves from ONE interval per user (user_settings.check_interval_minutes
+-- plus a boolean is_priority per term) to one interval per SEARCH TERM. The
+-- "check every" dropdown in Scanner Settings is retired; each term carries its
+-- own rate, set from the button on that term's row.
+--
+-- WHY THIS SHAPE: per-term rates generalise to a credit system, where a user
+-- buys a budget and spends it per term at whatever rate each one deserves. A
+-- single user-level dropdown does not generalise at all. This is foundational,
+-- not cosmetic.
+--
+-- DEFAULT 10 backfills every existing row to 10 on ADD COLUMN. That is the
+-- intended behaviour here rather than an oversight: there are no production
+-- users yet, so preserving each term's previous effective cadence would be
+-- work in service of nobody. Note that this DOES change cadence for terms that
+-- were on a slower user-level interval, and speeds Pro's non-priority terms
+-- from 15 to 10 — both deliberate.
+--
+-- is_priority is KEPT, and is now DERIVED: is_priority = (interval_minutes = 5).
+-- It is written on every settings save and is no longer read by the scheduler.
+-- Keeping it means a half-deployed state — new frontend against old backend, or
+-- either side rolled back — degrades to the old behaviour instead of breaking
+-- the priority feature that works in production today. Dropping the column
+-- would make a rollback destructive.
+--
+-- There is deliberately no UPDATE here to reset stale is_priority rows. Nothing
+-- reads that column for scheduling after this migration, so a row left at
+-- is_priority = TRUE with interval_minutes = 10 is inert, and it self-corrects
+-- on the user's next settings save. A backfill UPDATE would have to live in
+-- db_schema.py to actually run, and anything in there executes on EVERY boot —
+-- which would silently reset every user's choices on each deploy.
+--
+-- NOTE: db_schema.py's ensure_term_interval_column() is what actually runs in
+-- production. This file is the readable record. Changing one without the other
+-- means the change silently does not apply.
+
+ALTER TABLE user_search_terms
+  ADD COLUMN IF NOT EXISTS interval_minutes INT NOT NULL DEFAULT 10;

@@ -329,20 +329,100 @@ PLAN_INTERVAL_OPTIONS = {
 }
 DEFAULT_INTERVAL_FLOOR_MINUTES = 10
 
-# Priority terms: a Pro user picks up to 3 terms that keep the 5-minute floor;
-# their remaining terms drop to a 15-minute floor. Basic sees the control as an
-# upsell but cannot enable it, so PLAN_MAX_PRIORITY_TERMS is 0 there and the
-# standard floor never applies — all Basic terms use PLAN_INTERVAL_FLOOR_MINUTES.
+# Priority terms: a Pro user picks up to 3 terms that may run at the 5-minute
+# floor. Every other term, on every tier, sits at 10. Basic sees the control as
+# an upsell but cannot enable it, so PLAN_MAX_PRIORITY_TERMS is 0 there.
 #
-# This is a bandwidth lever as much as a feature: 7 of 10 terms going from 288
-# to 96 scans/day is the difference between $9.11 and $4.86 a month in
-# residential proxy spend per Pro account (measured 2026-08-11 at 110.6KB/term).
+# PLAN_STANDARD_FLOOR_MINUTES was 15 for Pro, which made the paid plan's default
+# cadence SLOWER than Basic's 10. It is 10 everywhere now, and the only thing
+# priority buys is the right to put 5 on up to three terms.
+#
+# Still a bandwidth lever, though a weaker one than at 15: 7 of 10 terms at 144
+# scans/day instead of 288 is 1,872 rather than 2,880 scans/day per Pro account.
+# Against the 2026-08-11 measurement of 110.6KB/term and $9.11/mo at full rate,
+# that is ~$5.92/mo — derived from that measurement by arithmetic, not
+# re-measured. It was $4.86 when the standard floor was 15.
 #
 # Keep in sync with the identical tables in scraper_multi_user.py AND with
 # frontend/src/App.js.
 PLAN_MAX_PRIORITY_TERMS = {'pro': 3, 'basic': 0}
-PLAN_STANDARD_FLOOR_MINUTES = {'pro': 15}
+PLAN_STANDARD_FLOOR_MINUTES = {'pro': 10}
 DEFAULT_MAX_PRIORITY_TERMS = 0
+
+# Cadence is per TERM now (user_search_terms.interval_minutes, migration 012).
+# PLAN_INTERVAL_OPTIONS above is the per-term allowlist, and this is what a term
+# gets when the client sends nothing.
+DEFAULT_TERM_INTERVAL_MINUTES = 10
+
+
+def _term_interval_options_for_tier(tier):
+    """The rates a single term may be set to on this tier."""
+    return PLAN_INTERVAL_OPTIONS.get((tier or '').strip().lower(),
+                                     PLAN_INTERVAL_OPTIONS['basic'])
+
+
+def _sanitize_term_interval(value, tier):
+    """
+    Coerce a client-supplied per-term interval onto the tier's allowlist.
+
+    Anything off-menu — junk, a missing field, or a crafted 5 on a tier that
+    does not sell it — falls back to the default rather than erroring, so a
+    stale or hostile client cannot lock a user out of saving their settings.
+    Whether the user may have this MANY fast terms is a separate question,
+    counted by the caller.
+    """
+    allowed = _term_interval_options_for_tier(tier)
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TERM_INTERVAL_MINUTES
+    return v if v in allowed else DEFAULT_TERM_INTERVAL_MINUTES
+
+
+def _resolve_term_intervals(thresholds_in, tier, max_priority, prev_interval=None):
+    """
+    Decide every term's stored interval_minutes for a settings save.
+
+    Returns (intervals, demoted_count). Enforces both halves of the rule
+    server-side, because the UI cannot be trusted to: which rates this tier may
+    use at all, and how many terms may sit at its fastest one. Going over the
+    cap demotes to the default rather than erroring, so a stale or hostile
+    client cannot lock a user out of saving their settings.
+
+    Terms ALREADY at the fastest rate outrank newly-raised ones, so setting a
+    fourth term to 5 simply does not take — it never silently demotes a term the
+    user chose earlier, which picking by name would.
+    """
+    prev_interval = prev_interval or {}
+    max_priority = max(0, int(max_priority or 0))
+    fastest_rate = _interval_floor_for_tier(tier)
+    tier_has_fast = max_priority > 0
+
+    out = {}
+    for term, prices in (thresholds_in or {}).items():
+        prices = prices or {}
+        if 'interval' in prices:
+            out[term] = _sanitize_term_interval(prices.get('interval'), tier)
+        else:
+            # A client still sending only the old boolean. Map it, so a
+            # half-deployed frontend keeps working instead of silently resetting
+            # every term to the default.
+            out[term] = (fastest_rate
+                         if (tier_has_fast and bool(prices.get('priority')))
+                         else DEFAULT_TERM_INTERVAL_MINUTES)
+
+    demoted = 0
+    if tier_has_fast:
+        wants_fast = sorted(t for t, v in out.items() if v <= fastest_rate)
+        if len(wants_fast) > max_priority:
+            already = [t for t in wants_fast if prev_interval.get(t) == fastest_rate]
+            newly = [t for t in wants_fast if t not in already]
+            granted = set((already + newly)[:max_priority])
+            for t in wants_fast:
+                if t not in granted:
+                    out[t] = DEFAULT_TERM_INTERVAL_MINUTES
+                    demoted += 1
+    return out, demoted
 
 
 def _max_priority_terms_for_tier(tier):
@@ -602,6 +682,7 @@ def get_db_connection():
                 ensure_tour_column,
                 ensure_listing_uniqueness_per_user,
                 ensure_priority_term_columns,
+                ensure_term_interval_column,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
@@ -609,6 +690,7 @@ def get_db_connection():
             ensure_tour_column(conn)
             ensure_listing_uniqueness_per_user(conn)
             ensure_priority_term_columns(conn)
+            ensure_term_interval_column(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -892,41 +974,46 @@ def get_status(user_id):
         # Calculate when the next check SHOULD be (countdown starts after last scrape *finished*)
         next_check_timestamp = last_scraped + interval_secs
 
-        # With priority terms the user-level interval is no longer the whole
-        # story: a Pro user's 3 fast terms come round every 5 minutes while the
-        # rest wait 15, so a single user-level countdown would tick to zero and
-        # then sit there while nothing happened. The scan the user is waiting for
-        # is the SOONEST term, so the countdown targets that — and
-        # `next_check_terms` says how many terms that scan will actually cover,
-        # which is what makes one timer honest instead of ambiguous.
+        # Every term carries its own cadence now, so a single user-level
+        # countdown would tick to zero and then sit there while nothing
+        # happened. The scan the user is waiting for is the SOONEST term, so the
+        # countdown targets that — and `next_check_terms` says how many terms
+        # that scan will actually cover, which is what makes one timer honest
+        # instead of ambiguous. This runs for every tier, not just the ones with
+        # a fast tier, because mixed cadences are now the normal case.
         next_check_terms = None
         next_check_scope = None
         try:
             tier_for_terms = _effective_plan_tier(us)
-            if _max_priority_terms_for_tier(tier_for_terms) > 0:
-                cursor.execute(
-                    "SELECT search_term, is_priority, "
-                    "EXTRACT(EPOCH FROM last_scraped_at) AS last_ts "
-                    "FROM user_search_terms WHERE user_id = %s;", (user_id,))
-                soonest = None
-                due_at = {}
-                for row in cursor.fetchall():
-                    floor_min = (_interval_floor_for_tier(tier_for_terms)
-                                 if row['is_priority']
-                                 else _standard_floor_for_tier(tier_for_terms))
-                    every = max(int(interval_min), floor_min) * 60
-                    ready = (float(row['last_ts']) if row['last_ts'] is not None else 0.0) + every
-                    due_at[row['search_term']] = ready
-                    if soonest is None or ready < soonest:
-                        soonest = ready
-                if soonest is not None:
-                    next_check_timestamp = soonest
-                    # Terms that will be due within a few seconds of the soonest
-                    # one ride along in the same scan.
-                    next_check_terms = sum(1 for r in due_at.values() if r <= soonest + 5)
-                    next_check_scope = ('all terms'
-                                        if next_check_terms >= len(due_at)
-                                        else f'{next_check_terms} priority')
+            has_fast = _max_priority_terms_for_tier(tier_for_terms) > 0
+            cursor.execute(
+                "SELECT search_term, interval_minutes, "
+                "EXTRACT(EPOCH FROM last_scraped_at) AS last_ts "
+                "FROM user_search_terms WHERE user_id = %s;", (user_id,))
+            soonest = None
+            due_at = {}
+            for row in cursor.fetchall():
+                every_min = (int(row['interval_minutes'])
+                             if row['interval_minutes'] is not None
+                             else DEFAULT_TERM_INTERVAL_MINUTES)
+                # The same clamp term_interval_minutes() applies, so the
+                # countdown cannot promise a rate the scheduler will not honour.
+                every_min = max(every_min,
+                                _interval_floor_for_tier(tier_for_terms) if has_fast
+                                else _standard_floor_for_tier(tier_for_terms))
+                ready = ((float(row['last_ts']) if row['last_ts'] is not None else 0.0)
+                         + every_min * 60)
+                due_at[row['search_term']] = ready
+                if soonest is None or ready < soonest:
+                    soonest = ready
+            if soonest is not None:
+                next_check_timestamp = soonest
+                # Terms that will be due within a few seconds of the soonest
+                # one ride along in the same scan.
+                next_check_terms = sum(1 for r in due_at.values() if r <= soonest + 5)
+                next_check_scope = ('all terms'
+                                    if next_check_terms >= len(due_at)
+                                    else f'{next_check_terms} of {len(due_at)} terms')
         except Exception as e:
             # A countdown is not worth failing /api/status over.
             print(f"[status] per-term countdown failed for {user_id[:8]}: {e}", flush=True)
@@ -1010,17 +1097,25 @@ def handle_settings(user_id):
 
             # NULL min/max means "any price" — an unset bound, not zero. Keep it
             # as None all the way to the client so the input renders empty.
-            cursor.execute("SELECT search_term, max_price, min_price, is_priority "
+            cursor.execute("SELECT search_term, max_price, min_price, is_priority, "
+                           "interval_minutes "
                            "FROM user_search_terms WHERE user_id = %s;",
                            (user_id,))
-            terms = {
-                row['search_term']: {
+            terms = {}
+            for row in cursor.fetchall():
+                every = (int(row['interval_minutes'])
+                         if row.get('interval_minutes') is not None
+                         else DEFAULT_TERM_INTERVAL_MINUTES)
+                terms[row['search_term']] = {
                     'max': float(row['max_price']) if row['max_price'] is not None else None,
                     'min': float(row['min_price']) if row['min_price'] is not None else None,
                     'exclusions': [],
-                    'priority': bool(row.get('is_priority')),
-                } for row in cursor.fetchall()
-            }
+                    'interval': every,
+                    # Derived from the interval rather than read from the column,
+                    # so a frontend still on the boolean renders correctly
+                    # against the new backend.
+                    'priority': every == 5,
+                }
 
             # Exclusions are per search term. Rows with a NULL search_term are
             # pre-migration leftovers and are ignored (and cleared on next save).
@@ -1050,6 +1145,12 @@ def handle_settings(user_id):
                     "plan_name": None,
                     "max_search_terms": _plan_limits('inactive')['max_search_terms'],
                     "max_priority_terms": _plan_limits('inactive')['max_priority_terms'],
+                    # Served rather than duplicated client-side: the option table
+                    # lived in three files and drifting one silently broke the
+                    # others. The frontend keeps a fallback for an offline load.
+                    "term_interval_options": _term_interval_options_for_tier('inactive'),
+                    "fastest_term_interval": _interval_floor_for_tier('inactive'),
+                    "default_term_interval": DEFAULT_TERM_INTERVAL_MINUTES,
                     "ai_image_allowed": False,
                     "subscription_current_period_end": None,
                     "subscription_cancel_at_period_end": False,
@@ -1085,6 +1186,12 @@ def handle_settings(user_id):
                 "plan_name": _plan_display_name(pt),
                 "max_search_terms": limits['max_search_terms'],
                 "max_priority_terms": limits['max_priority_terms'],
+                # Served rather than duplicated client-side: the option table
+                # lived in three files and drifting one silently broke the
+                # others. The frontend keeps a fallback for an offline load.
+                "term_interval_options": _term_interval_options_for_tier(pt),
+                "fastest_term_interval": _interval_floor_for_tier(pt),
+                "default_term_interval": DEFAULT_TERM_INTERVAL_MINUTES,
                 "ai_image_allowed": ai_allowed,
                 "subscription_current_period_end": us.get('subscription_current_period_end'),
                 "subscription_cancel_at_period_end": bool(us.get('subscription_cancel_at_period_end')),
@@ -1175,10 +1282,15 @@ def handle_settings(user_id):
             # of all their terms, and an autosaving dashboard makes that
             # constant.
             cursor.execute(
-                "SELECT search_term, last_scraped_at FROM user_search_terms WHERE user_id = %s;",
+                "SELECT search_term, last_scraped_at, interval_minutes "
+                "FROM user_search_terms WHERE user_id = %s;",
                 (user_id,),
             )
-            prev_scraped = {r['search_term']: r['last_scraped_at'] for r in cursor.fetchall()}
+            prev_scraped = {}
+            prev_interval = {}
+            for r in cursor.fetchall():
+                prev_scraped[r['search_term']] = r['last_scraped_at']
+                prev_interval[r['search_term']] = r['interval_minutes']
 
             cursor.execute("DELETE FROM user_search_terms WHERE user_id = %s;", (user_id,))
 
@@ -1191,29 +1303,36 @@ def handle_settings(user_id):
                 except (TypeError, ValueError):
                     return None
 
-            # Priority is a paid feature and the cap is enforced HERE, not in the
-            # UI: a crafted POST would otherwise buy a Basic account ten
-            # 5-minute terms. Anything over the cap falls back to standard rather
-            # than erroring, so a stale client cannot lock a user out of saving.
-            max_priority = limits.get('max_priority_terms', 0)
-            requested_priority = [
-                t for t, p in thresholds_in.items() if bool((p or {}).get('priority'))
-            ]
-            granted_priority = set(sorted(requested_priority)[:max(0, int(max_priority))])
-            if len(requested_priority) > len(granted_priority):
-                print(f"[settings] {user_id[:8]} requested {len(requested_priority)} priority "
-                      f"terms, cap is {max_priority} — granting {len(granted_priority)}",
-                      flush=True)
+            # Cadence is per term now, and BOTH halves of the rule are enforced
+            # HERE rather than in the UI: which rates a term may use, and how
+            # many terms may sit at the plan's fastest one. A crafted POST would
+            # otherwise buy a Basic account ten 5-minute terms. Going over the
+            # cap demotes rather than erroring, so a stale client cannot lock a
+            # user out of saving their settings.
+            max_priority = max(0, int(limits.get('max_priority_terms', 0)))
+            fastest_rate = _interval_floor_for_tier(tier_eff)
+            tier_has_fast = max_priority > 0
+            requested_interval, demoted = _resolve_term_intervals(
+                thresholds_in, tier_eff, max_priority, prev_interval)
+            if demoted:
+                print(f"[settings] {user_id[:8]} asked for {demoted} term(s) over the "
+                      f"{fastest_rate}m cap of {max_priority} — demoted to "
+                      f"{DEFAULT_TERM_INTERVAL_MINUTES}m", flush=True)
 
             for term, prices in thresholds_in.items():
                 prices = prices or {}
+                every = requested_interval[term]
                 cursor.execute(
                     "INSERT INTO user_search_terms "
-                    "(user_id, search_term, max_price, min_price, is_priority, last_scraped_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s);",
+                    "(user_id, search_term, max_price, min_price, is_priority, "
+                    "interval_minutes, last_scraped_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s);",
                     (user_id, term, _price_or_none(prices.get('max')),
-                     _price_or_none(prices.get('min')), term in granted_priority,
-                     prev_scraped.get(term))
+                     _price_or_none(prices.get('min')),
+                     # Derived from the interval, and still written so a rollback
+                     # to the boolean-reading scheduler marks the right terms.
+                     bool(tier_has_fast and every <= fastest_rate),
+                     every, prev_scraped.get(term))
                 )
 
             # REPLACE Exclusions — all per-term. The DELETE also clears any
