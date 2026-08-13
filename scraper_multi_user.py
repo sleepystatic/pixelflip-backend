@@ -1119,6 +1119,48 @@ def _extract_craigslist_price_from_listing_soup(soup):
     return None
 
 
+_CL_LOCAL = threading.local()
+
+
+def _craigslist_session():
+    """
+    One requests.Session per thread.
+
+    Sessions are not thread-safe, and the detail fetches now run in a pool.
+    Sharing one across workers corrupts the connection pool under load.
+    """
+    s = getattr(_CL_LOCAL, 'session', None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+        _CL_LOCAL.session = s
+    return s
+
+
+def _craigslist_title_match(title, search_terms):
+    """
+    The matched term for this title, or None — using ONLY the title.
+
+    Split out of check_price_threshold so it can run BEFORE the detail fetch.
+    Measured 2026-08-12 across 659 tiles: 45% fail the title filter, and every
+    one of them was costing a page GET plus a polite-delay sleep before being
+    discarded. Price bounds still run after enrichment, because 5.5% of tiles
+    have no price until the detail page supplies one.
+    """
+    tl = (title or '').lower()
+    if not tl:
+        return None
+    for term in sorted(search_terms.keys(), key=len, reverse=True):
+        if _search_term_matches_title(term, tl):
+            return term
+    return None
+
+
 def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_sec):
     """GET the listing detail page for posted time, gallery image, and price when the tile omits it."""
     try:
@@ -1163,10 +1205,31 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     cl_cat = os.getenv('CRAIGSLIST_SEARCH_CAT', 3 * 's').strip() or (3 * 's')
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
     fetch_detail = os.getenv('CRAIGSLIST_FETCH_DETAIL', '1').strip().lower() not in ('0', 'false', 'no')
+    # Per-request politeness. Lower than the old 0.35 because the fetches are no
+    # longer serial — with a pool of N, the effective rate is delay/N, so keeping
+    # 0.35 alongside parallelism would have been a real rate increase. 0.25/6 is
+    # gentler per-connection than 0.35 sequential was.
     try:
-        detail_delay = float(os.getenv('CRAIGSLIST_DETAIL_DELAY_SEC', '0.35'))
+        detail_delay = float(os.getenv('CRAIGSLIST_DETAIL_DELAY_SEC', '0.25'))
     except ValueError:
-        detail_delay = 0.35
+        detail_delay = 0.25
+    # Craigslist was the ONLY platform without a row cap. Facebook caps at 40 and
+    # Mercari at 30, but a broad Craigslist term returns everything: measured
+    # 2026-08-12, "road bike" gave 340 tiles and "nintendo switch" 300, each
+    # costing a detail page. That is the whole reason Craigslist dominated the
+    # 10-user stress test at 1,374s. Results come back sort=date, so the first N
+    # are the newest — exactly what a deal alert wants.
+    try:
+        cl_max_rows = int(os.getenv('CRAIGSLIST_MAX_ROWS_PER_TERM', '40'))
+    except ValueError:
+        cl_max_rows = 40
+    try:
+        cl_workers = max(1, int(os.getenv('CRAIGSLIST_DETAIL_WORKERS', '6')))
+    except ValueError:
+        cl_workers = 6
+    # Grows on each 403 and resets on the first 200, so a throttled run slows
+    # down instead of hammering harder.
+    cl_throttle_backoff = 2.0
 
     session = requests.Session()
     session.headers.update({
@@ -1194,12 +1257,39 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
             try:
                 response = session.get(url, timeout=15)
                 _record_bytes('craigslist', len(response.content or b''))
+
+                # A throttled Craigslist answers 403 with an empty body, which
+                # parsed to zero tiles and was reported as "scanned 0 rows" —
+                # identical to a genuinely empty search. Measured 2026-08-12
+                # while load-testing: two 403s then a 200, so it is rate limiting
+                # rather than a ban, and it is recoverable by backing off.
+                # Saying so matters because "0 results" sent debugging toward
+                # search terms instead of request volume.
+                if response.status_code != 200:
+                    if log_callback:
+                        log_callback(
+                            user_id,
+                            f"Craigslist returned HTTP {response.status_code} for "
+                            f"'{term}' — rate limited, not empty. Backing off; "
+                            "lower CRAIGSLIST_DETAIL_WORKERS if this persists.",
+                            'error',
+                        )
+                    time.sleep(min(30.0, max(1.0, cl_throttle_backoff)))
+                    cl_throttle_backoff = min(30.0, cl_throttle_backoff * 2)
+                    continue
+                cl_throttle_backoff = 2.0
+
                 soup = BeautifulSoup(response.content, 'html.parser')
                 items = soup.find_all('li', class_='cl-static-search-result')
                 if debug and log_callback:
                     log_callback(user_id, f"Craigslist {subdomain} '{term}': scanned {len(items)} rows", "info")
 
-                for item in items:
+                # PASS 1 — everything decidable without a network call.
+                # Each survivor costs a detail page, so every filter that can run
+                # on tile data alone belongs here rather than after the fetch.
+                candidates = []
+                skipped_title = 0
+                for item in items[:max(1, cl_max_rows)]:
                     if not is_user_active(user_id):
                         if debug and log_callback:
                             log_callback(user_id, "Craigslist stopped by user.", "info")
@@ -1219,6 +1309,8 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         link = link_elem['href'] if link_elem else None
                         if link and not link.startswith('http'):
                             link = f'https://{subdomain}.craigslist.org' + link
+                        if not link:
+                            continue
 
                         price_elem = item.find('div', class_='price')
                         price = extract_price(price_elem.text if price_elem else None)
@@ -1227,9 +1319,6 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         if _is_craigslist_placeholder_price(price):
                             price = None
 
-                        if not link:
-                            continue
-
                         # Placed before the detail fetch, not just before Vision:
                         # a listing we already hold costs a page GET plus a
                         # polite-delay sleep here, and it would be discarded by
@@ -1237,38 +1326,85 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                         if known_links and link in known_links:
                             continue
 
-                        entry = {
-                            'title': title,
-                            'price': price,
-                            'link': link,
-                            'platform': 'Craigslist',
-                            'console_type': None,
-                            'threshold': None,
-                            'image_url': None,
-                            'listed_at': _parse_source_datetime(dt_text) if dt_text else None,
-                            'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)',
-                        }
+                        # Title match on tile data. 45% of tiles fail this, and
+                        # each one used to buy a detail page first.
+                        matched_term = _craigslist_title_match(title, search_terms)
+                        if not matched_term:
+                            skipped_title += 1
+                            continue
+                        # Price bounds too, when the tile already knows the price
+                        # (94.5% of the time). The 5.5% without one fall through
+                        # and get checked after enrichment.
+                        if price is not None:
+                            meets, _mt, _mx = check_price_threshold(title, price, search_terms)
+                            if not meets:
+                                continue
 
-                        if fetch_detail:
-                            if not _enrich_craigslist_from_detail(session, entry, max_age_days, detail_delay):
-                                continue
-                            if not entry.get('image_url'):
-                                entry['image_url'] = _craigslist_image_from_data_ids(item)
-                        else:
-                            if not entry.get('price'):
-                                continue
+                        candidates.append({
+                            'entry': {
+                                'title': title,
+                                'price': price,
+                                'link': link,
+                                'platform': 'Craigslist',
+                                'console_type': None,
+                                'threshold': None,
+                                'image_url': None,
+                                'listed_at': _parse_source_datetime(dt_text) if dt_text else None,
+                                'location': f'Craigslist ({subdomain}) · {zip_code} ({search_radius} mi)',
+                            },
+                            'item': item,
+                        })
+                    except Exception:
+                        continue
+
+                if debug and log_callback and skipped_title:
+                    log_callback(
+                        user_id,
+                        f"Craigslist {subdomain} '{term}': {len(candidates)} to enrich "
+                        f"({skipped_title} skipped on title before any page fetch)",
+                        'info',
+                    )
+
+                # PASS 2 — enrich the survivors in parallel. Craigslist is plain
+                # HTTP with no proxy, so this is bounded by latency, not by
+                # anything expensive: serially it was ~1s per listing.
+                if fetch_detail and candidates:
+                    def _enrich(c):
+                        try:
+                            keep = _enrich_craigslist_from_detail(
+                                _craigslist_session(), c['entry'], max_age_days, detail_delay)
+                        except Exception:
+                            keep = True
+                        return c, keep
+
+                    enriched = []
+                    with ThreadPoolExecutor(max_workers=min(cl_workers, len(candidates)),
+                                            thread_name_prefix='cl-detail') as pool:
+                        for c, keep in pool.map(_enrich, candidates):
+                            if keep:
+                                enriched.append(c)
+                    candidates = enriched
+
+                # PASS 3 — filters that need the enriched fields.
+                for c in candidates:
+                    if not is_user_active(user_id):
+                        return listings
+                    try:
+                        entry, item = c['entry'], c['item']
+                        if not entry.get('image_url'):
+                            entry['image_url'] = _craigslist_image_from_data_ids(item)
+                        if not fetch_detail and not entry.get('image_url'):
                             try:
-                                img_elem = item.find('img')
-                                entry['image_url'] = _extract_lazy_image_url(img_elem)
+                                entry['image_url'] = _extract_lazy_image_url(item.find('img'))
                             except Exception:
                                 pass
-                            if not entry.get('image_url'):
-                                entry['image_url'] = _craigslist_image_from_data_ids(item)
 
                         if entry.get('price') is None or _is_craigslist_placeholder_price(entry.get('price')):
                             continue
 
-                        meets_threshold, matched_term, max_price = check_price_threshold(title, entry['price'], search_terms)
+                        title = entry['title']
+                        meets_threshold, matched_term, max_price = check_price_threshold(
+                            title, entry['price'], search_terms)
                         if not meets_threshold:
                             continue
                         if is_excluded(title, entry['price'], exclusions, search_terms, matched_term):
@@ -5129,7 +5265,6 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             continue
         recent_fp_to_prices.setdefault(fp, []).append(float(row.get('price') or 0))
 
-    all_listings = []
 
     # Skip platforms that cannot satisfy the buyer's delivery preference. A
     # shipping-only buyer gets nothing usable from Craigslist or OfferUp, so
@@ -5150,113 +5285,127 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             )
         return False
 
-    if user_config['platforms'].get('craigslist') and _delivery_allows('craigslist'):
-        if not is_user_active(user_id):
-            if log_callback:
-                log_callback(user_id, "Scrape stopped by user before Craigslist.", "info")
-            return 0
-        all_listings.extend(
-            scrape_craigslist_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
-                                       user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
-                                       known_links=known_links))
-        _log_memory('Craigslist', log_callback, user_id)
-
-    if user_config['platforms'].get('offerup') and _delivery_allows('offerup'):
-        if not is_user_active(user_id):
-            if log_callback:
-                log_callback(user_id, "Scrape stopped by user before OfferUp.", "info")
-            return 0
-        all_listings.extend(
-            scrape_offerup_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
-                                    user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
-                                    known_links=known_links))
-        _log_memory('OfferUp', log_callback, user_id)
-
-    if user_config['platforms'].get('mercari') and _delivery_allows('mercari'):
-        if not is_user_active(user_id):
-            if log_callback:
-                log_callback(user_id, "Scrape stopped by user before Mercari.", "info")
-            return 0
-        all_listings.extend(
-            scrape_mercari_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
-                                    user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
-                                    known_links=known_links))
-        _log_memory('Mercari', log_callback, user_id)
-
-    if user_config['platforms'].get('facebook') and _delivery_allows('facebook'):
-        if not is_user_active(user_id):
-            if log_callback:
-                log_callback(user_id, "Scrape stopped by user before Facebook.", "info")
-            return 0
-        if (user_config.get('plan_tier') or '').strip().lower() == 'pro':
-            all_listings.extend(
-                scrape_facebook_for_user(user_id, zip_code, user_config['search_radius'], search_terms, exclusions,
-                                         user_config['ai_enabled'], user_config['ai_strictness'], debug, log_callback,
-                                         known_links=known_links))
-            _log_memory('Facebook', log_callback, user_id)
-        elif log_callback:
-            log_callback(user_id, "Facebook Marketplace requires a Pro plan.", "info")
-
-    skipped_seen_or_link_blocked = 0
-    skipped_fingerprint_blocked = 0
-    skipped_recent_dupe = 0
-    skipped_buyer_delivery = 0
-    saved_count = 0
+    stats = {'candidates': 0, 'saved': 0, 'seen_or_link': 0,
+             'fingerprint': 0, 'recent_dupe': 0, 'delivery': 0}
     new_listings = []
-    to_save = []
     cycle_fp_to_prices = {}
-    for listing in all_listings:
-        if not is_user_active(user_id):
-            if log_callback:
-                log_callback(user_id, "Scrape stopped by user during result processing.", "info")
-            break
-        link = listing['link']
-        fp = _title_fingerprint(listing.get('title'))
-        listing['title_fingerprint'] = fp
-        price = float(listing.get('price') or 0)
 
-        if link in seen_listings or link in blocked_links:
-            skipped_seen_or_link_blocked += 1
-            continue
-        if fp and fp in blocked_fingerprints:
-            skipped_fingerprint_blocked += 1
-            continue
+    def _persist(batch):
+        """
+        Dedup and save ONE platform's results, immediately.
 
-        # Fuzzy-ish duplicate gate across marketplaces:
-        # same normalized title fingerprint and close price (+/- $10)
-        recent_prices = recent_fp_to_prices.get(fp, [])
-        cycle_prices = cycle_fp_to_prices.get(fp, [])
-        if fp and any(abs(price - p) <= 10 for p in recent_prices + cycle_prices):
-            skipped_recent_dupe += 1
-            continue
+        This used to run once, after every platform had finished. That made the
+        whole scrape all-or-nothing: when Mercari stalled, a scan that had
+        already collected Craigslist and OfferUp listings saved none of them
+        (observed in production 2026-08-12). Pressing STOP threw them away too.
 
-        if not listing_matches_buyer_delivery_prefs(
-            listing,
-            user_config['buyer_include_local'],
-            user_config['buyer_include_shipping'],
-        ):
-            skipped_buyer_delivery += 1
-            continue
+        Saving per platform keeps whatever has been found. The cross-platform
+        duplicate gate still works because cycle_fp_to_prices persists across
+        calls — a listing found on both Craigslist and OfferUp in the same scan
+        is still caught by the second call.
+        """
+        if not batch:
+            return
+        stats['candidates'] += len(batch)
+        to_save = []
+        for listing in batch:
+            if not is_user_active(user_id):
+                if log_callback:
+                    log_callback(user_id, "Scrape stopped by user during result processing.", "info")
+                break
+            link = listing['link']
+            fp = _title_fingerprint(listing.get('title'))
+            listing['title_fingerprint'] = fp
+            price = float(listing.get('price') or 0)
 
-        # Collected rather than written here: one bulk insert after the loop
-        # replaces one connection per listing. Reserve the fingerprint now so
-        # the in-cycle duplicate gate above still sees it.
-        to_save.append(listing)
-        cycle_fp_to_prices.setdefault(fp, []).append(price)
+            if link in seen_listings or link in blocked_links:
+                stats['seen_or_link'] += 1
+                continue
+            if fp and fp in blocked_fingerprints:
+                stats['fingerprint'] += 1
+                continue
 
-    if to_save:
+            # Fuzzy-ish duplicate gate across marketplaces:
+            # same normalized title fingerprint and close price (+/- $10)
+            recent_prices = recent_fp_to_prices.get(fp, [])
+            cycle_prices = cycle_fp_to_prices.get(fp, [])
+            if fp and any(abs(price - p) <= 10 for p in recent_prices + cycle_prices):
+                stats['recent_dupe'] += 1
+                continue
+
+            if not listing_matches_buyer_delivery_prefs(
+                listing,
+                user_config['buyer_include_local'],
+                user_config['buyer_include_shipping'],
+            ):
+                stats['delivery'] += 1
+                continue
+
+            # Collected rather than written per row: one bulk insert replaces one
+            # connection per listing. Reserve the fingerprint now so the in-cycle
+            # duplicate gate above still sees it.
+            to_save.append(listing)
+            cycle_fp_to_prices.setdefault(fp, []).append(price)
+            # Mark the link seen, so a later platform in this same scrape cannot
+            # re-save it. seen_listings was previously only consulted, never
+            # added to, which was safe only because this block ran exactly once.
+            seen_listings.add(link)
+            # known_links is the copy handed to the scrapers, and the later ones
+            # have not started yet — adding here means they skip this listing
+            # before paying for Vision or a detail page.
+            known_links.add(link)
+
+        if not to_save:
+            return
         inserted_links = save_listings_bulk(user_id, to_save)
         for listing in to_save:
             if listing['link'] not in inserted_links:
                 continue
             new_listings.append(listing)
-            saved_count += 1
+            stats['saved'] += 1
             if log_callback:
                 log_callback(
                     user_id,
                     f"New match: {listing['title'][:40]} — ${listing['price']}",
                     "success"
                 )
+
+    # Each platform is its own job so one failure cannot take the others with it.
+    platform_jobs = []
+    if user_config['platforms'].get('craigslist') and _delivery_allows('craigslist'):
+        platform_jobs.append(('Craigslist', scrape_craigslist_for_user))
+    if user_config['platforms'].get('offerup') and _delivery_allows('offerup'):
+        platform_jobs.append(('OfferUp', scrape_offerup_for_user))
+    if user_config['platforms'].get('mercari') and _delivery_allows('mercari'):
+        platform_jobs.append(('Mercari', scrape_mercari_for_user))
+    if user_config['platforms'].get('facebook') and _delivery_allows('facebook'):
+        if (user_config.get('plan_tier') or '').strip().lower() == 'pro':
+            platform_jobs.append(('Facebook', scrape_facebook_for_user))
+        elif log_callback:
+            log_callback(user_id, "Facebook Marketplace requires a Pro plan.", "info")
+
+    for label, fn in platform_jobs:
+        if not is_user_active(user_id):
+            if log_callback:
+                log_callback(user_id, f"Scrape stopped by user before {label}.", "info")
+            break
+        try:
+            batch = fn(user_id, zip_code, user_config['search_radius'], search_terms,
+                       exclusions, user_config['ai_enabled'], user_config['ai_strictness'],
+                       debug, log_callback, known_links=known_links)
+        except Exception as e:
+            # One marketplace failing is not the scrape failing. Report it and
+            # keep whatever the others found.
+            print(f"  ❌ [{user_id[:8]}] {label} failed: {type(e).__name__}: {e}", flush=True)
+            if log_callback:
+                log_callback(user_id,
+                             f"{label} failed ({type(e).__name__}) — continuing with "
+                             "your other marketplaces.", 'error')
+            batch = []
+        # Saved here, before the next platform runs, so a later stall cannot
+        # discard it.
+        _persist(batch)
+        _log_memory(label, log_callback, user_id)
 
     if new_listings:
         _notify_scrape_digest(user_id, new_listings, notify_prefs, log_callback)
@@ -5265,12 +5414,12 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         log_callback(
             user_id,
             (
-                f"Filter summary: candidates={len(all_listings)} "
-                f"saved={saved_count} "
-                f"seen_or_link_blocked={skipped_seen_or_link_blocked} "
-                f"fingerprint_blocked={skipped_fingerprint_blocked} "
-                f"recent_dupe={skipped_recent_dupe} "
-                f"buyer_local_shipping_prefs={skipped_buyer_delivery}"
+                f"Filter summary: candidates={stats['candidates']} "
+                f"saved={stats['saved']} "
+                f"seen_or_link_blocked={stats['seen_or_link']} "
+                f"fingerprint_blocked={stats['fingerprint']} "
+                f"recent_dupe={stats['recent_dupe']} "
+                f"buyer_local_shipping_prefs={stats['delivery']}"
             ),
             "info",
         )
@@ -5486,8 +5635,19 @@ def main(log_callback=None, health_callback=None):
                             # only for something raised outside it.
                             print(f"  ❌ worker future failed: {e}", flush=True)
 
+            # How long before we look for due users again. This is ALSO the
+            # worst-case delay between a user pressing START and their console
+            # showing anything: /api/start only flips is_active, and nothing
+            # happens until the next cycle notices. At 60s that felt broken.
+            # The cycle costs two indexed queries, so polling four times as often
+            # is cheap next to the scraping it gates.
+            try:
+                cycle_sleep = max(5, int(os.getenv('SCRAPE_CYCLE_SLEEP_SEC', '15')))
+            except ValueError:
+                cycle_sleep = 15
+
             print(f"\n✅ Total new listings this cycle: {total_new}", flush=True)
-            print(f"⏳ Cycle complete. Waiting 1 minute...", flush=True)
+            print(f"⏳ Cycle complete. Waiting {cycle_sleep}s...", flush=True)
             sys.stdout.flush()
 
             # Report health check timestamp
@@ -5497,7 +5657,7 @@ def main(log_callback=None, health_callback=None):
                 except Exception:
                     pass
 
-            time.sleep(60)
+            time.sleep(cycle_sleep)
 
         except Exception as e:
             print(f"❌ Error: {e}", flush=True)

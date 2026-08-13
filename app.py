@@ -1549,6 +1549,23 @@ def start_scraper(user_id):
         # WE NOW FLIP THE CORRECT SWITCH
         cursor.execute("UPDATE user_settings SET is_active = TRUE WHERE user_id = %s;", (user_id,))
         conn.commit()
+
+        # Immediate console feedback. Starting is only a flag flip — the scraper
+        # picks it up on its next cycle, so without this the console stayed
+        # completely silent for up to SCRAPE_CYCLE_SLEEP_SEC and START read as
+        # broken. Also drop the is_user_active cache so a scrape already in
+        # flight for this user notices the change at its next checkpoint rather
+        # than up to the TTL later.
+        try:
+            import scrape_logs
+            scrape_logs.add_log(user_id, "Scanner armed — your first scan begins shortly.", "info")
+        except Exception:
+            pass
+        try:
+            from scraper_multi_user import _invalidate_active_cache
+            _invalidate_active_cache(user_id)
+        except Exception:
+            pass
         return jsonify({"success": True, "status": "running"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
