@@ -17,6 +17,12 @@ playwright==1.61.0
 patchright==1.61.2
 beautifulsoup4==4.14.3
 requests==2.32.5
+# curl_cffi reproduces Chrome's TLS handshake. Mercari's /v1/api gate is the
+# handshake itself, not the headers: measured 2026-08-13, the SAME bearer,
+# headers and cf_clearance got HTTP 403 through `requests` and HTTP 200 with 28
+# items through curl_cffi. It is what lets the search replay run with no browser
+# at all, which is the difference between Mercari costing ~600MB and ~0.
+curl_cffi==0.16.0
 
 # Payments & Logic
 stripe==8.0.0

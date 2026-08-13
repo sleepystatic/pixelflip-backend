@@ -22,6 +22,9 @@ _priority_applied = False
 _term_interval_lock = threading.Lock()
 _term_interval_applied = False
 
+_scraper_state_lock = threading.Lock()
+_scraper_state_applied = False
+
 BUYER_DELIVERY_PREFS_DDL = """
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS buyer_include_local BOOLEAN NOT NULL DEFAULT TRUE,
@@ -215,6 +218,44 @@ def ensure_term_interval_column(conn):
             cur.execute(TERM_INTERVAL_DDL)
             conn.commit()
             _term_interval_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+SCRAPER_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS scraper_state (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
+def ensure_scraper_state_table(conn):
+    """
+    Apply migration 013 if it was not run yet.
+
+    Shared key/value state for credentials that outlive one process. Currently
+    Mercari's captured bearer, which is expensive to mint (a ~1GB browser
+    capture) and cheap to reuse (a 7-day JWT that needs no cookies and is not
+    IP-bound). In the database rather than a file because Render instances do
+    not share a disk — and because it lets the capture run somewhere else
+    entirely, on a machine with room for Chrome.
+    """
+    global _scraper_state_applied
+    if _scraper_state_applied:
+        return
+    with _scraper_state_lock:
+        if _scraper_state_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(SCRAPER_STATE_DDL)
+            conn.commit()
+            _scraper_state_applied = True
         except Exception:
             conn.rollback()
             raise

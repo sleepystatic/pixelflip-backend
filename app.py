@@ -683,6 +683,7 @@ def get_db_connection():
                 ensure_listing_uniqueness_per_user,
                 ensure_priority_term_columns,
                 ensure_term_interval_column,
+                ensure_scraper_state_table,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
@@ -691,6 +692,7 @@ def get_db_connection():
             ensure_listing_uniqueness_per_user(conn)
             ensure_priority_term_columns(conn)
             ensure_term_interval_column(conn)
+            ensure_scraper_state_table(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn

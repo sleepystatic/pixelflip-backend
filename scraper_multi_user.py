@@ -227,7 +227,8 @@ def get_db_connection():
         raise last_err if last_err else Exception('Database connection failed')
     try:
         from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
-                               ensure_priority_term_columns, ensure_term_interval_column)
+                               ensure_priority_term_columns, ensure_term_interval_column,
+                               ensure_scraper_state_table)
         ensure_buyer_delivery_columns(conn)
         # save_listing lives in this module and targets ON CONFLICT (user_id, link),
         # so the matching index has to be guaranteed on the scraper's own
@@ -242,6 +243,9 @@ def get_db_connection():
         # this and every cycle dies on UndefinedColumn, which surfaces as a
         # scanner that says "armed" and then never scrapes anything.
         ensure_term_interval_column(conn)
+        # Mercari's captured bearer lives here so one capture serves every
+        # instance — and so a machine with no room for Chrome can still scrape.
+        ensure_scraper_state_table(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -2763,6 +2767,25 @@ def _mercari_chrome_kwargs(bundled=False):
 #   * The call must come from INSIDE the page. Mercari 403s /v1/api for a plain
 #     request — it is checking the session cookie, the Cloudflare clearance and
 #     Chromium's TLS fingerprint, none of which a `requests` call has.
+#
+#     ...which is true of `requests`, but NOT of a client that impersonates
+#     Chrome's TLS handshake. Measured 2026-08-13, same URL, same moment, with
+#     the same captured bearer, the same headers and the same 11 profile cookies
+#     including a live cf_clearance:
+#
+#         in-page   page.evaluate()      : HTTP 200, 28 items
+#         requests  direct / via proxy   : HTTP 403, 'Just a moment...' (12 KB)
+#         curl_cffi direct               : HTTP 200, 28 items, 0.2s
+#         curl_cffi via proxy            : HTTP 200, 28 items, 1.4s
+#
+#     The gate is the TLS FINGERPRINT ALONE — not the cookies, not the token.
+#     That is what _mercari_fetch_browserless exploits: the REPLAY needs no
+#     browser, only a client that handshakes like Chrome. A browser is still
+#     required once per TTL to mint the bearer, because that comes from
+#     Mercari's app JS and cannot be requested directly.
+#
+#     Do not retry plain requests/httpx here — they fail on the handshake, long
+#     before any header you could add matters.
 #   * The persistent profile already holds cf_clearance, so the bootstrap can be
 #     robots.txt (0.8 KB) rather than a search page.
 #   * `authorization: Bearer <jwt>` is NOT in any cookie or localStorage — it
@@ -2797,59 +2820,164 @@ _MERCARI_API_LOCK = threading.Lock()
 _MERCARI_API_COOLDOWN_UNTIL = 0.0
 
 
-def _mercari_ctx_cache_path():
-    import tempfile
-    return os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_ctx.json')
+def _mercari_ctx_state_key():
+    """Overridable so a test never clobbers the live captured token."""
+    return (os.getenv('MERCARI_CTX_STATE_KEY') or 'mercari_api_ctx').strip()
 
 
 def _persist_mercari_ctx(ctx):
-    """Save the captured search context so a restart skips the capture render."""
+    """
+    Store the captured search context in the database.
+
+    In Postgres rather than a file because Render instances do not share a disk,
+    so a per-instance file meant a per-instance capture — and because the point
+    of shared storage here is that the capture can run somewhere else entirely.
+    A box with no room for Chrome can scrape Mercari all week off a token minted
+    on a laptop or a CI runner. See capture_mercari_token.py.
+    """
     if not _env_flag('MERCARI_PERSIST_CTX', True) or not ctx:
         return
-    path = _mercari_ctx_cache_path()
+    conn = cursor = None
     try:
-        tmp = f'{path}.{os.getpid()}.tmp'
-        with open(tmp, 'w') as f:
-            json.dump({'stamp': time.time(), 'ctx': ctx}, f)
-        # Atomic: a concurrent worker must never read half a file, which is the
-        # bug that silently emptied the city cache (see _save_city_cache).
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+        conn = get_db_connection()
+        if not conn:
+            return
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO scraper_state (key, value, updated_at) "
+            "VALUES (%s, %s::jsonb, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+            "updated_at = EXCLUDED.updated_at;",
+            (_mercari_ctx_state_key(),
+             json.dumps({'stamp': time.time(), 'ctx': ctx})),
+        )
+        conn.commit()
     except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        # Never fatal: a context we cannot store still works for this process.
         print(f"[mercari] could not persist search context: {e}", flush=True)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _mercari_token_expiry(ctx):
+    """
+    When the captured bearer actually stops working — read from the token itself.
+
+    It is a JWT: base64url header.payload.signature, and the payload carries an
+    `exp` claim. Decoded 2026-08-13, Mercari issues these with a 10,080-minute
+    (SEVEN DAY) life. Guessing a cache TTL was throwing a perfectly good token
+    away and paying a ~1GB browser capture to mint an identical one.
+
+    Reading `exp` is not trusting the token — we never validate its signature or
+    act on its contents. It is a hint about when to refresh, and a wrong answer
+    costs one 403 and one re-capture.
+
+    Returns an epoch, or None when the token is not a readable JWT.
+    """
+    import base64
+    try:
+        tok = ((ctx or {}).get('headers') or {}).get('authorization') or ''
+        tok = tok.replace('Bearer ', '').strip()
+        parts = tok.split('.')
+        if len(parts) != 3:
+            return None
+        seg = parts[1]
+        body = json.loads(base64.urlsafe_b64decode(seg + '=' * (-len(seg) % 4)))
+        exp = body.get('exp')
+        return float(exp) if exp else None
+    except Exception:
+        return None
 
 
 def _load_persisted_mercari_ctx():
     """A recently captured context from disk, or None if absent/stale/unusable."""
     if not _env_flag('MERCARI_PERSIST_CTX', True):
         return None
+    # A CAP, not the real gate. The token's own `exp` decides below; this only
+    # stops a context living forever if the JWT is ever unreadable. Six hours
+    # because erring long is the cheap direction — being wrong costs one 403 and
+    # one re-capture, while being conservative costs a ~1GB browser launch.
     try:
-        ttl = int(os.getenv('MERCARI_CTX_TTL_SEC', '1800'))
+        ttl = int(os.getenv('MERCARI_CTX_TTL_SEC', '21600'))
     except ValueError:
-        ttl = 1800
+        ttl = 21600
+    conn = cursor = None
     try:
-        path = _mercari_ctx_cache_path()
-        if not os.path.isfile(path):
+        conn = get_db_connection()
+        if not conn:
             return None
-        with open(path) as f:
-            payload = json.load(f)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM scraper_state WHERE key = %s;",
+                       (_mercari_ctx_state_key(),))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        payload = row[0]
+        # psycopg2 decodes jsonb to dict already; tolerate a text column too.
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            return None
         age = time.time() - float(payload.get('stamp') or 0)
         if age > max(0, ttl):
             return None
         ctx = payload.get('ctx') or None
-        # A truncated or half-written file must not become a broken context that
-        # fails every replay until the TTL expires.
-        if not (isinstance(ctx, dict) and ctx.get('headers') and ctx.get('variables')
-                and ctx.get('ext')):
+        # The token's own expiry outranks the cap. Refresh a few minutes early
+        # rather than discovering expiry as a mid-scrape 403.
+        exp = _mercari_token_expiry(ctx)
+        if exp is not None:
+            try:
+                margin = int(os.getenv('MERCARI_CTX_RENEW_MARGIN_SEC', '300'))
+            except ValueError:
+                margin = 300
+            if time.time() >= exp - max(0, margin):
+                _emit(f"[mercari] persisted bearer expires in "
+                      f"{int((exp - time.time()) / 60)} min — re-capturing", 'info')
+                return None
+        # A hand-edited or partially written row must not become a broken context
+        # that fails every replay until the cap expires.
+        if not (isinstance(ctx, dict)
+                and isinstance(ctx.get('headers'), dict) and ctx['headers']
+                and isinstance(ctx.get('variables'), dict) and ctx['variables']
+                and isinstance(ctx.get('ext'), str) and ctx['ext']):
             return None
-        _emit(f"[mercari] reusing persisted search context ({int(age)}s old) — "
-              "skipping the capture render", 'info')
+        _emit(f"[mercari] reusing stored search context ({int(age / 60)} min old, "
+              f"expires in {int((exp - time.time()) / 3600)}h) — no capture render"
+              if exp else
+              f"[mercari] reusing stored search context ({int(age / 60)} min old) "
+              "— no capture render", 'info')
         return ctx
-    except Exception:
+    except Exception as e:
+        # Not fatal — the caller falls through to a browser capture. Say so
+        # anyway: a missing table or a permissions problem would otherwise look
+        # like "Mercari is just slow" forever.
+        print(f"[mercari] could not read stored search context: {e}", flush=True)
         return None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # Cross-user batching
@@ -3019,6 +3147,14 @@ def _mercari_api_capture(page, term='ds lite'):
             pass
 
     if captured.get('headers') and captured.get('variables'):
+        # Cookies ride along with the context so the browserless replay can
+        # present the same cf_clearance this page load earned. Best-effort: a
+        # context without them still works through the in-page path.
+        try:
+            captured['cookies'] = {c['name']: c['value']
+                                   for c in page.context.cookies()}
+        except Exception:
+            captured['cookies'] = {}
         _emit("[mercari] captured searchFacetQuery context", 'info')
         return captured
 
@@ -3046,6 +3182,12 @@ def _mercari_api_capture(page, term='ds lite'):
 def _mercari_api_url(ctx, term, length):
     """searchFacetQuery URL for one term, with the payload trimmed to what we use."""
     variables = json.loads(json.dumps(ctx['variables']))     # deep copy
+    # `variables` used to arrive only from a live capture and was always a dict.
+    # It can now come off disk (persisted context), so a truncated or hand-edited
+    # file must return None like any other unusable shape rather than raising
+    # AttributeError out of the middle of a scrape.
+    if not isinstance(variables, dict):
+        return None
     criteria = variables.get('criteria')
     if not isinstance(criteria, dict):
         return None
@@ -3102,6 +3244,91 @@ def _mercari_items_from_api(payload):
     return out
 
 
+def _mercari_fetch_browserless(terms, max_rows, ctx=None):
+    """
+    Replay searchFacetQuery over plain HTTP, with no browser in the process.
+
+    Works because Cloudflare's gate here is the TLS handshake, not the headers —
+    curl_cffi reproduces Chrome's. Measured 2026-08-13: HTTP 200 and 28 items in
+    0.2s direct / 1.4s through the residential proxy, where `requests` with the
+    identical bearer, headers and cf_clearance got HTTP 403.
+
+    Returns (results, error). The caller falls back to the browser session on any
+    error, so an expired token or a rotated persisted-query hash costs one cheap
+    attempt rather than a failure.
+    """
+    try:
+        from curl_cffi import requests as cffi
+    except ImportError as e:
+        return {}, f'curl_cffi not installed ({e})'
+
+    ctx = ctx or _MERCARI_API_CTX or _load_persisted_mercari_ctx()
+    if not (ctx and ctx.get('headers') and ctx.get('variables') and ctx.get('ext')):
+        return {}, 'no captured context to replay'
+
+    # Chrome's TLS signature, not its User-Agent. Pinned loosely on purpose:
+    # curl_cffi retires old profile names, and 'chrome' tracks its newest.
+    imp = (os.getenv('MERCARI_TLS_IMPERSONATE') or 'chrome').strip()
+    try:
+        timeout_s = int(os.getenv('MERCARI_HTTP_TIMEOUT_SEC', '45'))
+    except ValueError:
+        timeout_s = 45
+
+    proxies = None
+    px = _get_proxy('mercari')
+    if px:
+        n = _normalize_proxy(px)
+        proxies = {'http': n, 'https': n}
+
+    results = {}
+    # A Session rather than bare gets. Measured 2026-08-13, the captured jar
+    # holds credentials on wildly different clocks: cf_clearance 365 days and
+    # the bearer 7 days, but mercarius_session ~14 minutes and __cf_bm ~27,
+    # with Cloudflare rotating the latter on its responses. A jar that is never
+    # updated therefore goes stale WHILE we are actively using it, and the next
+    # cycle pays a ~1GB browser capture to rebuild a session we could simply
+    # have kept alive.
+    with cffi.Session() as sess:
+        try:
+            sess.cookies.update(ctx.get('cookies') or {})
+        except Exception:
+            pass
+        for term in terms:
+            url = _mercari_api_url(ctx, term, max_rows)
+            if not url:
+                return results, 'unexpected variables shape'
+            try:
+                r = sess.get(url, headers=ctx.get('headers') or {},
+                             proxies=proxies, impersonate=imp, timeout=timeout_s)
+            except Exception as e:
+                return results, f'browserless replay failed: {type(e).__name__}: {e}'
+            _record_bytes('mercari', len(r.content or b''))
+            if r.status_code != 200:
+                # 403 is the Cloudflare challenge page: the clearance or the
+                # token aged out. The browser path re-earns both, so this is a
+                # fall-through, not an error worth alarming on.
+                return results, f'browserless replay HTTP {r.status_code}'
+            try:
+                payload = r.json()
+            except Exception:
+                return results, 'browserless replay returned non-JSON'
+            if payload.get('errors'):
+                return results, 'browserless replay returned GraphQL errors'
+            results[term] = _mercari_items_from_api(payload)
+
+        # Hand the renewed jar back so the caller can persist it.
+        refreshed = {}
+        try:
+            jar = getattr(sess.cookies, 'jar', None)
+            refreshed = ({c.name: c.value for c in jar} if jar is not None
+                         else dict(sess.cookies))
+        except Exception:
+            refreshed = {}
+        if refreshed:
+            ctx['cookies'] = {**(ctx.get('cookies') or {}), **refreshed}
+    return results, None
+
+
 def _mercari_fetch_via_api(terms, max_rows):
     """
     Search Mercari for several terms, retrying on bundled Chromium if needed.
@@ -3118,7 +3345,40 @@ def _mercari_fetch_via_api(terms, max_rows):
     it costs one extra attempt and can only turn a failure into a success — but
     it is no longer evidence of anything about shared libraries.
     """
-    global _MERCARI_API_COOLDOWN_UNTIL
+    global _MERCARI_API_CTX, _MERCARI_API_COOLDOWN_UNTIL
+
+    # Browserless FIRST, and deliberately ahead of the cooldown check: it launches
+    # no browser, so there is nothing here for the cooldown to protect. When a
+    # persisted context is still good this also rescues a process that would
+    # otherwise sit out the full back-off doing nothing at all.
+    if _env_flag('MERCARI_BROWSERLESS_REPLAY', True):
+        ctx0 = _MERCARI_API_CTX or _load_persisted_mercari_ctx()
+        if ctx0:
+            jar_before = dict(ctx0.get('cookies') or {})
+            items0, err0 = _mercari_fetch_browserless(terms, max_rows, ctx0)
+            if not err0 and items0:
+                with _MERCARI_API_LOCK:
+                    if _MERCARI_API_CTX is None:
+                        _MERCARI_API_CTX = ctx0
+                # Write back only when the jar actually moved. Cloudflare rotates
+                # __cf_bm often but not on every response, and this runs every
+                # cycle — no reason to rewrite an unchanged file each time.
+                if (ctx0.get('cookies') or {}) != jar_before:
+                    _persist_mercari_ctx(ctx0)
+                return items0, None
+            _emit(f"[mercari] browserless replay unavailable ({err0}) — "
+                  "falling back to a browser session")
+
+    # Hard guard for hosts that cannot afford a capture. The browser paths below
+    # peak at ~1GB, which does not fit a 512MB instance and takes Flask down with
+    # it. Setting MERCARI_ALLOW_CAPTURE=0 there makes that structurally
+    # impossible: the box replays a token minted elsewhere (see
+    # capture_mercari_token.py) and, if there is no usable token, skips Mercari
+    # with a reason instead of OOM-ing the whole service to discover it.
+    if not _env_flag('MERCARI_ALLOW_CAPTURE', True):
+        return {}, ('no usable stored token and MERCARI_ALLOW_CAPTURE=0 — this '
+                    'host does not mint tokens; run capture_mercari_token.py '
+                    'somewhere with memory')
 
     # Check the cooldown HERE and return without touching it. Doing this inside
     # the session made "in cooldown" look like a fresh failure: the caller then
