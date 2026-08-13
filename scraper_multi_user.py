@@ -3816,9 +3816,19 @@ def _load_city_cache():
             _CITY_CACHE = {}
 
 
-def _save_city_cache():
+_CITY_CACHE_DIRTY = False
+_CITY_CACHE_LAST_SAVE = 0.0
+
+
+def _save_city_cache(force=False):
     """
     Persist the geocode cache. Safe to call from several scrapes at once.
+
+    Debounced. This used to rewrite the whole file on EVERY cache miss, so a
+    term returning 49 listings in unfamiliar cities did 49 full serialise +
+    write + rename cycles on top of 49 Nominatim round trips. Now it writes at
+    most once every CITY_CACHE_SAVE_INTERVAL_SEC, and the data is only a cache —
+    losing the last few seconds of it costs one re-geocode, not correctness.
 
     Two separate hazards above one worker, both fixed here:
       * open(path,'w') truncates before writing, so a second writer starting
@@ -3829,7 +3839,18 @@ def _save_city_cache():
     Snapshot under the lock, then write to a temp file and rename, so a reader
     only ever sees a complete file.
     """
+    global _CITY_CACHE_DIRTY, _CITY_CACHE_LAST_SAVE
     with _CITY_CACHE_LOCK:
+        _CITY_CACHE_DIRTY = True
+        try:
+            interval = float(os.getenv('CITY_CACHE_SAVE_INTERVAL_SEC', '20'))
+        except ValueError:
+            interval = 20.0
+        if not force and (time.time() - _CITY_CACHE_LAST_SAVE) < interval:
+            return
+        _CITY_CACHE_LAST_SAVE = time.time()
+        _CITY_CACHE_DIRTY = False
+
         snapshot = {k: list(v) if v else None for k, v in _CITY_CACHE.items()}
         tmp = f'{_CITY_CACHE_PATH}.{os.getpid()}.tmp'
         try:
@@ -3842,6 +3863,29 @@ def _save_city_cache():
                     os.remove(tmp)
             except Exception:
                 pass
+
+
+_GEOCODE_LOCAL = threading.local()
+
+
+def reset_geocode_budget():
+    """Called at the start of each user's scrape."""
+    _GEOCODE_LOCAL.spent = 0
+
+
+def _geocode_budget_spent():
+    """True once this scrape has used its allowance of new-city lookups."""
+    try:
+        budget = int(os.getenv('GEOCODE_MAX_PER_SCRAPE', '12'))
+    except ValueError:
+        budget = 12
+    if budget <= 0:
+        return False                      # 0 disables the cap
+    spent = getattr(_GEOCODE_LOCAL, 'spent', 0)
+    if spent >= budget:
+        return True
+    _GEOCODE_LOCAL.spent = spent + 1
+    return False
 
 
 def city_to_latlon(city_state):
@@ -3858,6 +3902,20 @@ def city_to_latlon(city_state):
     _load_city_cache()
     if key in _CITY_CACHE:
         return _CITY_CACHE[key]
+
+    # Budget the misses. Nominatim's courtesy limit is 1 request/second, so each
+    # unknown city costs ~1.05s of pure sleep — and a broad term like "iphone 14"
+    # returns ~50 listings across ~40 unfamiliar cities. Measured in production
+    # 2026-08-12: two such terms added 44s and 40s to a single OfferUp run,
+    # making geocoding the largest cost on the platform.
+    #
+    # A miss returns None and the CALLER KEEPS THE LISTING (unknown city is
+    # never a reason to drop one), so exhausting the budget degrades distance
+    # filtering slightly for this scrape rather than losing results. The cache is
+    # permanent, so each scrape resolves a few more and the budget stops binding
+    # once a user's metro is covered.
+    if _geocode_budget_spent():
+        return None
     coords = None
     try:
         r = requests.get(
@@ -5285,6 +5343,9 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             )
         return False
 
+    # Fresh allowance of new-city geocodes for this scrape — see city_to_latlon.
+    reset_geocode_budget()
+
     stats = {'candidates': 0, 'saved': 0, 'seen_or_link': 0,
              'fingerprint': 0, 'recent_dupe': 0, 'delivery': 0}
     new_listings = []
@@ -5596,6 +5657,20 @@ def main(log_callback=None, health_callback=None):
                         if mc_err:
                             print(f"  ⚠ Mercari shared fetch failed ({mc_err}) — "
                                   "users will fetch individually", flush=True)
+                            # Also tell the affected users. This ran in the
+                            # scheduler, so its only output was the server's
+                            # stdout — which meant the dashboard showed the
+                            # resulting cooldown but never the reason for it,
+                            # and the actual failure was invisible without
+                            # Render log access.
+                            if log_callback:
+                                for cfg in due:
+                                    try:
+                                        log_callback(cfg['user_id'],
+                                                     f"Mercari unavailable: {mc_err[:160]}",
+                                                     'error')
+                                    except Exception:
+                                        pass
                         else:
                             print(f"  🛒 Mercari: {n} unique term(s) fetched once for "
                                   f"{len(due)} user(s)", flush=True)
