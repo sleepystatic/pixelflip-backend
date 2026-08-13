@@ -2694,6 +2694,24 @@ def _patchright_clean_ua():
     return _PATCHRIGHT_UA_CACHE
 
 
+# Chrome flags that shrink the capture render's process tree. Each one removes
+# a helper process or a buffer we never read; none of them changes what the page
+# renders, so listing counts are unaffected. Enabled with MERCARI_LOWMEM=1.
+_MERCARI_LOWMEM_ARGS = [
+    '--renderer-process-limit=1',      # one renderer instead of one per frame
+    '--disable-gpu',                   # drops the GPU process entirely
+    '--disable-software-rasterizer',
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--mute-audio',
+    # We already block image REQUESTS; this also stops Blink allocating decode
+    # buffers for anything that slips through (data: URIs, CSS backgrounds).
+    '--blink-settings=imagesEnabled=false',
+    '--js-flags=--max-old-space-size=128',
+]
+
+
 def _mercari_chrome_kwargs(bundled=False):
     """
     How to reach real Chrome: by channel, or by explicit path.
@@ -2755,9 +2773,18 @@ def _mercari_chrome_kwargs(bundled=False):
 #   facetTypes: []  200KB -> 138KB   (category/brand/price filter UI we never read)
 #   length: 40      138KB ->  55KB   (MERCARI_MAX_ROWS_PER_TERM is 30)
 #
-# The captured token is kept in memory ONLY. It is a session credential, and
-# writing it next to the source would put a live bearer token on disk for no
-# benefit — a restart needs a fresh capture regardless, since it expires.
+# The token used to be kept in memory ONLY, on the reasoning that a restart
+# needs a fresh capture anyway because it expires. MEASURED 2026-08-13 and that
+# is wrong: a context written to disk and reloaded in a FRESH process returned
+# the same 56 listings for two terms at 7.9 KB and 6.3s, against 3,063 KB and
+# 15.9s for the same run when it had to capture. The capture render IS Mercari's
+# bandwidth — everything else is already 4 KB per term.
+#
+# It is still a live session credential on disk, which is why it is TTL-bounded
+# and written 0600 to the temp dir rather than beside the source. That is the
+# same tradeoff already accepted for the persistent Chrome profile, which holds
+# cf_clearance — an equivalent credential — for exactly the same reason.
+# Staleness is free: a 401/403 triggers the existing single re-capture.
 # ---------------------------------------------------------------------------
 
 _MERCARI_API_CTX = None            # {'headers': {...}, 'variables': {...}, 'ext': str}
@@ -2768,6 +2795,61 @@ _MERCARI_API_LOCK = threading.Lock()
 # navigation timeout every single cycle BEFORE falling back — which is how a
 # broken platform ends up delaying every working one behind it.
 _MERCARI_API_COOLDOWN_UNTIL = 0.0
+
+
+def _mercari_ctx_cache_path():
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), 'pixelflip_mercari_ctx.json')
+
+
+def _persist_mercari_ctx(ctx):
+    """Save the captured search context so a restart skips the capture render."""
+    if not _env_flag('MERCARI_PERSIST_CTX', True) or not ctx:
+        return
+    path = _mercari_ctx_cache_path()
+    try:
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'stamp': time.time(), 'ctx': ctx}, f)
+        # Atomic: a concurrent worker must never read half a file, which is the
+        # bug that silently emptied the city cache (see _save_city_cache).
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[mercari] could not persist search context: {e}", flush=True)
+
+
+def _load_persisted_mercari_ctx():
+    """A recently captured context from disk, or None if absent/stale/unusable."""
+    if not _env_flag('MERCARI_PERSIST_CTX', True):
+        return None
+    try:
+        ttl = int(os.getenv('MERCARI_CTX_TTL_SEC', '1800'))
+    except ValueError:
+        ttl = 1800
+    try:
+        path = _mercari_ctx_cache_path()
+        if not os.path.isfile(path):
+            return None
+        with open(path) as f:
+            payload = json.load(f)
+        age = time.time() - float(payload.get('stamp') or 0)
+        if age > max(0, ttl):
+            return None
+        ctx = payload.get('ctx') or None
+        # A truncated or half-written file must not become a broken context that
+        # fails every replay until the TTL expires.
+        if not (isinstance(ctx, dict) and ctx.get('headers') and ctx.get('variables')
+                and ctx.get('ext')):
+            return None
+        _emit(f"[mercari] reusing persisted search context ({int(age)}s old) — "
+              "skipping the capture render", 'info')
+        return ctx
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Cross-user batching
@@ -3097,6 +3179,19 @@ def _mercari_api_session(terms, max_rows, bundled=False):
         args.insert(0, '--headless=new')
     if _env_flag('MERCARI_CONTAINER_FLAGS', not sys.platform.startswith('win')):
         args += ['--no-sandbox', '--disable-dev-shm-usage']
+    # Mercari's cost is MEMORY, not bandwidth — the search API is already 4.1KB
+    # per term, but the capture render spawns a full Chrome process tree that
+    # measured 1,125MB peak against a 512MB instance. These collapse it.
+    # --single-process is deliberately NOT here: it is the biggest single saving
+    # and also a well-known automation signal, so it belongs in
+    # MERCARI_CHROME_ARGS where it is an explicit, measured choice.
+    if _env_flag('MERCARI_LOWMEM', False):
+        args += _MERCARI_LOWMEM_ARGS
+    # Free-form escape hatch, space separated, so a box can be tuned from the
+    # environment without a deploy.
+    extra = (os.getenv('MERCARI_CHROME_ARGS') or '').strip()
+    if extra:
+        args += [a for a in extra.split() if a]
     args.append(f'--user-agent={clean_ua}')
 
     launch_kwargs = dict(headless=False, no_viewport=True, args=args,
@@ -3132,14 +3227,21 @@ def _mercari_api_session(terms, max_rows, bundled=False):
                 with _MERCARI_API_LOCK:
                     api_ctx = _MERCARI_API_CTX
                     if api_ctx is None:
-                        api_ctx = _mercari_api_capture(page)
-                        if not api_ctx:
-                            # Cooldown is the CALLER's decision — setting it here
-                            # would make a real-Chrome failure block the bundled
-                            # Chromium retry that is meant to rescue it.
-                            return {}, 'could not capture searchFacetQuery context'
+                        # Disk before browser. A process restart otherwise pays a
+                        # full capture render, and on a small instance restarts
+                        # are routine — that render is 3MB and the entire reason
+                        # Mercari costs more than 4KB per term.
+                        api_ctx = _load_persisted_mercari_ctx()
+                        if api_ctx is None:
+                            api_ctx = _mercari_api_capture(page)
+                            if not api_ctx:
+                                # Cooldown is the CALLER's decision — setting it
+                                # here would make a real-Chrome failure block the
+                                # bundled Chromium retry meant to rescue it.
+                                return {}, 'could not capture searchFacetQuery context'
+                            captured_here = True
+                            _persist_mercari_ctx(api_ctx)
                         _MERCARI_API_CTX = api_ctx
-                        captured_here = True
 
             if not captured_here:
                 # Capturing already left this page on a Mercari search URL. If we
@@ -3181,6 +3283,9 @@ def _mercari_api_session(terms, max_rows, bundled=False):
                         api_ctx = fresh
                         with _MERCARI_API_LOCK:
                             _MERCARI_API_CTX = fresh
+                        # Re-persist, or every process would keep reloading the
+                        # dead token from disk and re-capturing it in turn.
+                        _persist_mercari_ctx(fresh)
                         url = _mercari_api_url(api_ctx, term, max_rows) or url
                         continue
                     return results, f"api replay HTTP {res.get('status')}"
