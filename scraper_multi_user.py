@@ -1297,7 +1297,15 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                 soup = BeautifulSoup(response.content, 'html.parser')
                 items = soup.find_all('li', class_='cl-static-search-result')
                 if debug and log_callback:
-                    log_callback(user_id, f"Craigslist {subdomain} '{term}': scanned {len(items)} rows", "info")
+                    # Say when the row cap bit. "scanned 284 rows" followed by
+                    # "29 skipped on title" does not add up for anyone reading
+                    # it — 255 rows went unmentioned because only the newest
+                    # CRAIGSLIST_MAX_ROWS_PER_TERM are ever considered.
+                    kept = min(len(items), max(1, cl_max_rows))
+                    detail = (f"{len(items)} rows found, newest {kept} considered"
+                              if len(items) > kept else f"scanned {len(items)} rows")
+                    log_callback(user_id,
+                                 f"Craigslist {subdomain} '{term}': {detail}", "info")
 
                 # PASS 1 — everything decidable without a network call.
                 # Each survivor costs a detail page, so every filter that can run
@@ -4121,30 +4129,129 @@ def term_interval_minutes(term_cfg, user_cfg):
     return max(every, floor)
 
 
+def _container_memory_mb():
+    """
+    Memory available to THIS process, or None if it cannot be determined.
+
+    cgroup first, /proc/meminfo last: inside a container /proc/meminfo reports
+    the HOST's memory, which on a 512MB Render instance reads as tens of
+    gigabytes and would justify a worker count that OOMs instantly.
+    """
+    for path in ('/sys/fs/cgroup/memory.max',                      # cgroup v2
+                 '/sys/fs/cgroup/memory/memory.limit_in_bytes'):   # cgroup v1
+        try:
+            with open(path) as f:
+                raw = (f.read() or '').strip()
+            if raw and raw != 'max':
+                v = int(raw)
+                # v1 reports a huge sentinel rather than 'max' when unlimited.
+                if 0 < v < (1 << 62):
+                    return v / (1024 * 1024)
+        except Exception:
+            continue
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return None
+
+
+def memory_capped_workers():
+    """
+    The most concurrent scrapes this box's RAM can actually hold, or None when
+    the limit is unknown (Windows dev machines) and the operator's setting stands.
+
+    SCRAPE_MAX_WORKERS defaults to 3 while a 512MB instance fits exactly ONE
+    scrape. That mismatch is invisible with a single user — workers is
+    min(setting, len(due)), so it stays 1 — and becomes an OOM the first time two
+    users come due together. Since an OOM kills Flask too, the dashboard goes
+    down with the scraper, which is a spectacularly confusing way to learn you
+    have a second user.
+
+    The arithmetic is the one already documented at the call site:
+    (RAM - reserve) / peak-per-scrape, using the 2026-08-11 measurements.
+    """
+    ram = _container_memory_mb()
+    if not ram:
+        return None
+    try:
+        reserve = float(os.getenv('SCRAPE_MEMORY_RESERVE_MB', '200'))
+    except ValueError:
+        reserve = 200.0
+    default_peak = 206.0 if _env_flag('FB_LEAN_FETCH', False) else 455.0
+    try:
+        peak = float(os.getenv('SCRAPE_PEAK_MB_PER_WORKER', str(default_peak)))
+    except ValueError:
+        peak = default_peak
+    if peak <= 0:
+        return None
+    # Always at least 1: refusing to scrape at all is worse than risking the box,
+    # and a single scrape is what the operator implicitly asked for by deploying.
+    return max(1, int((ram - reserve) // peak))
+
+
+def coalesce_window_sec():
+    """
+    How far ahead a due scrape sweeps up terms that are nearly due.
+
+    Default 120s because a scrape takes roughly that long: a term coming due
+    inside the window would otherwise start a SECOND full run — another
+    Craigslist wake-up, another Playwright launch for OfferUp, another Facebook
+    session — for one extra term. Observed 2026-08-13: three terms on staggered
+    clocks produced three separate scrapes, one of which spent two minutes of
+    browser startup on a single term.
+    """
+    try:
+        return max(0, int(os.getenv('SCRAPE_COALESCE_WINDOW_SEC', '120')))
+    except ValueError:
+        return 120
+
+
 def due_terms_for_user(search_terms, user_cfg, now=None):
     """
     Split a user's terms into (due_now, next_due_epoch).
 
-    The scheduler used to ask one question per user. With priority terms a user
-    can be due for their 5-minute terms and not their 15-minute ones, so the
-    question moves to the term and the user is due when ANY term is.
+    A user is due when ANY term is. Once one term has triggered a scrape, terms
+    coming due within coalesce_window_sec() ride along, because the browser
+    startup they would otherwise pay for is already being paid.
 
-    Returns the terms to scrape this cycle and, when nothing is due, the epoch
-    of the soonest one, so the caller can report a real countdown instead of
-    going quiet.
+    Coalescing also RE-PHASES terms. Adding a term mid-cooldown gives it a NULL
+    last_scraped_at, so it fires immediately and lands permanently out of step
+    with the rest; sweeping neighbours in gives them a shared stamp and they stay
+    together afterwards.
+
+    A term is never pulled in by more than the window, so the acceleration is
+    bounded and small: a 60-minute term swept 2 minutes early settles at ~58
+    minutes, while two 5-minute terms simply lock into the same phase and keep
+    their 5 minutes. It can never scan anything faster than the window allows.
+
+    Returns the terms to scrape and, when some are held back, the epoch of the
+    soonest of THOSE, so the caller can report a real countdown.
     """
     now = now or time.time()
-    due = {}
-    soonest = None
+    ready_at = {}
     for term, cfg in (search_terms or {}).items():
         interval_s = term_interval_minutes(cfg, user_cfg) * 60
         last = float((cfg or {}).get('last_scraped_ts') or 0.0)
-        ready_at = last + interval_s
-        if now >= ready_at:
-            due[term] = cfg
-        elif soonest is None or ready_at < soonest:
-            soonest = ready_at
-    return due, soonest
+        ready_at[term] = last + interval_s
+    if not ready_at:
+        return {}, None
+
+    due = {t: search_terms[t] for t, r in ready_at.items() if now >= r}
+    if not due:
+        # Nothing due: report the soonest so the console can count down to it.
+        return {}, min(ready_at.values())
+
+    horizon = now + coalesce_window_sec()
+    for t, r in ready_at.items():
+        if t not in due and r <= horizon:
+            due[t] = search_terms[t]
+
+    held = [r for t, r in ready_at.items() if t not in due]
+    return due, (min(held) if held else None)
 
 
 def stamp_terms_scraped(user_id, terms):
@@ -5710,7 +5817,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         log_callback(
             user_id,
             f"Scanning {len(search_terms)} of {len(all_terms)} terms "
-            f"({held} not due yet on the standard interval).",
+            f"({held} not due yet — each term has its own rate).",
             'info',
         )
 
@@ -6156,7 +6263,19 @@ def main(log_callback=None, health_callback=None):
                     max_workers = max(1, int(os.getenv('SCRAPE_MAX_WORKERS', '3')))
                 except ValueError:
                     max_workers = 3
+                # Clamp to what the box can actually hold. The default of 3 is
+                # right for a 2GB machine and fatal on 512MB, and the difference
+                # only shows up once TWO users are due at the same moment — so
+                # without this the setting looks fine right up until the day it
+                # takes the service down.
+                mem_cap = memory_capped_workers()
                 workers = min(max_workers, len(due))
+                if mem_cap is not None and workers > mem_cap:
+                    print(f"  ⚠ SCRAPE_MAX_WORKERS={max_workers} but this box holds "
+                          f"{mem_cap} concurrent scrape(s) — running {mem_cap}. "
+                          f"Users queue instead of the process being OOM-killed.",
+                          flush=True)
+                    workers = mem_cap
                 print(f"  ▶ {len(due)} user(s) due — running {workers} at a time", flush=True)
 
                 with ThreadPoolExecutor(max_workers=workers,

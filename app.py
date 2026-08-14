@@ -46,13 +46,16 @@ if _dsns:
 try:
     # is_user_scraping() applies the staleness guard; reading SCRAPING_USERS
     # directly would report a hung scrape as still running forever.
-    from scraper_multi_user import SCRAPING_USERS, is_user_scraping, set_user_scraping
+    from scraper_multi_user import (SCRAPING_USERS, is_user_scraping, set_user_scraping,
+                                    coalesce_window_sec)
 except Exception:
     SCRAPING_USERS = {}
     def is_user_scraping(_uid):
         return False
     def set_user_scraping(_uid, _active):
         pass
+    def coalesce_window_sec():
+        return 120
 
 # Health check tracking (set by scraper thread)
 _health_last_scraper_cycle = None
@@ -379,6 +382,45 @@ def _sanitize_term_interval(value, tier):
     return v if v in allowed else DEFAULT_TERM_INTERVAL_MINUTES
 
 
+def _term_due_map(conn, user_id, tier):
+    """
+    When each of this user's terms next comes due, as {term: epoch}.
+
+    Shared by /api/status (the countdown) and /api/start (the armed message), so
+    the two can never disagree about when the next scan is. They did once: START
+    promised "shortly" while the countdown showed 25 minutes, and the resulting
+    "the scanner is broken" hunt cost most of a session.
+
+    Owns its cursor because callers hold different kinds — /api/start uses tuple
+    rows, /api/status dict rows — and this needs names.
+
+    Mirrors term_interval_minutes() in scraper_multi_user.py: the user's chosen
+    rate, floored by what their plan allows. A countdown that promises a rate the
+    scheduler will not honour is worse than no countdown.
+    """
+    has_fast = _max_priority_terms_for_tier(tier) > 0
+    floor_min = (_interval_floor_for_tier(tier) if has_fast
+                 else _standard_floor_for_tier(tier))
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT search_term, interval_minutes, "
+            "EXTRACT(EPOCH FROM last_scraped_at) AS last_ts "
+            "FROM user_search_terms WHERE user_id = %s;", (user_id,))
+        out = {}
+        for row in cur.fetchall():
+            every = (int(row['interval_minutes'])
+                     if row['interval_minutes'] is not None
+                     else DEFAULT_TERM_INTERVAL_MINUTES)
+            every = max(every, floor_min)
+            # NULL last_scraped_at means never scanned, which is due now.
+            last = float(row['last_ts']) if row['last_ts'] is not None else 0.0
+            out[row['search_term']] = last + every * 60
+        return out
+    finally:
+        cur.close()
+
+
 def _resolve_term_intervals(thresholds_in, tier, max_priority, prev_interval=None):
     """
     Decide every term's stored interval_minutes for a settings save.
@@ -702,6 +744,73 @@ def get_db_connection():
 
 
 
+# Verified-token cache.
+#
+# require_auth asked Supabase to verify on EVERY request, and /api/status polls
+# every 2 seconds per open dashboard — 30 auth round-trips a minute per user
+# before any real work happens. Each adds its own latency to the request and
+# counts against Supabase's auth rate limits, so N friends with the dashboard
+# open is N x 30/min spent purely re-answering the same question.
+#
+# The cost is that a signed-out token keeps working for up to the TTL. A minute
+# is the usual trade and is far shorter than the token's own lifetime.
+#
+# The proper fix is verifying the JWT locally with SUPABASE_JWT_SECRET, which
+# needs no network at all — deliberately not done here because it means adding a
+# JWT library and getting algorithm/audience checks right, which is a bigger
+# change than this problem warrants today.
+_AUTH_CACHE = {}
+_AUTH_CACHE_LOCK = threading.Lock()
+
+
+def _auth_cache_ttl():
+    try:
+        return max(0, int(os.getenv('AUTH_CACHE_TTL_SEC', '60')))
+    except ValueError:
+        return 60
+
+
+def _auth_cache_key(token):
+    """Hashed, so a memory dump or log of this dict is not a pile of credentials."""
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def _auth_cache_get(token):
+    if _auth_cache_ttl() <= 0:
+        return None
+    key = _auth_cache_key(token)
+    now = time.time()
+    with _AUTH_CACHE_LOCK:
+        hit = _AUTH_CACHE.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
+        if hit:
+            _AUTH_CACHE.pop(key, None)
+    return None
+
+
+def _auth_cache_put(token, user_id):
+    ttl = _auth_cache_ttl()
+    if ttl <= 0:
+        return
+    now = time.time()
+    with _AUTH_CACHE_LOCK:
+        # Bounded. An unbounded dict keyed on tokens is a slow memory leak, and
+        # anyone can mint new tokens by logging in repeatedly.
+        if len(_AUTH_CACHE) >= 500:
+            for k, v in list(_AUTH_CACHE.items()):
+                if v[1] <= now:
+                    _AUTH_CACHE.pop(k, None)
+            if len(_AUTH_CACHE) >= 1000:
+                _AUTH_CACHE.clear()
+        _AUTH_CACHE[_auth_cache_key(token)] = (user_id, now + ttl)
+
+
+def _invalidate_auth_cache(token):
+    with _AUTH_CACHE_LOCK:
+        _AUTH_CACHE.pop(_auth_cache_key(token), None)
+
+
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -713,7 +822,16 @@ def require_auth(f):
         if not auth_header or not auth_header.startswith('Bearer '):
             return jsonify({"error": "Missing token"}), 401
 
-        token = auth_header.split(" ")[1]
+        # split(" ")[1] raised IndexError on a bare "Bearer", which the handler
+        # below turned into a 500. A malformed header is a 401.
+        token = auth_header.split(" ", 1)[1].strip()
+        if not token:
+            return jsonify({"error": "Missing token"}), 401
+
+        cached_user = _auth_cache_get(token)
+        if cached_user:
+            return f(cached_user, *args, **kwargs)
+
         try:
             # Ask Supabase directly if the token is valid
             verify_url = f"{SUPABASE_URL}/auth/v1/user"
@@ -722,7 +840,12 @@ def require_auth(f):
                 headers={
                     "Authorization": f"Bearer {token}",
                     "apikey": SUPABASE_ANON_KEY
-                }
+                },
+                # Without this a hung Supabase connection pins the request
+                # forever. Flask's threaded server has a finite worker pool, so
+                # enough of them takes the whole API down — including /health,
+                # which is what a monitor would be watching.
+                timeout=float(os.getenv('AUTH_VERIFY_TIMEOUT_SEC', '10')),
             )
 
             if response.status_code != 200:
@@ -735,9 +858,18 @@ def require_auth(f):
             if not user_id:
                 return jsonify({"error": "User ID not found in token"}), 401
 
+            _auth_cache_put(token, user_id)
+
+        except requests.RequestException as e:
+            # Supabase unreachable is OUR problem, not a bad token. Returning
+            # 401 here would sign every user out on a network blip, because the
+            # dashboard treats 401 as "session expired".
+            print(f"🔒 Auth verification unreachable: {type(e).__name__}: {e}", flush=True)
+            return jsonify({"error": "Auth service unavailable, retrying"}), 503
         except Exception as e:
-            print(f"🔒 Auth Server Error: {str(e)}", flush=True)
-            return jsonify({"error": f"Server auth error: {str(e)}"}), 500
+            # Do not echo the exception to the client; it can carry internals.
+            print(f"🔒 Auth Server Error: {type(e).__name__}: {e}", flush=True)
+            return jsonify({"error": "Server auth error"}), 500
 
         return f(user_id, *args, **kwargs)
 
@@ -986,33 +1118,16 @@ def get_status(user_id):
         next_check_terms = None
         next_check_scope = None
         try:
-            tier_for_terms = _effective_plan_tier(us)
-            has_fast = _max_priority_terms_for_tier(tier_for_terms) > 0
-            cursor.execute(
-                "SELECT search_term, interval_minutes, "
-                "EXTRACT(EPOCH FROM last_scraped_at) AS last_ts "
-                "FROM user_search_terms WHERE user_id = %s;", (user_id,))
-            soonest = None
-            due_at = {}
-            for row in cursor.fetchall():
-                every_min = (int(row['interval_minutes'])
-                             if row['interval_minutes'] is not None
-                             else DEFAULT_TERM_INTERVAL_MINUTES)
-                # The same clamp term_interval_minutes() applies, so the
-                # countdown cannot promise a rate the scheduler will not honour.
-                every_min = max(every_min,
-                                _interval_floor_for_tier(tier_for_terms) if has_fast
-                                else _standard_floor_for_tier(tier_for_terms))
-                ready = ((float(row['last_ts']) if row['last_ts'] is not None else 0.0)
-                         + every_min * 60)
-                due_at[row['search_term']] = ready
-                if soonest is None or ready < soonest:
-                    soonest = ready
-            if soonest is not None:
+            due_at = _term_due_map(conn, user_id, _effective_plan_tier(us))
+            if due_at:
+                soonest = min(due_at.values())
                 next_check_timestamp = soonest
-                # Terms that will be due within a few seconds of the soonest
-                # one ride along in the same scan.
-                next_check_terms = sum(1 for r in due_at.values() if r <= soonest + 5)
+                # Terms due within the coalescing window ride along in the same
+                # scan. Imported rather than re-guessed: this used to assume a
+                # 5-second window while the scheduler used none, so the UI
+                # promised groupings that never happened.
+                next_check_terms = sum(1 for r in due_at.values()
+                                       if r <= soonest + coalesce_window_sec())
                 next_check_scope = ('all terms'
                                     if next_check_terms >= len(due_at)
                                     else f'{next_check_terms} of {len(due_at)} terms')
@@ -1321,9 +1436,30 @@ def handle_settings(user_id):
                       f"{fastest_rate}m cap of {max_priority} — demoted to "
                       f"{DEFAULT_TERM_INTERVAL_MINUTES}m", flush=True)
 
+            # A brand-new term has no last_scraped_at, which makes it due at once:
+            # it fires its own scrape seconds after being added and then sits
+            # permanently out of phase with everything else, so each term ends up
+            # paying its own full browser startup. Give a new term a synthetic
+            # stamp that lands it on the user's NEXT group scan instead.
+            #
+            # A user with no existing terms still scans immediately, which is the
+            # right first-run behaviour — there is no group to join yet.
+            soonest_due = None
+            for t, stamped in prev_scraped.items():
+                if stamped is None:
+                    continue
+                mins = int(prev_interval.get(t) or DEFAULT_TERM_INTERVAL_MINUTES)
+                ready = stamped + timedelta(minutes=mins)
+                if soonest_due is None or ready < soonest_due:
+                    soonest_due = ready
+
             for term, prices in thresholds_in.items():
                 prices = prices or {}
                 every = requested_interval[term]
+                stamp = prev_scraped.get(term)
+                if term not in prev_scraped and soonest_due is not None:
+                    # Due exactly when the rest of the group is.
+                    stamp = soonest_due - timedelta(minutes=every)
                 cursor.execute(
                     "INSERT INTO user_search_terms "
                     "(user_id, search_term, max_price, min_price, is_priority, "
@@ -1334,7 +1470,7 @@ def handle_settings(user_id):
                      # Derived from the interval, and still written so a rollback
                      # to the boolean-reading scheduler marks the right terms.
                      bool(tier_has_fast and every <= fastest_rate),
-                     every, prev_scraped.get(term))
+                     every, stamp)
                 )
 
             # REPLACE Exclusions — all per-term. The DELETE also clears any
@@ -1673,21 +1809,24 @@ def start_scraper(user_id):
                        "WHERE user_id = %s AND is_active IS DISTINCT FROM TRUE;",
                        (user_id,))
         armed_now = cursor.rowcount > 0
-
-        # Arming has to make the terms DUE, or the message below is simply false.
-        # The scheduler works off each term's own last_scraped_at, so a user
-        # whose terms were stamped a few minutes ago sat through the remainder of
-        # their interval — up to a full hour on a 60-minute term — while the
-        # console said "begins shortly" and nothing happened. Clearing the stamps
-        # makes the next cycle pick every term up.
-        #
-        # Only on a genuine transition: without that guard, holding down START
-        # would re-arm every term on every press, which is a free way to hammer
-        # the marketplaces and get us blocked.
-        if armed_now:
-            cursor.execute("UPDATE user_search_terms SET last_scraped_at = NULL "
-                           "WHERE user_id = %s;", (user_id,))
         conn.commit()
+
+        # Do NOT clear last_scraped_at here.
+        #
+        # An earlier version did, so arming always forced an immediate scan. That
+        # made STOP/START reset every countdown: stopping with 4:20 left and
+        # starting again 15 seconds later began a fresh interval instead of
+        # resuming at 4:05 — and it handed anyone a "re-scan every marketplace on
+        # demand" button, which is how we get rate-limited.
+        #
+        # Time passes whether or not the scanner is on. The schedule is simply
+        # last_scraped_at + the term's interval, and STOP is not an event in it.
+        # A user who has never scanned still starts at once: their terms carry a
+        # NULL last_scraped_at, which is already due.
+        #
+        # The complaint that produced the clearing was really about the message
+        # below lying — it said "shortly" while the real wait was minutes away.
+        # Telling the truth fixes that without touching the schedule.
 
         # Immediate console feedback. Starting is only a flag flip — the scraper
         # picks it up on its next cycle, so without this the console stayed
@@ -1697,11 +1836,27 @@ def start_scraper(user_id):
         # than up to the TTL later.
         try:
             import scrape_logs
-            scrape_logs.add_log(
-                user_id,
-                "Scanner armed — your first scan begins shortly." if armed_now
-                else "Scanner is already running.",
-                "info")
+            message = "Scanner is already running."
+            if armed_now:
+                message = "Scanner armed — your first scan begins shortly."
+                try:
+                    cursor.execute("SELECT * FROM user_settings WHERE user_id = %s;",
+                                   (user_id,))
+                    cols = [d[0] for d in cursor.description]
+                    us_row = dict(zip(cols, cursor.fetchone() or ()))
+                    due_at = _term_due_map(conn, user_id, _effective_plan_tier(us_row))
+                    if due_at:
+                        wait = int(min(due_at.values()) - time.time())
+                        if wait > 0:
+                            mins, secs = divmod(wait, 60)
+                            message = (f"Scanner armed — next scan in {mins}m {secs:02d}s, "
+                                       "picking up where the countdown left off.")
+                except Exception as e:
+                    # A countdown is not worth failing START over; the generic
+                    # message is still true, just vaguer.
+                    print(f"[start] could not compute next-due for {user_id[:8]}: {e}",
+                          flush=True)
+            scrape_logs.add_log(user_id, message, "info")
         except Exception:
             pass
         try:
@@ -1917,7 +2072,10 @@ def update_password(user_id):
         response = requests.put(
             update_url,
             headers=headers,
-            json={"password": new_password}
+            json={"password": new_password},
+            # Every other outbound call here is bounded; this one was not, and a
+            # hung Supabase connection would pin the worker indefinitely.
+            timeout=20,
         )
 
         print(f"📡 Supabase Response Code: {response.status_code}")
