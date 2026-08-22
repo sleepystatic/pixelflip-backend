@@ -228,7 +228,7 @@ def get_db_connection():
     try:
         from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
                                ensure_priority_term_columns, ensure_term_interval_column,
-                               ensure_scraper_state_table)
+                               ensure_scraper_state_table, ensure_term_include_table)
         ensure_buyer_delivery_columns(conn)
         # save_listing lives in this module and targets ON CONFLICT (user_id, link),
         # so the matching index has to be guaranteed on the scraper's own
@@ -246,6 +246,9 @@ def get_db_connection():
         # Mercari's captured bearer lives here so one capture serves every
         # instance — and so a machine with no room for Chrome can still scrape.
         ensure_scraper_state_table(conn)
+        # Per-term include keywords. Read on every scrape, so the scraper's own
+        # connection has to guarantee the table exists — same reason as above.
+        ensure_term_include_table(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -319,6 +322,10 @@ def get_user_search_terms(user_id):
                 'min': float(row[1]) if row[1] is not None else None,
                 'max': float(row[2]) if row[2] is not None else None,
                 'exclusions': [],
+                # Include keywords are OR'd: a listing survives if it matches
+                # ANY of them. Empty means "no positive filter", not "match
+                # nothing" — see is_excluded().
+                'includes': [],
                 # is_priority is derived from the interval now and kept only so
                 # a rollback still finds the column populated.
                 'is_priority': bool(row[3]),
@@ -336,6 +343,23 @@ def get_user_search_terms(user_id):
         for keyword, term in cursor.fetchall():
             if term in terms:
                 terms[term]['exclusions'].append(keyword)
+
+        # Separate query rather than a join: a term with three excludes and two
+        # includes would otherwise come back as six rows to de-duplicate.
+        try:
+            cursor.execute(
+                'SELECT keyword, search_term FROM user_includes '
+                'WHERE user_id = %s AND search_term IS NOT NULL',
+                (user_id,),
+            )
+            for keyword, term in cursor.fetchall():
+                if term in terms:
+                    terms[term]['includes'].append(keyword)
+        except Exception as e:
+            # A missing table (migration 014 not applied yet) must not take the
+            # whole scrape down — no includes simply means no positive filter.
+            conn.rollback()
+            print(f"[terms] include keywords unavailable: {e}", flush=True)
         return terms
     finally:
         cursor.close()
@@ -818,6 +842,18 @@ def is_excluded(title, price, exclusions, search_terms=None, matched_term=None):
 
     `exclusions` is the retired global list; it is always empty now and is kept
     only so the call signature stays stable.
+
+    INCLUDES (migration 014) are the positive counterpart and are checked here
+    too, so every platform gets them from one place. They are OR'd — a listing
+    survives if it matches ANY include — because that is what a user means by
+    'size 6' plus 'size 7'. AND would require a shoe to be both at once.
+
+    Exclusions OUTRANK includes: an excluded word rejects even when an include
+    matched. The more specific instruction wins.
+
+    Matching is TITLE-ONLY, deliberately. Descriptions exist on only some
+    platforms, so consulting them would make the same keyword behave differently
+    depending on where the listing came from.
     """
     title_lower = title.lower()
     # Optional floor (default: off). The old hard-coded $10 rule dropped $0–$9 deals and "free" posts.
@@ -831,11 +867,48 @@ def is_excluded(title, price, exclusions, search_terms=None, matched_term=None):
         if keyword and keyword.lower() in title_lower:
             return True
     if search_terms and matched_term:
-        per_term = (search_terms.get(matched_term) or {}).get('exclusions') or []
-        for keyword in per_term:
+        cfg = search_terms.get(matched_term) or {}
+        for keyword in (cfg.get('exclusions') or []):
             if keyword and keyword.lower() in title_lower:
                 return True
+        # Empty means "no positive filter", NOT "match nothing" — getting this
+        # backwards would silently drop every listing for every term that has no
+        # includes, which is all of them today.
+        includes = [k for k in (cfg.get('includes') or []) if k and str(k).strip()]
+        if includes and not any(_include_matches(title_lower, k) for k in includes):
+            return True
     return False
+
+
+def _include_matches(title_lower, keyword):
+    """
+    Word-boundary match for one include keyword.
+
+    Exclusions match as plain substrings, which is fine for a NEGATIVE filter —
+    over-matching there only costs you a listing you probably did not want. A
+    POSITIVE filter over-matching is worse: it silently admits the listings the
+    user was trying to filter down to, so the feature looks broken rather than
+    strict.
+
+    On the real examples: substring matching would have 'blue' match
+    "iPhone XR Bluetooth case" and 'red' match "one hundred dollars", while
+    'size 6' matched "size 65". Boundaries fix all three and still allow
+    'size 6' to match "size 6.5", because '.' is not a word character.
+
+    Lookarounds rather than \\b: \\b is defined relative to word characters, so a
+    keyword starting or ending in punctuation ('+', '6.5', 'iphone!') would
+    anchor unpredictably. (?<!\\w) and (?!\\w) behave the same for ordinary words
+    and degrade sanely for everything else.
+    """
+    kw = str(keyword).strip().lower()
+    if not kw:
+        return False
+    try:
+        return re.search(r'(?<!\w)' + re.escape(kw) + r'(?!\w)', title_lower) is not None
+    except re.error:
+        # A keyword that cannot be compiled must not take the scrape down; fall
+        # back to the looser behaviour rather than dropping every listing.
+        return kw in title_lower
 
 
 def _is_recent_timestamp(dt_text, max_age_days):
@@ -3245,11 +3318,57 @@ def _mercari_items_from_api(payload):
                 'price': price,
                 'link': f'https://www.mercari.com/us/item/{lid}/',
                 'image_url': image_url,
-                'listed_at': None,
+                # APPROXIMATE — derived from the photo's cache-buster because the
+                # search payload carries no post date. /api/listings flags it to
+                # the client by platform; see _mercari_listed_at_from_photo.
+                'listed_at': _mercari_listed_at_from_photo(image_url),
             })
         except Exception:
             continue
     return out
+
+
+def _mercari_listed_at_from_photo(image_url):
+    """
+    Approximate a Mercari listing's post date from its first photo's URL.
+
+    Mercari's searchFacetQuery carries NO created timestamp — probed 2026-08-13,
+    the only date-ish field on an Item is promoteExpireTime, which is a promotion
+    expiry and is 0 for most listings. The detail page would have one but costs a
+    fetch per listing.
+
+    What the payload does carry is a cache-buster on the photo URL
+    (`..._1.jpg?1785048429`) which is a unix timestamp. Measured across six live
+    listings: 2026-07-26, 07-31, 07-21, 06-30, 07-16, 08-12 — all plausibly
+    recent, all in the past, spread the way real listings are.
+
+    It is the PHOTO UPLOAD time, not strictly the post time. Those coincide for a
+    listing created once and left alone, and diverge if the seller later replaces
+    the picture — which would read as NEWER than reality. So it is surfaced as
+    approximate ('listed_at_approx') and must not be used for anything that
+    needs precision, notably FB_MAX_LISTING_AGE_DAYS-style age cutoffs.
+
+    Returns a tz-aware datetime, or None when the URL carries no usable stamp.
+    """
+    if not image_url or '?' not in str(image_url):
+        return None
+    raw = str(image_url).rsplit('?', 1)[-1].strip()
+    if not raw.isdigit():
+        return None
+    try:
+        ts = int(raw)
+    except ValueError:
+        return None
+    now = time.time()
+    # Sanity-bound it. A cache-buster that is not a timestamp (a build number, a
+    # random int) would otherwise become a listing date in 1970 or 2087, and a
+    # nonsense date on screen is worse than an honest blank.
+    if not (946684800 < ts <= now + 86400):        # 2000-01-01 .. tomorrow
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _mercari_fetch_browserless(terms, max_rows, ctx=None):
@@ -3817,39 +3936,94 @@ def _parse_offerup_last_updated_ago(text):
 
 
 def _offerup_listed_at_from_item_page(link, polite_delay_sec):
-    """Off by default — fetches each item page for posted date. Enable with OFFERUP_FETCH_ITEM_POSTED=true."""
+    """
+    The seller's original post date for one OfferUp listing. Off by default.
+
+    THIS USED TO LAUNCH A WHOLE BROWSER PER LISTING. _offerup_fetch_with_playwright
+    opens its own `sync_playwright()` and `chromium.launch()`, so enabling the
+    flag meant one Chromium per new listing — 48 of them on a normal scan, which
+    OOM-kills a 512MB instance and takes Flask with it. The "~1s per listing"
+    figure in the old docs was wrong by orders of magnitude, and nothing ever
+    exercised the path to find out.
+
+    It now fetches over HTTP with curl_cffi. Measured 2026-08-14 on a live item:
+    plain `requests` gets HTTP 403 (a 1.1KB block page) direct AND through the
+    proxy, while curl_cffi impersonating Chrome gets HTTP 200 and 220KB. Same
+    gate as Mercari's /v1/api — the TLS handshake, not the headers.
+
+    It also reads a BETTER field. The old parser scraped "last updated N ago",
+    which is a bump time; __NEXT_DATA__ carries `postDate`, the original posting.
+    Verified it is scoped to this item: exactly one object in the page has
+    postDate and its listingId matches the URL.
+
+    Still opt-in, because the cost is now BANDWIDTH: ~220KB per item page against
+    ~15KB for a whole search. Only genuinely new listings pay it — this sits
+    after the known_links check — but a first scan of 48 new listings is ~10MB
+    through a residential proxy.
+    """
     if not _env_flag('OFFERUP_FETCH_ITEM_POSTED', False):
         return None
     if not link or '/item/' not in link:
         return None
     try:
-        html = _offerup_fetch_with_playwright(link, stealth=False)
-        time.sleep(max(0.0, polite_delay_sec))
-        if not html:
-            return None
-        soup = BeautifulSoup(html, 'html.parser')
-        for node in soup.find_all(string=re.compile(r'last\s+updated', re.I)):
-            parent = getattr(node, 'parent', None)
-            block = parent
-            for _ in range(5):
-                if block is None:
-                    break
-                t = block.get_text(' ', strip=True)
-                dt = _parse_offerup_last_updated_ago(t)
-                if dt:
-                    return dt
-                block = getattr(block, 'parent', None)
-        m = re.search(
-            r'last\s+updated\s+(\d+)\s+'
-            r'(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago',
-            html,
-            re.IGNORECASE,
+        from curl_cffi import requests as cffi
+    except ImportError:
+        return None
+
+    item_id = link.rstrip('/').rsplit('/', 1)[-1]
+    proxies = None
+    px = _get_proxy('offerup')
+    if px:
+        n = _normalize_proxy(px)
+        proxies = {'http': n, 'https': n}
+    try:
+        r = cffi.get(
+            link,
+            headers={'User-Agent': _patchright_clean_ua()},
+            proxies=proxies,
+            impersonate=(os.getenv('OFFERUP_TLS_IMPERSONATE') or 'chrome').strip(),
+            timeout=int(os.getenv('OFFERUP_HTTP_TIMEOUT_SEC', '30')),
         )
-        if m:
-            return _parse_offerup_last_updated_ago(m.group(0))
+        _record_bytes('offerup', len(r.content or b''))
+        time.sleep(max(0.0, polite_delay_sec))
+        if r.status_code != 200:
+            return None
+        m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+        if not m:
+            return None
+        data = json.loads(m.group(1))
     except Exception:
         return None
-    return None
+
+    # Take postDate only from the object that IS this listing. The page also
+    # embeds related items, and picking the first postDate found would date the
+    # listing from whatever OfferUp happened to recommend beside it.
+    found = []
+
+    def _walk(node):
+        if found:
+            return
+        if isinstance(node, dict):
+            if node.get('postDate') and (
+                    str(node.get('listingId')) == item_id
+                    or str(node.get('id')) == item_id):
+                found.append(node['postDate'])
+                return
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    try:
+        _walk(data)
+        if not found:
+            return None
+        raw = str(found[0]).replace('Z', '+00:00')
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,

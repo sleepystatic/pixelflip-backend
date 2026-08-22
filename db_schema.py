@@ -25,6 +25,9 @@ _term_interval_applied = False
 _scraper_state_lock = threading.Lock()
 _scraper_state_applied = False
 
+_term_include_lock = threading.Lock()
+_term_include_applied = False
+
 BUYER_DELIVERY_PREFS_DDL = """
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS buyer_include_local BOOLEAN NOT NULL DEFAULT TRUE,
@@ -218,6 +221,46 @@ def ensure_term_interval_column(conn):
             cur.execute(TERM_INTERVAL_DDL)
             conn.commit()
             _term_interval_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+TERM_INCLUDES_DDL = """
+CREATE TABLE IF NOT EXISTS user_includes (
+    id          SERIAL PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    keyword     TEXT NOT NULL,
+    search_term TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_includes_user_term
+  ON user_includes (user_id, search_term);
+"""
+
+
+def ensure_term_include_table(conn):
+    """
+    Apply migration 014 if it was not run yet.
+
+    Per-term include keywords: a listing survives if it matches ANY of them (OR),
+    while exclusions stay AND-NOT and outrank them. No includes on a term means
+    everything passes, so this is additive and cannot change existing behaviour.
+    """
+    global _term_include_applied
+    if _term_include_applied:
+        return
+    with _term_include_lock:
+        if _term_include_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(TERM_INCLUDES_DDL)
+            conn.commit()
+            _term_include_applied = True
         except Exception:
             conn.rollback()
             raise

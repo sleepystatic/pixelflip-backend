@@ -357,6 +357,14 @@ DEFAULT_MAX_PRIORITY_TERMS = 0
 # gets when the client sends nothing.
 DEFAULT_TERM_INTERVAL_MINUTES = 10
 
+# Include keywords per term. Bounded because they are free user text checked
+# against every title on every platform, and because a runaway paste should not
+# become a permanent per-listing cost for everyone.
+try:
+    MAX_TERM_INCLUDES = max(1, int(os.getenv('MAX_TERM_INCLUDES', '20')))
+except ValueError:
+    MAX_TERM_INCLUDES = 20
+
 
 def _term_interval_options_for_tier(tier):
     """The rates a single term may be set to on this tier."""
@@ -726,6 +734,7 @@ def get_db_connection():
                 ensure_priority_term_columns,
                 ensure_term_interval_column,
                 ensure_scraper_state_table,
+                ensure_term_include_table,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
@@ -735,6 +744,7 @@ def get_db_connection():
             ensure_priority_term_columns(conn)
             ensure_term_interval_column(conn)
             ensure_scraper_state_table(conn)
+            ensure_term_include_table(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -1227,6 +1237,8 @@ def handle_settings(user_id):
                     'max': float(row['max_price']) if row['max_price'] is not None else None,
                     'min': float(row['min_price']) if row['min_price'] is not None else None,
                     'exclusions': [],
+                    # OR'd positive filter. Empty means "no filter".
+                    'includes': [],
                     'interval': every,
                     # Derived from the interval rather than read from the column,
                     # so a frontend still on the boolean renders correctly
@@ -1245,6 +1257,21 @@ def handle_settings(user_id):
                 term = row.get('search_term')
                 if term in terms:
                     terms[term]['exclusions'].append(row['keyword'])
+
+            # Include keywords (migration 014). Tolerated missing so a partially
+            # migrated database still serves settings instead of 500-ing.
+            try:
+                cursor.execute(
+                    "SELECT keyword, search_term FROM user_includes "
+                    "WHERE user_id = %s AND search_term IS NOT NULL;", (user_id,)
+                )
+                for row in cursor.fetchall():
+                    term = row.get('search_term')
+                    if term in terms:
+                        terms[term]['includes'].append(row['keyword'])
+            except Exception as e:
+                conn.rollback()
+                print(f"[settings] include keywords unavailable: {e}", flush=True)
 
             if not us:
                 return jsonify({
@@ -1482,6 +1509,23 @@ def handle_settings(user_id):
                     if kw:
                         cursor.execute(
                             "INSERT INTO user_exclusions (user_id, keyword, search_term) VALUES (%s, %s, %s);",
+                            (user_id, kw, term),
+                        )
+
+            # REPLACE Includes, same shape as exclusions above. Capped per term
+            # because these are unbounded user text and every one of them is
+            # checked against every title on every platform.
+            cursor.execute("DELETE FROM user_includes WHERE user_id = %s;", (user_id,))
+            for term, prices in thresholds_in.items():
+                seen_inc = set()
+                for keyword in ((prices or {}).get('includes') or [])[:MAX_TERM_INCLUDES]:
+                    kw = str(keyword).strip()
+                    # Case-insensitive de-dupe: 'Blue' and 'blue' filter
+                    # identically, so storing both is pure waste.
+                    if kw and kw.lower() not in seen_inc:
+                        seen_inc.add(kw.lower())
+                        cursor.execute(
+                            "INSERT INTO user_includes (user_id, keyword, search_term) VALUES (%s, %s, %s);",
                             (user_id, kw, term),
                         )
 
@@ -2613,6 +2657,12 @@ def list_scraped_listings(user_id):
                 "location": r.get('location'),
                 "created_at": created,
                 "listed_at": listed,
+                # Craigslist and Facebook report a real post time. Mercari's
+                # search payload has none at all (probed 2026-08-13), so its
+                # date is inferred from the listing photo's upload stamp — close,
+                # but not the same thing. Flagged so the UI can show it as
+                # approximate rather than quietly overstating precision.
+                "listed_at_approx": bool(listed) and (r.get('platform') == 'Mercari'),
             })
         return jsonify({"listings": out, "total": total, "limit": limit, "offset": offset})
     except Exception as e:
