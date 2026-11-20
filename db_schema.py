@@ -28,6 +28,13 @@ _scraper_state_applied = False
 _term_include_lock = threading.Lock()
 _term_include_applied = False
 
+_scan_desc_lock = threading.Lock()
+_scan_desc_applied = False
+_scrape_lease_lock = threading.Lock()
+_scrape_lease_applied = False
+_alerted_lock = threading.Lock()
+_alerted_applied = False
+
 BUYER_DELIVERY_PREFS_DDL = """
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS buyer_include_local BOOLEAN NOT NULL DEFAULT TRUE,
@@ -221,6 +228,159 @@ def ensure_term_interval_column(conn):
             cur.execute(TERM_INTERVAL_DDL)
             conn.commit()
             _term_interval_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+SCRAPE_LEASE_DDL = """
+ALTER TABLE user_settings
+  ADD COLUMN IF NOT EXISTS scrape_claimed_until TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_user_settings_scrape_claim
+  ON user_settings (scrape_claimed_until);
+"""
+
+
+def ensure_scrape_lease_column(conn):
+    """
+    Apply migration 016 if it was not run yet.
+
+    The lease that lets more than one scraper process exist. Without it two
+    workers both claim the same due user, both scrape, and both stamp
+    last_scraped_at — burning the user's interval twice and sending a duplicate
+    digest.
+    """
+    global _scrape_lease_applied
+    if _scrape_lease_applied:
+        return
+    with _scrape_lease_lock:
+        if _scrape_lease_applied:
+            return
+        # Split deliberately. Sent as one statement these exceeded Supabase's
+        # statement_timeout, and because psycopg2 wraps the batch in a single
+        # transaction the rollback took the ALTER with it — so the column that
+        # IS required was lost to an index that merely helps.
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "ALTER TABLE user_settings "
+                "ADD COLUMN IF NOT EXISTS scrape_claimed_until TIMESTAMPTZ;"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+        # Best effort. The scheduler works without it; it only keeps the
+        # due-and-unclaimed lookup cheap as the user count grows.
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_settings_scrape_claim "
+                "ON user_settings (scrape_claimed_until);"
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[schema] scrape-claim index skipped: {e}", flush=True)
+        finally:
+            cur.close()
+
+        _scrape_lease_applied = True
+
+
+def ensure_alerted_listings_table(conn):
+    """
+    The persistent 'already alerted' log (dedup across scrapes).
+
+    WHY THIS EXISTS, SEPARATELY FROM `listings`
+    A match counts as "new" only when its (user_id, link) is not already in
+    `listings` — and the cleanup thread deletes from `listings` after 7 days to
+    keep it small. But a Facebook listing can stay live for up to 45 days, and an
+    OfferUp listing has no reliable end date. So a listing still for sale when its
+    `listings` row is purged re-inserts as "new" on the next scrape and the user
+    is alerted about it AGAIN — once a week, for as long as it stays up.
+
+    `alerted_listings` records what a user has ALREADY been told about and is kept
+    far longer than `listings` (ALERTED_RETENTION_DAYS, default 60 — longer than
+    Facebook's 45-day max), so the re-alert cannot happen. It is deliberately not
+    the same table: `listings` is "what to show in the app right now" and is sized
+    for that; this is "what we have notified", and the two have different lifetimes.
+    Keyed on (user_id, link); `first_alerted_at` drives retention.
+    """
+    global _alerted_applied
+    if _alerted_applied:
+        return
+    with _alerted_lock:
+        if _alerted_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerted_listings (
+                  user_id          TEXT NOT NULL,
+                  link             TEXT NOT NULL,
+                  title_fingerprint TEXT,
+                  first_alerted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  PRIMARY KEY (user_id, link)
+                );
+                """
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+        # Best effort: keeps the per-user retention lookup cheap as the table grows.
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alerted_user_time "
+                "ON alerted_listings (user_id, first_alerted_at);"
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[schema] alerted_listings index skipped: {e}", flush=True)
+        finally:
+            cur.close()
+
+        _alerted_applied = True
+
+
+SCAN_DESCRIPTION_DDL = """
+ALTER TABLE user_settings
+  ADD COLUMN IF NOT EXISTS scan_description BOOLEAN NOT NULL DEFAULT FALSE;
+"""
+
+
+def ensure_scan_description_column(conn):
+    """
+    Apply migration 015 if it was not run yet.
+
+    Opt-in, Pro-only description matching. Default FALSE so existing users keep
+    today's behaviour and today's bandwidth — enabling it costs one extra fetch
+    per NEW listing on Mercari, OfferUp and Facebook (Craigslist is free, its
+    detail page is already being fetched).
+    """
+    global _scan_desc_applied
+    if _scan_desc_applied:
+        return
+    with _scan_desc_lock:
+        if _scan_desc_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(SCAN_DESCRIPTION_DDL)
+            conn.commit()
+            _scan_desc_applied = True
         except Exception:
             conn.rollback()
             raise

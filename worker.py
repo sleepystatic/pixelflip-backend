@@ -33,7 +33,10 @@ load_dotenv()
 def main():
     # Imported after load_dotenv so the module-level interpreter check and the
     # pool both see the real configuration.
-    from scraper_multi_user import run_scraper
+    # The loop is called main(); there has never been a run_scraper. This
+    # import raised ImportError on every start, which is why the worker
+    # service has never run and the scraper still lives inside Flask.
+    from scraper_multi_user import main as run_scrape_loop
     import scrape_logs
 
     workers = os.getenv('SCRAPE_MAX_WORKERS', '3')
@@ -52,7 +55,7 @@ def main():
 
     while True:
         try:
-            run_scraper(log_callback=log_bridge)
+            run_scrape_loop(log_callback=log_bridge)
         except KeyboardInterrupt:
             print('worker: shutting down', flush=True)
             scrape_logs.flush(force=True)

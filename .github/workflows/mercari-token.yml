@@ -1,0 +1,113 @@
+# Mint Mercari's search bearer on a schedule and store it in Postgres.
+#
+# WHY THIS EXISTS
+# Minting the token needs a real browser: ~1GB peak across ~11 Chrome processes,
+# which does not fit the 512MB Render instance and takes Flask down with it. So
+# MERCARI_ALLOW_CAPTURE=0 is set there, making the browser path structurally
+# unreachable, and the token is minted somewhere with memory instead. A GitHub
+# runner has ~7GB and costs nothing on a cron.
+#
+# Replaying the token needs no browser at all — only curl_cffi reproducing
+# Chrome's TLS handshake. Measured: capture 1,071MB / 11 processes / 20s,
+# replay 4.1MB / 0 processes / 3.6s. Three measured facts make the split safe:
+#   * the bearer is a JWT with a 7-day exp
+#   * the replay needs no cookies
+#   * it works from an IP other than the one that captured it
+#
+# WHY EVERY 3 DAYS, AND WHY EVERY RUN RENEWS
+# The token lives exactly 7 days. The script only captures when the stored one
+# is unusable, and by default "unusable" means within MERCARI_CTX_RENEW_MARGIN_SEC
+# of expiry: 300s. A run at 07:00 every 3 days almost never lands inside a
+# 5-minute window, so on that default every token would expire BEFORE a run
+# replaced it. A token captured on a cron day expires on a non-cron day, which
+# leaves Mercari dark ~2 days in every 9 even when no run ever fails.
+#
+# So this job renews whenever less than 4.5 days remain (env below). Runs are at
+# most 3 days apart, so the next regular run finds ~4 days left and renews.
+# That survives ONE failed run: the run after it still lands with ~1 day to
+# spare. Two failures in a row leave Mercari dark ~2 days, which is why a failed
+# capture fails the job (and emails) instead of passing quietly. Captures are
+# cheap on a runner, so renewing every run costs almost nothing.
+#
+# Mercari went dark for 14 days in Sept 2026 because nothing automated this.
+#
+# SETUP (one time)
+#   Settings -> Secrets and variables -> Actions -> New repository secret:
+#     DATABASE_URL      the same Postgres the scraper uses
+#     MERCARI_PROXY_URL sticky residential proxy (optional but recommended;
+#                       Cloudflare binds clearance to one IP, so it must be
+#                       sticky, not a rotating pool)
+name: Mercari token
+
+on:
+  schedule:
+    # 07:00 UTC on days 1, 4, 7, ... 31. The 31st->1st gap is one day rather
+    # than three; that just means one extra no-op run at a month boundary.
+    - cron: '0 7 */3 * *'
+  workflow_dispatch:        # so it can be run by hand after an outage
+
+# Two overlapping captures would race to write the same scraper_state row.
+concurrency:
+  group: mercari-token
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      MERCARI_PROXY_URL: ${{ secrets.MERCARI_PROXY_URL }}
+      # patchright + real Chrome is the only combination measured to clear
+      # Cloudflare; bundled Chromium clears it but renders zero listings.
+      MERCARI_CHROME_CHANNEL: chrome
+      MERCARI_HEADLESS: 'true'
+      PYTHONUNBUFFERED: '1'
+      # 4.5 days: renew on every regular run. See WHY EVERY RUN RENEWS above.
+      # Set this ONLY here, never on Render. Render cannot mint
+      # (MERCARI_ALLOW_CAPTURE=0), so there it would discard a token with days
+      # of life left and have nothing to replace it with. If Mercari ever issues
+      # tokens that live less than 4.5 days, the post-capture read-back fails
+      # and this job goes red: lower the value below the new lifetime.
+      MERCARI_CTX_RENEW_MARGIN_SEC: '388800'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Same pin as Render and local (.python-version, major.minor -> latest
+          # patch): one file decides the Python version everywhere.
+          python-version-file: '.python-version'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Chrome for patchright
+        # patchright install chrome shells out to apt, which needs root. That is
+        # why it cannot be done on Render's native runtime, but a runner has
+        # sudo, so the straightforward path works here.
+        run: |
+          patchright install --with-deps chrome
+          # Chromium as a fallback so a capture still attempts rather than
+          # erroring out if the Chrome channel is ever unavailable.
+          patchright install chromium || true
+
+      - name: Report current token state
+        # Never fails the job: this is context for the log when the next step
+        # does something. Exit 1 here just means "a capture is needed", which
+        # with the renew margin above includes "expires within 4.5 days".
+        run: python capture_mercari_token.py --check || true
+
+      - name: Capture and store the bearer
+        # Exits non-zero when a capture was needed and failed, so a broken proxy
+        # or a Mercari change surfaces as a failed job and an email rather than
+        # as Mercari quietly returning nothing a few days later.
+        run: python capture_mercari_token.py
+
+      - name: Confirm the stored token is usable
+        run: python capture_mercari_token.py --check

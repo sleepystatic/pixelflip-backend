@@ -1,7 +1,6 @@
 import time
 import tempfile
 import shutil
-import uuid
 import traceback
 import os
 import sys
@@ -9,7 +8,9 @@ import re
 import json
 import hashlib
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import functools
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import psycopg2
 from psycopg2 import errorcodes
@@ -18,8 +19,23 @@ from urllib.parse import urlparse, quote, quote_plus, urlencode, unquote, parse_
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import search_cache
 
 load_dotenv()
+
+# Console output must never be able to raise. This module prints emoji in
+# several places, including INSIDE the per-platform exception handler ("one
+# marketplace failing is not the scrape failing"). On a Windows console, whose
+# default encoding is cp1252, that print raises UnicodeEncodeError from within
+# the handler and converts a handled platform failure into an unhandled one that
+# kills the whole scrape — the exact opposite of what the handler is for.
+# Render's stdout is UTF-8 so this is a no-op there; locally it degrades an
+# unencodable character to '?' instead of taking the run down.
+try:
+    sys.stdout.reconfigure(errors='replace')
+    sys.stderr.reconfigure(errors='replace')
+except Exception:
+    pass
 
 print("Multi-user scraper loaded", flush=True)
 
@@ -95,6 +111,105 @@ def _emit(message, level='error'):
             cb(uid, message, level)
         except Exception:
             pass
+
+
+def scrape_lease_sec():
+    """
+    How long a claim is held before anyone else may take the user.
+
+    Must exceed the worst honest scrape or a slow-but-healthy run gets stolen
+    mid-flight and scraped twice — the thing the lease exists to prevent.
+    Production scrapes measured 184-247s, so 900s leaves a wide margin without
+    stranding a user for long if a worker dies.
+    """
+    try:
+        return max(60, int(os.getenv('SCRAPE_LEASE_SEC', '900')))
+    except (TypeError, ValueError):
+        return 900
+
+
+def claim_user_for_scrape(user_id, lease_sec=None):
+    """
+    Try to become the one instance scraping `user_id`. True if we won it.
+
+    ONE conditional UPDATE does the whole thing. That is the point: a
+    read-then-write ("is it claimed? no? claim it") leaves a window where two
+    instances both read 'no' and both proceed, which is exactly the bug being
+    fixed. Postgres settles it inside a single statement instead.
+
+    Returns True when there was NO live claim and we installed ours. A worker
+    that loses simply skips that user this cycle; another instance has them.
+
+    Fails OPEN: if the database cannot be reached the scrape still runs. A
+    scraper that refuses to work whenever the lease table is unhappy is worse
+    than one that occasionally double-scrapes, and single-instance deployments —
+    which is everyone today — are unaffected either way.
+    """
+    lease = int(lease_sec or scrape_lease_sec())
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return True
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE user_settings
+               SET scrape_claimed_until = NOW() + (%s * INTERVAL '1 second')
+             WHERE user_id = %s
+               AND (scrape_claimed_until IS NULL OR scrape_claimed_until < NOW())
+            RETURNING user_id
+            """,
+            (lease, str(user_id)),
+        )
+        won = cursor.fetchone() is not None
+        conn.commit()
+        return won
+    except Exception as e:
+        print(f"[lease] claim failed for {str(user_id)[:8]} ({e}) — scraping anyway",
+              flush=True)
+        return True
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
+
+
+def release_user_scrape_claim(user_id):
+    """
+    Hand the user back immediately rather than waiting out the lease.
+
+    Only ever clears OUR claim conceptually — in practice any instance clearing
+    a finished scrape is correct, and the expiry is the real safety net for the
+    case this never runs at all (an OOM-killed worker).
+    """
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE user_settings SET scrape_claimed_until = NULL WHERE user_id = %s",
+            (str(user_id),),
+        )
+        conn.commit()
+    except Exception as e:
+        # Not fatal: the lease expires on its own. Worst case the user waits
+        # out the remainder before their next scan.
+        print(f"[lease] release failed for {str(user_id)[:8]}: {e}", flush=True)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
 
 
 def set_user_scraping(user_id, active):
@@ -228,7 +343,9 @@ def get_db_connection():
     try:
         from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
                                ensure_priority_term_columns, ensure_term_interval_column,
-                               ensure_scraper_state_table, ensure_term_include_table)
+                               ensure_scraper_state_table, ensure_term_include_table,
+                               ensure_scan_description_column, ensure_scrape_lease_column,
+                               ensure_alerted_listings_table)
         ensure_buyer_delivery_columns(conn)
         # save_listing lives in this module and targets ON CONFLICT (user_id, link),
         # so the matching index has to be guaranteed on the scraper's own
@@ -249,6 +366,22 @@ def get_db_connection():
         # Per-term include keywords. Read on every scrape, so the scraper's own
         # connection has to guarantee the table exists — same reason as above.
         ensure_term_include_table(conn)
+        # Same reason again, for scan_description (migration 015).
+        # get_active_users() SELECTs the column on the very first cycle, and the
+        # scraper thread starts at app.py IMPORT time — before any HTTP request
+        # has caused app.py to run its own ensure chain. Miss this and the query
+        # dies on UndefinedColumn, which surfaces as a scanner that says "armed"
+        # and then never scrapes anything.
+        ensure_scan_description_column(conn)
+        # Migration 016. The scheduler claims users on its FIRST cycle, so this
+        # has to exist before any scrape is attempted — same reason as every
+        # other column in this chain.
+        ensure_scrape_lease_column(conn)
+        # Persistent alert dedup. _scrape_for_user_impl reads it at the start of
+        # every scrape (get_alerted_links) and writes it after saving, so the
+        # scraper's own connection must guarantee the table — same reason as the
+        # rest of this chain.
+        ensure_alerted_listings_table(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -272,7 +405,8 @@ def get_active_users():
             SELECT user_id, zip_code, search_radius, platforms,
                    ai_enabled, ai_strictness, check_interval_minutes,
                    plan_tier, is_pro,
-                   buyer_include_local, buyer_include_shipping
+                   buyer_include_local, buyer_include_shipping,
+                   scan_description
             FROM user_settings
             WHERE is_active = TRUE
         ''')
@@ -281,7 +415,15 @@ def get_active_users():
         for row in cursor.fetchall():
             tier = (row.get('plan_tier') or '').strip().lower()
             if tier not in ('basic', 'pro'):
-                tier = 'pro' if row.get('is_pro') else 'inactive'
+        # is_pro with no plan_tier means they paid for SOMETHING but the
+        # record does not say what. Resolve DOWN to the cheapest paid tier:
+        # guessing 'pro' hands the most expensive plan to anyone whose row
+        # was written by a path other than Stripe (a manual grant, a
+        # pre-beta flag, a restored backup). Migration 017 made every
+        # legacy row explicit, so this now only governs genuinely new
+        # ambiguity. 'inactive' would be the opposite mistake — cutting
+        # off someone who is actually paying.
+                tier = 'basic' if row.get('is_pro') else 'inactive'
             # Pro-only AI image pipeline (Basic never runs Vision, regardless of DB flag)
             eff_ai = bool(row.get('ai_enabled')) and tier == 'pro'
 
@@ -296,11 +438,57 @@ def get_active_users():
                 'ai_strictness': row['ai_strictness'] or 'balanced',
                 'check_interval': row['check_interval_minutes'] or 10,
                 'plan_tier': tier,
+                # Pro-gated here as well as on save, for the same reason
+                # eff_ai is: a row that predates a downgrade, or one edited
+                # directly, must not buy a fetch-per-listing on three
+                # marketplaces.
+                'scan_description': (bool(row.get('scan_description'))
+                                     and tier == 'pro'
+                                     and _description_scan_enabled()),
             })
         return users
     finally:
         cursor.close()
         conn.close()
+
+
+def _disarm_unpaid(user_id):
+    """
+    Switch OFF the scanner of an armed account that has no paid plan.
+
+    /api/start refuses to arm such an account; this catches the rest: rows armed
+    before that check existed, rows edited by hand, and subscriptions that lapse
+    while the scanner is on (customer.subscription.deleted sets plan_tier to
+    'inactive' but leaves is_active alone). Switching it off, rather than
+    skipping it every cycle, keeps the dashboard truthful (stopped, not
+    running) and frees its capacity spot; re-subscribing and pressing START
+    resumes it. Returns True when it switched something off.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_settings SET is_active = FALSE "
+                    "WHERE user_id = %s AND is_active = TRUE;", (user_id,))
+        changed = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"  ⚠ could not switch off unpaid scanner {str(user_id)[:8]}: {e}", flush=True)
+        return False
+    finally:
+        conn.close()
+    _invalidate_active_cache(user_id)
+    if changed:
+        print(f"  ⏹ {str(user_id)[:8]}: scanner switched off (no paid plan)", flush=True)
+        try:
+            import scrape_logs
+            scrape_logs.add_log(user_id, "Scanner stopped: this account has no active plan. "
+                                         "Choose Basic or Pro, then press START.", 'error')
+        except Exception:
+            pass
+    return changed
 
 
 def get_user_search_terms(user_id):
@@ -436,7 +624,37 @@ def get_user_auth_email(user_id):
         return None
 
 
-def _notify_scrape_digest(user_id, new_listings, prefs, log_callback=None):
+def warn_descriptions_unavailable(platform, fetched, missing, log_callback, user_id):
+    """
+    Say plainly, in red, when description scanning produced NOTHING on a platform.
+
+    This is the gap that kept DESCRIPTION_SCAN_ENABLED switched off. OfferUp's
+    item pages started returning 403 and its descriptions quietly became None.
+    Every cheaper filter still ran, so the scan looked entirely normal while that
+    one platform had fallen back to matching titles only.
+
+    The all-or-nothing rule was never really that every platform must work — it
+    was that the user must be able to TELL. A platform that degrades loudly is
+    survivable. One that degrades silently is not, because the user cannot know
+    whether the listing they wanted was filtered out or simply never examined.
+
+    Only fires when the platform got nothing at all. A scan that read some bodies
+    and missed others is ordinary — sellers leave descriptions blank — and
+    warning about that would train the user to ignore the line that matters.
+    """
+    if not log_callback or fetched or not missing:
+        return
+    log_callback(
+        user_id,
+        "%s: descriptions unavailable this scan (%d listing%s checked) %s its "
+        "keyword filters matched TITLES ONLY. Your other marketplaces are "
+        "unaffected." % (platform, missing, '' if missing == 1 else 's', '—'),
+        'error',
+    )
+
+
+def _notify_scrape_digest(user_id, new_listings, prefs, log_callback=None,
+                          first_scan=False):
     """One email/SMS per scrape with all new matches (avoids inbox flooding)."""
     if not new_listings:
         return
@@ -446,7 +664,8 @@ def _notify_scrape_digest(user_id, new_listings, prefs, log_callback=None):
     if not any(ch.get(k) for k in ('email', 'sms', 'push')):
         return
     email = get_user_auth_email(user_id)
-    errs = dispatch_scrape_digest_notifications(user_id, new_listings, prefs, user_email=email)
+    errs = dispatch_scrape_digest_notifications(user_id, new_listings, prefs, user_email=email,
+                                               first_scan=first_scan)
     if errs:
         line = 'Notify issues: ' + '; '.join(errs)
         print(f"📣 user={str(user_id)[:10]}… {line}", flush=True)
@@ -515,6 +734,86 @@ def get_recent_listing_signatures(user_id):
         cursor.close()
         conn.close()
     return rows
+
+
+def _alerted_retention_days():
+    try:
+        return max(1, int(os.getenv('ALERTED_RETENTION_DAYS', '60')))
+    except ValueError:
+        return 60
+
+
+def get_alerted_links(user_id):
+    """
+    Links this user has ALREADY been alerted about, within the retention window.
+
+    This is the dedup that `listings` cannot provide on its own: `listings` is
+    purged after 7 days, so a still-live listing re-appears as "new" after that
+    and re-alerts. These links are held for ALERTED_RETENTION_DAYS (default 60,
+    longer than Facebook's 45-day max), so a listing is alerted at most once for
+    as long as it stays up. Fails OPEN — an empty set on any DB error means the
+    worst case is one duplicate alert, never a scrape that refuses to run.
+    """
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return set()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT link FROM alerted_listings "
+            "WHERE user_id = %s "
+            "  AND first_alerted_at >= NOW() - (%s * INTERVAL '1 day')",
+            (user_id, _alerted_retention_days()),
+        )
+        return {r[0] for r in cursor.fetchall()}
+    except Exception as e:
+        print(f"get_alerted_links warning for {str(user_id)[:8]}: {e}", flush=True)
+        return set()
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def record_alerted_listings(user_id, listings):
+    """
+    Record that these listings have now been alerted, so no later scrape alerts
+    them again while they stay live. ON CONFLICT DO NOTHING keeps the ORIGINAL
+    first_alerted_at, so retention is measured from the first alert, not the most
+    recent sighting. Never raises: a missed record costs one possible future
+    duplicate, which is strictly better than failing the scrape after the user
+    was already (correctly) notified.
+    """
+    if not listings:
+        return
+    from psycopg2.extras import execute_values
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cursor = conn.cursor()
+        rows = [(user_id, l['link'], l.get('title_fingerprint')) for l in listings if l.get('link')]
+        if not rows:
+            return
+        execute_values(
+            cursor,
+            "INSERT INTO alerted_listings (user_id, link, title_fingerprint) "
+            "VALUES %s ON CONFLICT (user_id, link) DO NOTHING",
+            rows, page_size=200,
+        )
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"record_alerted_listings warning for {str(user_id)[:8]}: {e}", flush=True)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 def save_listing(user_id, listing):
@@ -834,7 +1133,8 @@ def check_price_threshold(title, price, search_terms):
     return False, None, None
 
 
-def is_excluded(title, price, exclusions, search_terms=None, matched_term=None):
+def is_excluded(title, price, exclusions, search_terms=None, matched_term=None,
+                description=None, check_includes=True):
     """
     Exclusions belong to a single search term: a keyword attached to one term
     must not filter listings found by another — excluding "case" from a console
@@ -851,11 +1151,37 @@ def is_excluded(title, price, exclusions, search_terms=None, matched_term=None):
     Exclusions OUTRANK includes: an excluded word rejects even when an include
     matched. The more specific instruction wins.
 
-    Matching is TITLE-ONLY, deliberately. Descriptions exist on only some
-    platforms, so consulting them would make the same keyword behave differently
-    depending on where the listing came from.
+    `description` is passed only when the user has description scanning on
+    (migration 015, Pro, opt-in). Titles are short and sellers put the details
+    people actually filter on — size, colour, storage, faults — in the body. It
+    stays opt-in because no platform returns descriptions in its search
+    response, so it costs one extra fetch per new listing on three of the four.
+    Left None, behaviour is exactly title-only as before.
+
+    `check_includes=False` runs the EXCLUSION half only. It exists for the
+    two-pass flow a platform uses when it has to fetch the description itself:
+
+      pass 1 (title only, check_includes=False) — an exclude hit on the title is
+        final, because a description can only ever ADD reasons to reject. Such a
+        listing is dropped before anything pays for its item page.
+      pass 2 (after the fetch, description=..., includes back on) — an include
+        MISS on the title is NOT final: the keyword may be in the body, which is
+        the entire point of the feature.
+
+    Dropping on includes in pass 1 would make description scanning a silent
+    no-op for includes — the listing the user was trying to surface would be
+    discarded before its description was ever read.
     """
     title_lower = title.lower()
+    # With description scanning on (Pro, opt-in), keyword filters see the
+    # description too. Kept as SEPARATE haystacks rather than one concatenated
+    # string so a keyword can never match across the seam: a title ending
+    # "...blue" followed by a description starting "tooth..." must not read as
+    # "bluetooth".
+    haystacks = [title_lower]
+    if description:
+        haystacks.append(str(description).lower())
+
     # Optional floor (default: off). The old hard-coded $10 rule dropped $0–$9 deals and "free" posts.
     try:
         min_listing = float(os.getenv('MIN_LISTING_PRICE', '0'))
@@ -864,19 +1190,21 @@ def is_excluded(title, price, exclusions, search_terms=None, matched_term=None):
     if min_listing > 0 and price < min_listing:
         return True
     for keyword in (exclusions or []):
-        if keyword and keyword.lower() in title_lower:
+        if keyword and any(keyword.lower() in h for h in haystacks):
             return True
     if search_terms and matched_term:
         cfg = search_terms.get(matched_term) or {}
         for keyword in (cfg.get('exclusions') or []):
-            if keyword and keyword.lower() in title_lower:
+            if keyword and any(keyword.lower() in h for h in haystacks):
                 return True
         # Empty means "no positive filter", NOT "match nothing" — getting this
         # backwards would silently drop every listing for every term that has no
         # includes, which is all of them today.
-        includes = [k for k in (cfg.get('includes') or []) if k and str(k).strip()]
-        if includes and not any(_include_matches(title_lower, k) for k in includes):
-            return True
+        if check_includes:
+            includes = [k for k in (cfg.get('includes') or []) if k and str(k).strip()]
+            if includes and not any(_include_matches(h, k)
+                                    for k in includes for h in haystacks):
+                return True
     return False
 
 
@@ -962,6 +1290,22 @@ def _env_flag(name, default=False):
     if not raw:
         return default
     return raw in ('1', 'true', 'yes', 'on')
+
+
+def _description_scan_enabled():
+    """
+    Master switch for description scanning, mirroring app.py's function of the
+    same name. All-or-nothing by Bryan's decision: a filter that works on one
+    marketplace and silently does nothing on another is worse than no filter,
+    because the user cannot tell whether it applied.
+
+    Checked HERE as well as in app.py because app.py only gates what the UI
+    offers and what a settings POST may store. A row that predates the switch
+    being turned off, or one edited directly in the database, would otherwise
+    still buy a fetch-per-listing at scrape time. Same defensive reasoning as
+    the Pro clamp it sits next to.
+    """
+    return _env_flag('DESCRIPTION_SCAN_ENABLED', False)
 
 
 
@@ -1249,7 +1593,57 @@ def _craigslist_title_match(title, search_terms):
     return None
 
 
-def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_sec):
+_CL_DESC_JUNK_SELECTORS = (
+    # Print-only artefact Craigslist injects into every posting body.
+    '.print-information',
+    '.print-qrcode-container',
+    # The placeholder behind which the phone number is hidden until clicked.
+    '.show-contact',
+)
+
+
+def _craigslist_description_from_soup(soup):
+    """
+    The seller's body text from a detail page, or None.
+
+    FREE, unlike the other three platforms: the detail page is already being
+    fetched for the posted time, the gallery image and the price the tile
+    sometimes omits, so this is a parse of soup already in hand rather than a
+    request. Craigslist is the reason the feature is worth having at all — it
+    proves the pipeline at zero bandwidth.
+
+    Two pieces of boilerplate have to come out first, and BOTH appear on every
+    posting (measured on live listings, 2026-08-29):
+      * '.print-information' / '.print-qrcode-container' renders as
+        "QR Code Link to This Post"
+      * '.show-contact' renders as "show contact info"
+    Leave them in and every Craigslist description contains the word "contact",
+    so a user excluding that keyword would silently lose the whole platform —
+    and every description would match an include of "post".
+
+    The subtree is COPIED before anything is removed. The caller reuses the same
+    soup for the price and the gallery image, so decomposing in place would make
+    this function order-dependent in a way nothing else here is.
+    """
+    el = soup.select_one('#postingbody')
+    if el is None:
+        return None
+    try:
+        import copy  # local, matching the other helpers in this module
+        el = copy.copy(el)  # bs4's Tag.__copy__ duplicates the whole subtree
+        for sel in _CL_DESC_JUNK_SELECTORS:
+            for junk in el.select(sel):
+                junk.decompose()
+        text = el.get_text('\n', strip=True)
+    except Exception:
+        # A parse quirk must not cost the listing the rest of its enrichment.
+        return None
+    text = re.sub(r'\n{3,}', '\n\n', text or '').strip()
+    return text or None
+
+
+def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_sec,
+                                   want_description=False):
     """GET the listing detail page for posted time, gallery image, and price when the tile omits it."""
     try:
         r = session.get(listing['link'], timeout=22)
@@ -1274,13 +1668,19 @@ def _enrich_craigslist_from_detail(session, listing, max_age_days, polite_delay_
         img = _best_craigslist_gallery_image(soup)
         if img:
             listing['image_url'] = img
+        if want_description:
+            # Transient by design: PASS 3 reads it once for filtering and pops
+            # it. `listings` is written through an explicit column allowlist
+            # (_BULK_COLUMNS), so it could not reach the database regardless.
+            listing['description'] = _craigslist_description_from_soup(soup)
         return True
     except Exception:
         return True
 
 
 def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
-                               debug=False, log_callback=None, known_links=None):
+                               debug=False, log_callback=None, known_links=None,
+                               scan_description=False):
     listings = []
     # One subdomain is enough: Craigslist's static search is scoped by the
     # postal + search_distance params, NOT by the subdomain. Measured — stockton,
@@ -1293,6 +1693,14 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
     cl_cat = os.getenv('CRAIGSLIST_SEARCH_CAT', 3 * 's').strip() or (3 * 's')
     max_age_days = int(os.getenv('MAX_LISTING_AGE_DAYS', '7'))
     fetch_detail = os.getenv('CRAIGSLIST_FETCH_DETAIL', '1').strip().lower() not in ('0', 'false', 'no')
+    # Free here — the detail page is already fetched — so this is gated only on
+    # a term actually having a keyword to test the body against, not on cost.
+    # Computed once rather than per listing.
+    desc_wanted = bool(scan_description) and any(
+        _term_wants_description(cfg) for cfg in (search_terms or {}).values())
+    cl_desc_read = 0
+    cl_desc_missing = 0
+    cl_desc_filtered = 0
     # Per-request politeness. Lower than the old 0.35 because the fetches are no
     # longer serial — with a pool of N, the effective rate is delay/N, so keeping
     # 0.35 alongside parallelism would have been a real rate increase. 0.25/6 is
@@ -1330,6 +1738,13 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
         log_callback(user_id, "Waking up Craigslist scraper...", "info")
         if fetch_detail and debug:
             log_callback(user_id, "Craigslist: fetching each listing page for photos + posted time (search tiles omit them).", "info")
+        if scan_description and not fetch_detail:
+            # All-or-nothing means the user must never be left guessing whether
+            # their filter applied. With no detail page there is no body to read.
+            log_callback(user_id,
+                         "Description scanning is on, but CRAIGSLIST_FETCH_DETAIL "
+                         "is off — Craigslist keyword filters are matching the "
+                         "title only for this scan.", 'error')
 
     for subdomain in subdomains:
         if not is_user_active(user_id):
@@ -1468,7 +1883,8 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                     def _enrich(c):
                         try:
                             keep = _enrich_craigslist_from_detail(
-                                _craigslist_session(), c['entry'], max_age_days, detail_delay)
+                                _craigslist_session(), c['entry'], max_age_days, detail_delay,
+                                want_description=desc_wanted)
                         except Exception:
                             keep = True
                         return c, keep
@@ -1503,7 +1919,29 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                             title, entry['price'], search_terms)
                         if not meets_threshold:
                             continue
-                        if is_excluded(title, entry['price'], exclusions, search_terms, matched_term):
+                        # Read once for filtering, then dropped, so a transient
+                        # field cannot travel onward with the listing. Craigslist
+                        # needs no two-pass dance: the detail page is fetched in
+                        # PASS 2, so the body is already in hand by the time this
+                        # runs. Facebook has to fetch its own, which is why it
+                        # splits the include check out (see is_excluded).
+                        description = entry.pop('description', None)
+                        if description:
+                            cl_desc_read += 1
+                        elif desc_wanted:
+                            # Wanted one and the detail page yielded none.
+                            cl_desc_missing += 1
+                        if is_excluded(title, entry['price'], exclusions, search_terms,
+                                       matched_term, description=description):
+                            # Only credit the body when the title alone would
+                            # have KEPT it. Counting every exclusion here would
+                            # claim ordinary title filtering as the feature's
+                            # work, and the number is meant to tell the user
+                            # whether their description filter did anything.
+                            if description and not is_excluded(
+                                    title, entry['price'], exclusions,
+                                    search_terms, matched_term):
+                                cl_desc_filtered += 1
                             continue
                         entry['console_type'] = matched_term
                         entry['threshold'] = max_price
@@ -1520,8 +1958,18 @@ def scrape_craigslist_for_user(user_id, zip_code, search_radius, search_terms, e
                 time.sleep(1)
             except Exception:
                 pass
+    warn_descriptions_unavailable('Craigslist', cl_desc_read, cl_desc_missing,
+                                  log_callback, user_id)
     if debug and log_callback:
-        log_callback(user_id, f"Craigslist complete: {len(listings)} candidate matches", "info")
+        desc_note = ''
+        if cl_desc_read or cl_desc_filtered:
+            desc_note = (f' (descriptions: {cl_desc_read} read'
+                         + (f', {cl_desc_filtered} filtered out on body keywords'
+                            if cl_desc_filtered else '')
+                         + ')')
+        log_callback(user_id,
+                     f"Craigslist complete: {len(listings)} candidate matches{desc_note}",
+                     "info")
     return listings
 
 
@@ -2212,7 +2660,6 @@ def _process_tree_rss_mb():
     """
     try:
         pids = [os.getpid()]
-        children = os.path.join('/proc', str(os.getpid()), 'task')
         # Walk /proc for anything whose parent chain reaches us. Cheap enough at
         # the handful of processes a scrape creates.
         for entry in os.listdir('/proc'):
@@ -2592,8 +3039,251 @@ def _offerup_lean_attempt(browser, query, term, lat, lon, force_no_proxy):
             pass
 
 
+# ---------------------------------------------------------------------------
+# MULTI-USER SAFETY: process-wide pacing and a browser budget.
+#
+# Both exist because SCRAPE_MAX_WORKERS > 1 used to multiply two things that
+# must not grow with the user count:
+#
+# 1. REQUEST RATE PER MARKETPLACE. The politeness pauses were per scrape, so
+#    three concurrent scrapes hit OfferUp three times as often — and OfferUp's
+#    antibot is rate-based (measured: retrying faster returns 0 rows, switching
+#    proxy does not help). Facebook's concurrent scrapes all exit through the
+#    SAME sticky residential IP. _paced() makes the gap process-wide: at most one
+#    request in flight per platform, with the configured gap between the end of
+#    one and the start of the next — exactly the old single-scrape rhythm, no
+#    matter how many scrapes run at once.
+#
+# 2. BROWSERS. Steady state launches none (every platform is browser-free), but
+#    the FALLBACKS still do, and one lean Chromium peaks ~206MB. On a 512MB box
+#    two at once is an OOM that takes the API down with the scraper.
+#    _browser_slot() caps live browsers process-wide (BROWSER_MAX_CONCURRENT,
+#    default 1), which is also what lets memory_capped_workers() allow more than
+#    one browser-free scrape on a small box.
+#
+# Lock order is acyclic: a browser slot is never held while waiting for a pace
+# lock EXCEPT the Facebook lean session (which then takes the facebook pace
+# lock), and a facebook pace holder never needs a browser slot because the only
+# thing that could launch one inside it — the User-Agent probe — is warmed once
+# at boot (see main()).
+# ---------------------------------------------------------------------------
+_PACE_LOCKS = {'offerup': threading.Lock(), 'facebook': threading.Lock()}
+_PACE_LAST_END = {'offerup': 0.0, 'facebook': 0.0}
+_PACE_ENV = {'offerup': ('OFFERUP_TERM_DELAY_SEC', 3.0),
+             'facebook': ('FB_TERM_DELAY_SEC', 0.75)}
+
+
+def _pace_gap(platform):
+    name, default = _PACE_ENV[platform]
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+@contextmanager
+def _paced(platform, cached=None):
+    """
+    One request to `platform` at a time, process-wide, with the gap between.
+
+    `cached` (optional) is called once the lock is held, BEFORE the gap: if it
+    returns rows, they are yielded as {'hit': rows} and no request is made, so no
+    gap is consumed. That is what stops users who share a search from queueing
+    3s apart behind each other just to read the same cached result.
+    """
+    with _PACE_LOCKS[platform]:
+        if cached is not None:
+            hit = cached()
+            if hit is not None:
+                yield {'hit': hit}
+                return
+        wait = _PACE_LAST_END[platform] + _pace_gap(platform) - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            yield {'hit': None}
+        finally:
+            _PACE_LAST_END[platform] = time.time()
+
+
+def _browser_budget():
+    try:
+        return max(1, int(os.getenv('BROWSER_MAX_CONCURRENT', '1')))
+    except ValueError:
+        return 1
+
+
+_BROWSER_SLOTS = threading.BoundedSemaphore(_browser_budget())
+_BROWSER_TL = threading.local()
+
+
+@contextmanager
+def _browser_slot(blocking=True):
+    """
+    Hold one of the process-wide browser slots; yields True when held.
+
+    Re-entrant per thread, because some launchers call others (the Mercari
+    capture calls the UA probe) and a plain semaphore would deadlock a thread on
+    itself. blocking=False yields False instead of waiting — the UA probe uses it
+    so it can never wait on a slot while its caller holds a pace lock.
+    """
+    depth = getattr(_BROWSER_TL, 'depth', 0)
+    if depth == 0 and not _BROWSER_SLOTS.acquire(blocking=blocking):
+        yield False
+        return
+    _BROWSER_TL.depth = depth + 1
+    try:
+        yield True
+    finally:
+        _BROWSER_TL.depth -= 1
+        if _BROWSER_TL.depth == 0:
+            _BROWSER_SLOTS.release()
+
+
+def _uses_browser(fn):
+    """Decorator for a function that launches (and closes) its own browser."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        with _browser_slot():
+            return fn(*a, **k)
+    return wrapper
+
+
+# One curl_cffi session per scraping THREAD, reused across terms and scrapes.
+# The warm-up GET that earns OfferUp's __cf_bm cookie used to run before EVERY
+# term (measured 0.58s, and one extra request each time). The cookie lasts far
+# longer than a scrape, so it is now earned once and reused until it ages out or
+# a request fails. Thread-local because a curl_cffi Session is not thread-safe.
+_OU_SESSION_TL = threading.local()
+
+
+def _offerup_curl_session(cffi, impersonate, proxies, timeout):
+    """(session, warmed_now) — reuse this thread's warm session when still fresh."""
+    try:
+        max_age = float(os.getenv('OFFERUP_SESSION_MAX_AGE_SEC', '600'))
+    except ValueError:
+        max_age = 600.0
+    cur = getattr(_OU_SESSION_TL, 'state', None)
+    if (cur and cur['proxies'] == proxies and cur['impersonate'] == impersonate
+            and time.time() - cur['born'] < max_age):
+        return cur['session'], False
+    _offerup_drop_curl_session()
+    s = cffi.Session(impersonate=impersonate)
+    warm = s.get(os.getenv('OFFERUP_WARMUP_URL', 'https://offerup.com/robots.txt'),
+                 proxies=proxies, timeout=timeout)
+    _record_bytes('offerup', len(warm.content or b''))
+    _OU_SESSION_TL.state = {'session': s, 'born': time.time(),
+                            'proxies': proxies, 'impersonate': impersonate}
+    return s, True
+
+
+def _offerup_drop_curl_session():
+    cur = getattr(_OU_SESSION_TL, 'state', None)
+    _OU_SESSION_TL.state = None
+    if cur:
+        try:
+            cur['session'].close()
+        except Exception:
+            pass
+
+
+def _offerup_fetch_via_curl(term, lat, lon, force_no_proxy=False):
+    """
+    Browser-free GetModularFeed over curl_cffi — the OfferUp equivalent of
+    browserless Facebook. Returns (items, error_or_None).
+
+    The search API's gate is the TLS fingerprint plus a session cookie and the
+    Origin header — NOT OfferUp's own JavaScript — so curl_cffi impersonating
+    Chrome clears it with no browser at all. Measured 2026-10-19: one warm-up GET
+    to /robots.txt (which sets the __cf_bm cookie) then the credentialed POST
+    returned HTTP 200 and 49 listing tiles in ~38KB / ~0.5s, versus a full
+    Chromium launch per term before. The old "a plain requests POST gets 403"
+    note was `requests`, not curl_cffi — the same lesson Facebook taught.
+
+    The item PAGE is NOT reachable this way (it serves a Cloudflare JS challenge),
+    so this yields search rows, not per-item post dates — see the first-seen
+    stamp in scrape_offerup_for_user. Any error returns the caller to the browser
+    path, exactly like Facebook's fallback.
+    """
+    query = _offerup_query()
+    if not query:
+        # The browser path can self-heal a missing document; curl cannot capture
+        # one (that needs the request OfferUp's own JS issues), so defer to it.
+        return None, 'no stored GetModularFeed document for the browser-free path'
+    try:
+        from curl_cffi import requests as cffi
+    except ImportError as e:
+        return None, f'curl_cffi missing ({e})'
+
+    proxies = None
+    if not force_no_proxy:
+        px = _get_proxy('offerup')
+        if px:
+            n = _normalize_proxy(px)
+            proxies = {'http': n, 'https': n}
+    impersonate = (os.getenv('OFFERUP_TLS_IMPERSONATE') or 'chrome').strip()
+    timeout = int(os.getenv('OFFERUP_HTTP_TIMEOUT_SEC', '30'))
+    try:
+        limit = int(os.getenv('OFFERUP_MAX_ROWS_PER_TERM', '30')) or 30
+    except ValueError:
+        limit = 30
+    params = [
+        {'key': 'q', 'value': term},
+        {'key': 'platform', 'value': 'web'},
+        {'key': 'lon', 'value': str(lon)},
+        {'key': 'lat', 'value': str(lat)},
+        {'key': 'limit', 'value': str(limit)},
+    ]
+    body = {'operationName': 'GetModularFeed',
+            'variables': {'debug': False, 'searchParams': params},
+            'query': query}
+    try:
+        # The warm-up GET (robots.txt, 2.6KB) earns OfferUp's __cf_bm cookie,
+        # which the credentialed POST then carries — the browser's handshake
+        # without the browser. Earned once per thread and reused across terms;
+        # see _offerup_curl_session.
+        s, _ = _offerup_curl_session(cffi, impersonate, proxies, timeout)
+        r = s.post('https://offerup.com/api/graphql', json=body, proxies=proxies,
+                   timeout=timeout,
+                   headers={'content-type': 'application/json', 'accept': '*/*',
+                            'origin': 'https://offerup.com', 'referer': 'https://offerup.com/'})
+        _record_bytes('offerup', len(r.content or b''))
+    except Exception as e:
+        _offerup_drop_curl_session()
+        return None, f'{type(e).__name__}: {str(e)[:120]}'
+    if r.status_code != 200:
+        # A stale or flagged session is the likeliest cause, so the next call
+        # re-warms from scratch instead of reusing it.
+        _offerup_drop_curl_session()
+        return None, f'HTTP {r.status_code}'
+    try:
+        payload = json.loads(r.text or '{}')
+    except Exception:
+        _offerup_drop_curl_session()
+        return None, 'unparseable graphql response'
+    if payload.get('errors'):
+        return None, 'graphql errors: ' + json.dumps(payload['errors'])[:160]
+    return _offerup_tiles_to_items(payload), None
+
+
 def _offerup_fetch_via_graphql(term, lat, lon, force_no_proxy=False):
     """Search OfferUp at explicit coordinates. Returns (items, error_or_None)."""
+    # Browser-free first. curl_cffi clears the same gate the browser did for a
+    # fraction of the memory and time, and it is what lets a whole scrape avoid
+    # launching Chromium at all — OfferUp was the last per-term browser. The
+    # browser path below stays as the fallback; OFFERUP_BROWSERLESS=0 forces it,
+    # exactly like Facebook's FB_BROWSERLESS.
+    if _env_flag('OFFERUP_BROWSERLESS', True):
+        items, err = _offerup_fetch_via_curl(term, lat, lon, force_no_proxy=force_no_proxy)
+        if not err:
+            return items, None
+        _emit(f"[offerup] browser-free fetch failed ({err}) — falling back to a browser")
+    return _offerup_fetch_via_graphql_browser(term, lat, lon, force_no_proxy=force_no_proxy)
+
+
+@_uses_browser
+def _offerup_fetch_via_graphql_browser(term, lat, lon, force_no_proxy=False):
+    """The Chromium fallback for GetModularFeed. Holds a process-wide browser slot."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:
@@ -2654,6 +3344,7 @@ def _offerup_fetch_via_graphql(term, lat, lon, force_no_proxy=False):
                 pass
 
 
+@_uses_browser
 def _offerup_fetch_with_playwright(url, stealth=False, force_no_proxy=False):
     """Fetch OfferUp search page using Playwright headless Chromium."""
     try:
@@ -2755,14 +3446,19 @@ def _patchright_clean_ua():
         try:
             from patchright.sync_api import sync_playwright
             prof = tempfile.mkdtemp(prefix='pixelflip_ua_probe_')
-            with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(
-                    prof, headless=True,
-                    no_viewport=True,
-                    **_mercari_chrome_kwargs(),
-                )
-                ua = ctx.new_page().evaluate('navigator.userAgent')
-                ctx.close()
+            with _browser_slot(blocking=False) as got_slot:
+                if not got_slot:
+                    # Another browser is live. Waiting could deadlock (the caller
+                    # may hold a pace lock); the static UA below is the safe answer.
+                    raise RuntimeError('browser budget busy')
+                with sync_playwright() as p:
+                    ctx = p.chromium.launch_persistent_context(
+                        prof, headless=True,
+                        no_viewport=True,
+                        **_mercari_chrome_kwargs(),
+                    )
+                    ua = ctx.new_page().evaluate('navigator.userAgent')
+                    ctx.close()
             _PATCHRIGHT_UA_CACHE = (ua or '').replace('HeadlessChrome', 'Chrome')
         except Exception as e:
             print(f"[mercari] UA probe failed ({e}); falling back to static UA", flush=True)
@@ -2984,14 +3680,76 @@ def _mercari_token_expiry(ctx):
         return None
 
 
+def _mercari_token_state():
+    """
+    ('ok' | 'expired' | 'absent' | 'unreadable', exp_epoch_or_None) for the STORED
+    bearer, read straight from scraper_state.
+
+    _load_persisted_mercari_ctx() returns None for both 'expired' and 'absent',
+    which is the right call for "should I use this token" but useless for telling
+    the user WHY Mercari is down. This keeps the two apart so the console can say
+    "token expired 2026-10-16" instead of a blank "unavailable".
+    """
+    conn = cursor = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return 'unreadable', None
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM scraper_state WHERE key = %s;",
+                       (_mercari_ctx_state_key(),))
+        row = cursor.fetchone()
+        if not row:
+            return 'absent', None
+        payload = row[0]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        ctx = (payload or {}).get('ctx') if isinstance(payload, dict) else None
+        exp = _mercari_token_expiry(ctx)
+        if exp is None:
+            return 'unreadable', None
+        return ('expired' if time.time() >= exp else 'ok'), exp
+    except Exception:
+        return 'unreadable', None
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def _mercari_unavailable_reason():
+    """Plain-English reason Mercari cannot run on a host that cannot mint tokens."""
+    state, exp = _mercari_token_state()
+    if state == 'expired' and exp:
+        when = datetime.fromtimestamp(exp, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        return (f"Mercari unavailable: access token expired {when} (JWT exp passed). "
+                "It renews automatically via the token job — Mercari results resume "
+                "once a fresh one is minted.")
+    if state == 'absent':
+        return ("Mercari unavailable: no access token has been minted yet. The token "
+                "job creates it; Mercari results resume once that runs.")
+    return ("Mercari unavailable: its access token is unreadable and will be "
+            "re-minted by the token job.")
+
+
 def _load_persisted_mercari_ctx():
     """A recently captured context from disk, or None if absent/stale/unusable."""
     if not _env_flag('MERCARI_PERSIST_CTX', True):
         return None
-    # A CAP, not the real gate. The token's own `exp` decides below; this only
-    # stops a context living forever if the JWT is ever unreadable. Six hours
-    # because erring long is the cheap direction — being wrong costs one 403 and
-    # one re-capture, while being conservative costs a ~1GB browser launch.
+    # A FALLBACK, not the gate. The token's own `exp` decides below; this only
+    # stops a context living forever when the JWT cannot be read at all. Six
+    # hours because erring long is the cheap direction — being wrong costs one
+    # 403 and one re-capture, while being conservative costs a ~1GB browser
+    # launch.
+    #
+    # It used to be applied IN ADDITION to `exp`, which quietly turned it into a
+    # hard six-hour expiry on a seven-day token. Measured 2026-09-15: a context
+    # with 7.0 days of JWT remaining was rejected once its stamp was 7 hours
+    # old. On a box that cannot capture (MERCARI_ALLOW_CAPTURE=0 on Render) that
+    # meant Mercari worked for six hours after each capture and then refused for
+    # the rest of the week — defeating the mint-once/scrape-all-week split this
+    # store exists to provide.
     try:
         ttl = int(os.getenv('MERCARI_CTX_TTL_SEC', '21600'))
     except ValueError:
@@ -3014,11 +3772,10 @@ def _load_persisted_mercari_ctx():
         if not isinstance(payload, dict):
             return None
         age = time.time() - float(payload.get('stamp') or 0)
-        if age > max(0, ttl):
-            return None
         ctx = payload.get('ctx') or None
-        # The token's own expiry outranks the cap. Refresh a few minutes early
-        # rather than discovering expiry as a mid-scrape 403.
+        # The token's own expiry IS the gate. Refresh a few minutes early rather
+        # than discovering expiry as a mid-scrape 403. The age cap applies only
+        # when there is no readable expiry to trust — see the note above.
         exp = _mercari_token_expiry(ctx)
         if exp is not None:
             try:
@@ -3029,6 +3786,10 @@ def _load_persisted_mercari_ctx():
                 _emit(f"[mercari] persisted bearer expires in "
                       f"{int((exp - time.time()) / 60)} min — re-capturing", 'info')
                 return None
+        elif age > max(0, ttl):
+            _emit(f"[mercari] stored context is {int(age / 3600)}h old and its "
+                  "expiry is unreadable — re-capturing", 'info')
+            return None
         # A hand-edited or partially written row must not become a broken context
         # that fails every replay until the cap expires.
         if not (isinstance(ctx, dict)
@@ -3077,7 +3838,7 @@ def _load_persisted_mercari_ctx():
 # known_links and Vision all still run per user on the fan-out, so no user sees
 # another user's filtering.
 # ---------------------------------------------------------------------------
-_MERCARI_CYCLE = {'stamp': 0.0, 'items': {}}
+_MERCARI_CYCLE = {}            # term -> (stamp, rows); merged per term across cycles
 _MERCARI_CYCLE_LOCK = threading.Lock()
 
 
@@ -3098,16 +3859,30 @@ def _mercari_cycle_ttl():
 
 def mercari_prefetch_cycle(terms, max_rows=None):
     """
-    Fetch every unique term once for this cycle. Returns (n_terms, error).
+    Fetch every unique term the starting users need, ONCE. Returns
+    (n_terms_fetched, error).
 
     Called from the scheduler before users fan out to the thread pool, so the
     one browser this opens is the only one Mercari needs for the whole cycle.
+
+    Terms already fetched within the cycle TTL are skipped, and the cache is
+    MERGED per term rather than replaced. With continuous dispatch the scheduler
+    calls this every cycle (15s) for whichever users it is starting; replacing
+    the cache wholesale would re-fetch the same terms every 15s and evict terms
+    that a scrape already in flight has not reached yet.
     """
-    global _MERCARI_CYCLE
     terms = sorted({(t or '').strip() for t in (terms or []) if (t or '').strip()})
     if not terms:
         return 0, None
     if not (_env_flag('MERCARI_USE_API', True) and _env_flag('MERCARI_SHARED_FETCH', True)):
+        return 0, None
+    ttl = _mercari_cycle_ttl()
+    now = time.time()
+    with _MERCARI_CYCLE_LOCK:
+        for t in [t for t, (stamp, _) in _MERCARI_CYCLE.items() if now - stamp > ttl]:
+            del _MERCARI_CYCLE[t]
+        missing = [t for t in terms if t not in _MERCARI_CYCLE]
+    if not missing:
         return 0, None
     if max_rows is None:
         try:
@@ -3115,10 +3890,12 @@ def mercari_prefetch_cycle(terms, max_rows=None):
         except ValueError:
             max_rows = 30
 
-    items, err = _mercari_fetch_via_api(terms, max_rows)
+    items, err = _mercari_fetch_via_api(missing, max_rows)
     if items:
+        stamp = time.time()
         with _MERCARI_CYCLE_LOCK:
-            _MERCARI_CYCLE = {'stamp': time.time(), 'items': items}
+            for t, rows in items.items():
+                _MERCARI_CYCLE[t] = (stamp, rows)
     return len(items or {}), err
 
 
@@ -3133,10 +3910,10 @@ def _mercari_in_cooldown():
 def _mercari_cycle_items(term):
     """This cycle's listings for `term`, or None if not fetched / too old."""
     with _MERCARI_CYCLE_LOCK:
-        stamp = _MERCARI_CYCLE.get('stamp') or 0.0
-        if not stamp or (time.time() - stamp) > _mercari_cycle_ttl():
+        entry = _MERCARI_CYCLE.get(term)
+        if not entry or (time.time() - entry[0]) > _mercari_cycle_ttl():
             return None
-        return _MERCARI_CYCLE.get('items', {}).get(term)
+        return entry[1]
 
 
 def _mercari_profile_dir():
@@ -3503,9 +4280,10 @@ def _mercari_fetch_via_api(terms, max_rows):
     # capture_mercari_token.py) and, if there is no usable token, skips Mercari
     # with a reason instead of OOM-ing the whole service to discover it.
     if not _env_flag('MERCARI_ALLOW_CAPTURE', True):
-        return {}, ('no usable stored token and MERCARI_ALLOW_CAPTURE=0 — this '
-                    'host does not mint tokens; run capture_mercari_token.py '
-                    'somewhere with memory')
+        # This host cannot mint a token (the browser capture peaks ~1GB and would
+        # OOM a 512MB box). Say exactly why there is no usable one — expired vs
+        # never-minted — so the dashboard shows "jwt expired", not a blank failure.
+        return {}, _mercari_unavailable_reason()
 
     # Check the cooldown HERE and return without touching it. Doing this inside
     # the session made "in cooldown" look like a fresh failure: the caller then
@@ -3540,6 +4318,7 @@ def _mercari_fetch_via_api(terms, max_rows):
     return items, f'{err} — not retrying for {cool}s'
 
 
+@_uses_browser
 def _mercari_api_session(terms, max_rows, bundled=False):
     """
     Search Mercari for several terms over ONE browser session.
@@ -3684,6 +4463,7 @@ def _mercari_api_session(terms, max_rows, bundled=False):
                 pass
 
 
+@_uses_browser
 def _mercari_fetch_with_patchright(url):
     """
     Fetch Mercari via patchright (an undetected Playwright fork).
@@ -3814,6 +4594,7 @@ def _mercari_fetch_with_patchright(url):
                 pass
 
 
+@_uses_browser
 def _mercari_fetch_with_playwright(url):
     """Fetch Mercari search page using Playwright headless Chromium."""
     try:
@@ -3935,9 +4716,23 @@ def _parse_offerup_last_updated_ago(text):
     return datetime.now(timezone.utc) - delta
 
 
-def _offerup_listed_at_from_item_page(link, polite_delay_sec):
+def _offerup_item_details(link, polite_delay_sec, want_posted=False, want_description=False):
     """
-    The seller's original post date for one OfferUp listing. Off by default.
+    The post date AND/OR the body text for one OfferUp listing, from ONE fetch.
+
+    Returns (listed_at, description); either may be None. It used to return only
+    the date and throw the parsed payload away, which meant description scanning
+    would have re-fetched the identical ~236KB page. Both fields live in the
+    SAME object, so they cost one request between them.
+
+    Measured 2026-09-10 on two live items: the description is a plain string at
+    `props.pageProps.initialApolloState.ROOT_QUERY.listing({"listingId": ...})`,
+    the very object `postDate` comes from. Exactly one such object per page.
+
+    Callers pass the flags rather than this reading the environment, because the
+    two features are switched on independently: OFFERUP_FETCH_ITEM_POSTED for
+    the date, the user's Pro description toggle for the body. Either one alone
+    justifies the fetch, and neither should pay for it twice.
 
     THIS USED TO LAUNCH A WHOLE BROWSER PER LISTING. _offerup_fetch_with_playwright
     opens its own `sync_playwright()` and `chromium.launch()`, so enabling the
@@ -3956,19 +4751,20 @@ def _offerup_listed_at_from_item_page(link, polite_delay_sec):
     Verified it is scoped to this item: exactly one object in the page has
     postDate and its listingId matches the URL.
 
-    Still opt-in, because the cost is now BANDWIDTH: ~220KB per item page against
-    ~15KB for a whole search. Only genuinely new listings pay it — this sits
-    after the known_links check — but a first scan of 48 new listings is ~10MB
+    Still opt-in, because the cost is BANDWIDTH: measured 235-237KB per item
+    page on 2026-09-10, against ~15KB for a whole search. (An earlier table said
+    148KB; that figure was low.) Only genuinely new listings pay it — this sits
+    after the known_links check — but a first scan of 48 new listings is ~11MB
     through a residential proxy.
     """
-    if not _env_flag('OFFERUP_FETCH_ITEM_POSTED', False):
-        return None
+    if not (want_posted or want_description):
+        return None, None
     if not link or '/item/' not in link:
-        return None
+        return None, None
     try:
         from curl_cffi import requests as cffi
     except ImportError:
-        return None
+        return None, None
 
     item_id = link.rstrip('/').rsplit('/', 1)[-1]
     proxies = None
@@ -3987,48 +4783,363 @@ def _offerup_listed_at_from_item_page(link, polite_delay_sec):
         _record_bytes('offerup', len(r.content or b''))
         time.sleep(max(0.0, polite_delay_sec))
         if r.status_code != 200:
-            return None
+            return None, None
         m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
         if not m:
-            return None
+            return None, None
         data = json.loads(m.group(1))
     except Exception:
-        return None
+        return None, None
 
-    # Take postDate only from the object that IS this listing. The page also
-    # embeds related items, and picking the first postDate found would date the
-    # listing from whatever OfferUp happened to recommend beside it.
+    # Scope to the object that IS this listing. The page also embeds related
+    # items, so taking the first match would date the listing from whatever
+    # OfferUp happened to recommend beside it — and, now, describe it with a
+    # stranger's body text.
     found = []
 
     def _walk(node):
         if found:
             return
         if isinstance(node, dict):
-            if node.get('postDate') and (
-                    str(node.get('listingId')) == item_id
-                    or str(node.get('id')) == item_id):
-                found.append(node['postDate'])
-                return
+            if (str(node.get('listingId') or '') == item_id
+                    or str(node.get('id') or '') == item_id):
+                # Anchor on identity, then require one of the two fields we came
+                # for. Requiring postDate specifically (as this did) would find
+                # nothing on a page fetched only for its description.
+                if node.get('postDate') or node.get('description'):
+                    found.append(node)
+                    return
             for v in node.values():
                 _walk(v)
         elif isinstance(node, list):
             for v in node:
                 _walk(v)
 
-    try:
-        _walk(data)
-        if not found:
-            return None
-        raw = str(found[0]).replace('Z', '+00:00')
-        dt = datetime.fromisoformat(raw)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
+    _walk(data)
+    if not found:
+        return None, None
+    obj = found[0]
+
+    # Parsed independently: a malformed date must not cost us the body, and a
+    # missing body must not cost us the date.
+    listed_at = None
+    if want_posted and obj.get('postDate'):
+        try:
+            raw = str(obj['postDate']).replace('Z', '+00:00')
+            dt = datetime.fromisoformat(raw)
+            listed_at = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            listed_at = None
+
+    description = None
+    if want_description:
+        # `description` is the plain string; `descriptionHast` beside it is a
+        # syntax tree of the same text and is not what we want to match against.
+        raw_desc = obj.get('description')
+        if isinstance(raw_desc, str) and raw_desc.strip():
+            description = raw_desc.strip()
+
+    return listed_at, description
+
+
+_MERCARI_ITEM_ID_RE = re.compile(r'/item/(m\d+)')
+
+
+def _mercari_item_id_from_link(link):
+    """The mNNNN item id in a Mercari URL, or None."""
+    if not link:
         return None
+    m = _MERCARI_ITEM_ID_RE.search(str(link))
+    return m.group(1) if m else None
+
+
+def _mercari_item_delay_sec():
+    """
+    Pause between item pages. Mercari sits behind Cloudflare and a previous
+    session earned a block by probing it hard, so item pages are paced a little
+    more conservatively than Facebook's.
+    """
+    try:
+        return float(os.getenv('MERCARI_ITEM_DELAY_SEC', '0.6'))
+    except ValueError:
+        return 0.6
+
+
+def _mercari_description_from_item_html(html, item_id=None):
+    """
+    The seller's body text from a Mercari item page, or None.
+
+    Measured on a live item 2026-09-15. Two usable sources:
+
+      1. __NEXT_DATA__ -> props.pageProps.serverState['ItemDetail:<item_id>']
+         .description. PREFERRED, because the KEY carries the item id: the
+         object is scoped by construction rather than by searching for it.
+      2. The JSON-LD Product block, which carries the identical text. Used only
+         when the serverState shape moves.
+
+    NEVER og:description. It reads like a description and is not one — it is
+    Mercari's own marketing copy ("Shop smarter... Discover amazing secondhand
+    deals daily."), near-identical on every listing. Matching keywords against
+    it would make 'new', 'condition' and 'deals' hit the entire platform, which
+    is indistinguishable from the filter being broken.
+    """
+    if not html:
+        return None
+    m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        try:
+            state = (((json.loads(m.group(1)).get('props') or {})
+                      .get('pageProps') or {}).get('serverState') or {})
+        except (ValueError, TypeError, AttributeError):
+            state = {}
+        if isinstance(state, dict):
+            if item_id:
+                # Keyed lookup only. If we asked for item X and the page does
+                # not carry ItemDetail:X, something redirected us — a removed
+                # listing lands on a different item — and returning whatever
+                # body IS on the page would attribute a stranger's text to X.
+                # Fail closed.
+                node = state.get('ItemDetail:%s' % item_id)
+            else:
+                # No id to check against: accept the page's body only when it is
+                # unambiguous, i.e. exactly one ItemDetail entry.
+                candidates = [v for k, v in state.items()
+                              if str(k).startswith('ItemDetail:') and isinstance(v, dict)]
+                node = candidates[0] if len(candidates) == 1 else None
+            if isinstance(node, dict):
+                d = node.get('description')
+                if isinstance(d, str) and d.strip():
+                    return d.strip()
+
+    # JSON-LD carries the identical text but is NOT keyed by id, so it is only
+    # trustworthy once we know the page really is about the item we asked for.
+    # Without this a redirect (a removed listing lands elsewhere) would hand back
+    # the replacement's body under the original's id.
+    if item_id and item_id not in html:
+        return None
+    for blob in re.findall(r'<script type="application/ld\+json"[^>]*>(.*?)</script>',
+                           html, re.S):
+        try:
+            found = _mercari_ld_description(json.loads(blob))
+        except (ValueError, TypeError):
+            continue
+        if found:
+            return found
+    return None
+
+
+def _mercari_ld_description(node):
+    """The description from a JSON-LD Product block, walking nested graphs."""
+    if isinstance(node, dict):
+        if str(node.get('@type') or '') == 'Product':
+            d = node.get('description')
+            if isinstance(d, str) and d.strip():
+                return d.strip()
+        for v in node.values():
+            found = _mercari_ld_description(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = _mercari_ld_description(v)
+            if found:
+                return found
+    return None
+
+
+class _MercariItemSession:
+    """
+    One curl_cffi session for item pages, reused across a user's scrape.
+
+    Item pages are Cloudflare-fronted HTML, and the credential that gets through
+    is the CAPTURED CONTEXT, not the TLS signature on its own. Measured
+    2026-09-15: a curl_cffi GET carrying only a User-Agent got HTTP 403 and a
+    "Just a moment..." challenge, while the same client replaying the captured
+    header set and cookie jar got HTTP 200 and 234KB. (The handoff's "curl_cffi
+    defeats the gate, the gate is the TLS fingerprint alone" was measured
+    against /v1/api replaying a captured context — it does not generalise to
+    Mercari's HTML pages.)
+
+    So descriptions ride on the context the weekly token capture already
+    produces: no second credential, no browser.
+
+    A Session rather than bare gets, for the same reason the search replay uses
+    one: __cf_bm and mercarius_session rotate on Cloudflare's responses and
+    expire in minutes, so a jar that is never updated goes stale mid-scrape.
+    """
+
+    def __init__(self, ctx=None):
+        self._ctx = ctx
+        self._sess = None
+        # Resolved on the first fetch and reused for the rest of the scrape.
+        self._proxies = None
+        self._route_decided = False
+
+    def _proxy_mode(self):
+        """'auto' (default), 'always', or 'never'."""
+        raw = (os.getenv('MERCARI_ITEM_PROXY') or 'auto').strip().lower()
+        return raw if raw in ('auto', 'always', 'never') else 'auto'
+
+    def _configured_proxies(self):
+        px = _get_proxy('mercari')
+        if not px:
+            return None
+        n = _normalize_proxy(px)
+        return {'http': n, 'https': n}
+
+    def _decide_route(self, url):
+        """
+        Choose direct-vs-proxy ONCE per scrape by trying direct first.
+
+        Measured 2026-09-28 from a residential connection: the same item page
+        returned HTTP 200 / 232KB both direct and proxied, direct marginally
+        faster. Going direct therefore saves the entire ~232KB per new listing
+        of METERED residential bandwidth.
+
+        It cannot simply be hardcoded, though: that was a home IP, and
+        production runs on Render, whose egress is a datacenter range Cloudflare
+        treats far more harshly. Probing once per scrape — rather than per
+        listing — caps the cost of being wrong at a single ~6KB challenge page
+        and lets the same code be efficient on a laptop and correct on Render.
+        """
+        mode = self._proxy_mode()
+        if mode == 'always':
+            self._proxies = self._configured_proxies()
+            self._route_decided = True
+            return
+        if mode == 'never':
+            self._proxies = None
+            self._route_decided = True
+            return
+
+        configured = self._configured_proxies()
+        if configured is None:
+            # Nothing to fall back to; direct is the only route.
+            self._proxies = None
+            self._route_decided = True
+            return
+
+        # The probe is a real fetch of the url we were asked for, so on success
+        # its response IS the answer — it is handed back rather than discarded.
+        html = self._get(url, None)
+        if html and 'Just a moment' not in html:
+            _emit('[mercari desc] item pages reachable WITHOUT the proxy — '
+                  'saving residential bandwidth for this scrape', 'info')
+            self._proxies = None
+            self._route_decided = True
+            return html
+
+        _emit('[mercari desc] direct item fetch was challenged — using the '
+              'residential proxy for this scrape', 'info')
+        self._proxies = configured
+        self._route_decided = True
+        return None
+
+    def _ensure(self):
+        if self._sess is not None:
+            return self._sess
+        if self._ctx is None:
+            self._ctx = _MERCARI_API_CTX or _load_persisted_mercari_ctx()
+        if not (self._ctx and self._ctx.get('headers')):
+            return None
+        try:
+            from curl_cffi import requests as cffi
+        except ImportError:
+            return None
+        sess = cffi.Session()
+        try:
+            sess.cookies.update(self._ctx.get('cookies') or {})
+        except Exception:
+            pass
+        self._sess = sess
+        return sess
+
+    def fetch(self, url):
+        if self._ensure() is None:
+            _emit('[mercari desc] no captured context — cannot read item pages')
+            return ''
+        if not self._route_decided:
+            # The probe IS a real fetch of this url, so a successful one is the
+            # answer — never pay for the same page twice.
+            probed = self._decide_route(url)
+            if probed:
+                return probed
+        return self._get(url, self._proxies)
+
+    def _get(self, url, proxies):
+        sess = self._ensure()
+        if sess is None:
+            return ''
+        try:
+            r = sess.get(
+                url, headers=self._ctx.get('headers') or {}, proxies=proxies,
+                impersonate=(os.getenv('MERCARI_TLS_IMPERSONATE') or 'chrome').strip(),
+                timeout=int(os.getenv('MERCARI_HTTP_TIMEOUT_SEC', '45')),
+            )
+        except Exception as e:
+            _emit(f"[mercari desc] fetch failed: {type(e).__name__}: {e}")
+            return ''
+        _record_bytes('mercari', len(r.content or b''))
+        if r.status_code != 200:
+            _emit(f"[mercari desc] item page HTTP {r.status_code}")
+            return ''
+        return r.text or ''
+
+    def close(self):
+        if self._sess is not None:
+            try:
+                self._sess.close()
+            except Exception:
+                pass
+        self._sess = None
+
+
+def _mercari_fetch_description(session, link, log_callback=None, user_id=None, debug=False):
+    """
+    One item page, one request, no browser.
+
+    Returns None both when the page was challenged and when the seller wrote
+    nothing, so the two are logged distinctly — a scraper that comes back empty
+    has to say which it was.
+    """
+    item_id = _mercari_item_id_from_link(link)
+    if not item_id:
+        return None
+    url = link if str(link).startswith('http') else f'https://www.mercari.com{link}'
+    html = session.fetch(url)
+    if not html:
+        return None
+    if 'Just a moment' in html:
+        if debug and log_callback:
+            log_callback(user_id,
+                         f"Mercari description: item {item_id} hit a Cloudflare "
+                         "challenge, so keyword filters matched its title only.",
+                         'info')
+        return None
+    desc = _mercari_description_from_item_html(html, item_id)
+    if desc is None and debug and log_callback:
+        log_callback(user_id,
+                     f"Mercari description: item {item_id} has no body text "
+                     "(page fetched fine, seller left it blank).", 'info')
+    return desc
 
 
 def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
-                            debug=False, log_callback=None, known_links=None):
+                            debug=False, log_callback=None, known_links=None,
+                            scan_description=False):
     listings = []
+    desc_fetched = 0
+    desc_missing = 0
+    skipped_desc = 0
+    # Opened lazily and only if a description is actually needed, so a scan that
+    # never wants one never builds a session.
+    _own_desc_session = []
+
+    def _desc_session():
+        if not _own_desc_session:
+            _own_desc_session.append(_MercariItemSession())
+        return _own_desc_session[0]
+
     _set_active_log(user_id, log_callback)
     if log_callback:
         log_callback(user_id, "Waking up Mercari scraper...", "info")
@@ -4104,10 +5215,17 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
         if api_err:
             _emit(f"[mercari] search API unavailable ({api_err}) — "
                   "falling back to page rendering")
-            if debug and log_callback:
-                log_callback(user_id,
-                             f"Mercari: search API unavailable ({api_err[:80]}) — "
-                             "using the slower page path.", 'info')
+            if log_callback:
+                # When this host cannot mint a token, the page-rendering fallback
+                # cannot succeed either, so show the real reason as an ERROR rather
+                # than implying a silent retry on "the slower page path" will fix
+                # it. api_err already carries the precise cause (e.g. jwt expired).
+                if not _env_flag('MERCARI_ALLOW_CAPTURE', True):
+                    log_callback(user_id, api_err, 'error')
+                elif debug:
+                    log_callback(user_id,
+                                 f"Mercari: search API unavailable ({api_err[:80]}) — "
+                                 "using the slower page path.", 'info')
         elif debug and log_callback:
             total = sum(len(v) for v in api_items_by_term.values())
             log_callback(user_id,
@@ -4161,7 +5279,14 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                     if not meets_threshold:
                         continue
-                    if is_excluded(title, price, exclusions, search_terms, matched_term):
+                    # Pass 1. The INCLUDE half waits for the body when we are
+                    # going to fetch one; the EXCLUDE half still runs now, since
+                    # a title already excluded can never be rescued by its
+                    # description. See is_excluded's check_includes.
+                    want_desc = bool(scan_description) and _term_wants_description(
+                        search_terms.get(matched_term))
+                    if is_excluded(title, price, exclusions, search_terms, matched_term,
+                                   check_includes=not want_desc):
                         continue
 
                     if not check_image_with_ai(
@@ -4169,6 +5294,25 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                         matched_term=matched_term,
                         term_exclusions=(search_terms.get(matched_term) or {}).get('exclusions')):
                         continue
+
+                    # Pass 2, and the LAST filter: every cheaper test has run,
+                    # so a ~234KB item page is only ever bought for a listing
+                    # that would otherwise be reported.
+                    if want_desc:
+                        if desc_fetched or desc_missing:
+                            _d = _mercari_item_delay_sec()
+                            if _d > 0:
+                                time.sleep(_d)
+                        description = _mercari_fetch_description(
+                            _desc_session(), link, log_callback, user_id, debug)
+                        if description:
+                            desc_fetched += 1
+                        else:
+                            desc_missing += 1
+                        if is_excluded(title, price, exclusions, search_terms,
+                                       matched_term, description=description):
+                            skipped_desc += 1
+                            continue
 
                     listings.append({
                         'title': title,
@@ -4183,19 +5327,43 @@ def scrape_mercari_for_user(user_id, zip_code, search_radius, search_terms, excl
                     })
                 except Exception:
                     continue
-            time.sleep(1)
+            # Politeness pause — but only when this term actually went to the
+            # network (the page-rendering fallback). Terms answered by the search
+            # API were fetched in ONE batched call before this loop, usually by
+            # the scheduler's shared prefetch, so pausing here was sleeping 1s per
+            # term over data already in memory: 10s of a 10-term scan (measured).
+            if fetch_mode != 'search API':
+                time.sleep(1)
         except Exception:
             pass
+    for _own in _own_desc_session:
+        _own.close()
+    warn_descriptions_unavailable('Mercari', desc_fetched, desc_missing,
+                                  log_callback, user_id)
     if debug and log_callback:
-        log_callback(user_id, f"Mercari complete: {len(listings)} candidate matches", "info")
+        desc_note = ''
+        if desc_fetched or desc_missing or skipped_desc:
+            desc_note = (f' (descriptions: {desc_fetched} read'
+                         + (f', {desc_missing} unavailable' if desc_missing else '')
+                         + (f', {skipped_desc} filtered out on body keywords' if skipped_desc else '')
+                         + ')')
+        log_callback(user_id,
+                     f"Mercari complete: {len(listings)} candidate matches{desc_note}",
+                     "info")
     return listings
 
 
 def _tier_from_db_row(row):
+    """
+    The user's tier, resolving ambiguity DOWNWARD.
+
+    See migration 017: a row with is_pro set and no plan_tier used to resolve to
+    'pro', so any non-Stripe path that set is_pro gave away the top plan.
+    """
     t = (row.get('plan_tier') or '').strip().lower()
     if t in ('basic', 'pro'):
         return t
-    return 'pro' if row.get('is_pro') else 'inactive'
+    return 'basic' if row.get('is_pro') else 'inactive'
 
 
 def _coerce_platforms_dict(raw):
@@ -4228,16 +5396,6 @@ def interval_floor_for_tier(tier):
     return PLAN_INTERVAL_FLOOR_MINUTES.get(
         (tier or '').strip().lower(), DEFAULT_INTERVAL_FLOOR_MINUTES
     )
-
-
-def _effective_check_interval_minutes_for_user(row_or_cfg):
-    """Clamp the user's chosen interval up to their plan's floor."""
-    try:
-        stored = int(row_or_cfg.get('check_interval_minutes') or DEFAULT_INTERVAL_FLOOR_MINUTES)
-    except (TypeError, ValueError):
-        stored = DEFAULT_INTERVAL_FLOOR_MINUTES
-    tier = (row_or_cfg.get('plan_tier') or _tier_from_db_row(row_or_cfg)).strip().lower()
-    return max(stored, interval_floor_for_tier(tier))
 
 
 # Priority terms. Keep in sync with app.py and frontend/src/App.js.
@@ -4333,6 +5491,58 @@ def _container_memory_mb():
     return None
 
 
+def memory_detection_report():
+    """
+    One line describing how this box's memory limit was detected, and what it
+    implies for concurrency.
+
+    Exists because the safe-looking advice "delete SCRAPE_MAX_WORKERS and let
+    memory decide" is only safe when the limit came from CGROUP. The fallback in
+    _container_memory_mb reads /proc/meminfo, which inside a container reports
+    the HOST's RAM — tens of gigabytes on a 512MB instance — and returns that
+    instead of None, so the "unknown limit, operator setting stands" safety never
+    engages and the computed cap is wildly too high. Printing the SOURCE at
+    start-up is the difference between deciding that from evidence and guessing.
+    """
+    source = 'unknown'
+    for path, name in (('/sys/fs/cgroup/memory.max', 'cgroup v2'),
+                       ('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'cgroup v1')):
+        try:
+            with open(path) as f:
+                raw = (f.read() or '').strip()
+            if raw and raw != 'max':
+                v = int(raw)
+                if 0 < v < (1 << 62):
+                    source = name
+                    break
+        except Exception:
+            continue
+    else:
+        try:
+            with open('/proc/meminfo') as f:
+                if any(line.startswith('MemTotal:') for line in f):
+                    source = '/proc/meminfo (HOST RAM inside a container — NOT trustworthy)'
+        except Exception:
+            source = 'unknown'
+
+    mb = _container_memory_mb()
+    cap = memory_capped_workers()
+    try:
+        setting = int(os.getenv('SCRAPE_MAX_WORKERS', '3'))
+    except ValueError:
+        setting = 3
+    lean = _env_flag('FB_LEAN_FETCH', False)
+    effective = min(setting, cap) if cap is not None else setting
+    return ("memory: %s via %s | FB_LEAN_FETCH=%s | browsers <= %d | "
+            "browser-free peak %sMB/scrape | memory cap %s worker(s) | "
+            "SCRAPE_MAX_WORKERS=%s | effective concurrency %s"
+            % ('%.0fMB' % mb if mb else 'undetected', source,
+               '1' if lean else '0', _browser_budget(),
+               os.getenv('SCRAPE_BROWSERLESS_PEAK_MB', '40'),
+               cap if cap is not None else 'unknown',
+               setting, effective))
+
+
 def memory_capped_workers():
     """
     The most concurrent scrapes this box's RAM can actually hold, or None when
@@ -4345,8 +5555,22 @@ def memory_capped_workers():
     down with the scraper, which is a spectacularly confusing way to learn you
     have a second user.
 
-    The arithmetic is the one already documented at the call site:
-    (RAM - reserve) / peak-per-scrape, using the 2026-08-11 measurements.
+    BROWSER-FREE ACCOUNTING (2026-11-02). This used to be (RAM - reserve) /
+    peak-per-scrape with a browser in EVERY scrape (206MB lean / 455MB DOM,
+    measured 2026-08-11), so a 512MB box got exactly one worker. Two things
+    changed: steady state launches no browser on any platform, and live browsers
+    are now capped process-wide by _browser_slot (BROWSER_MAX_CONCURRENT,
+    default 1). So the fallbacks are budgeted ONCE, and every concurrent scrape
+    costs only its browser-free peak:
+
+        (RAM - reserve - BROWSER_MAX_CONCURRENT x browser peak)
+        -------------------------------------------------------
+              browser-free peak per concurrent scrape
+
+    SCRAPE_PEAK_MB_PER_WORKER keeps its meaning — what a browser-holding scrape
+    costs. SCRAPE_BROWSERLESS_PEAK_MB (default 40) is the new per-scrape figure,
+    and it is an ESTIMATE: replace it with the production "Memory after
+    <platform>" lines (LOG_MEMORY_ALWAYS=1). The boot line prints every input.
     """
     ram = _container_memory_mb()
     if not ram:
@@ -4357,14 +5581,19 @@ def memory_capped_workers():
         reserve = 200.0
     default_peak = 206.0 if _env_flag('FB_LEAN_FETCH', False) else 455.0
     try:
-        peak = float(os.getenv('SCRAPE_PEAK_MB_PER_WORKER', str(default_peak)))
+        browser_peak = float(os.getenv('SCRAPE_PEAK_MB_PER_WORKER', str(default_peak)))
     except ValueError:
-        peak = default_peak
-    if peak <= 0:
+        browser_peak = default_peak
+    try:
+        browserless_peak = float(os.getenv('SCRAPE_BROWSERLESS_PEAK_MB', '40'))
+    except ValueError:
+        browserless_peak = 40.0
+    if browser_peak <= 0 or browserless_peak <= 0:
         return None
+    budget = ram - reserve - _browser_budget() * browser_peak
     # Always at least 1: refusing to scrape at all is worse than risking the box,
     # and a single scrape is what the operator implicitly asked for by deploying.
-    return max(1, int((ram - reserve) // peak))
+    return max(1, int(budget // browserless_peak))
 
 
 def coalesce_window_sec():
@@ -4901,6 +6130,161 @@ def _fb_json_object_at(text, key_idx):
     return None
 
 
+_FB_DESC_KEY = '"redacted_description"'
+_FB_ITEM_ID_RE = re.compile(r'/marketplace/item/(\d+)')
+
+
+def _fb_listing_id_from_link(link):
+    """The numeric item id in a Marketplace URL, or None."""
+    if not link:
+        return None
+    m = _FB_ITEM_ID_RE.search(str(link))
+    return m.group(1) if m else None
+
+
+def _fb_item_url(listing_id):
+    """
+    Canonical item URL. The `?ref=search&referral_code=...` tail the feed hands
+    us is tracking noise; the bare path serves the same document.
+    """
+    return 'https://www.facebook.com/marketplace/item/%s/' % listing_id
+
+
+def _fb_description_from_item_html(html, listing_id=None):
+    """
+    The seller's body text from an item page, or None.
+
+    Measured 2026-08-29 on live listings: Facebook SERVER-RENDERS the body into
+    the inline Relay JSON as `redacted_description: {"text": ...}`, and it is
+    there with scripts blocked. So an item page is one _FbLeanSession
+    navigation with no script execution, exactly like the search feed — not the
+    ~1.6MB DOM render the handoff feared. (That claim was unverified until now.)
+
+    ANCHOR ON THE DESCRIPTION KEY, NOT THE TITLE KEY. An item page carries ~21
+    listings: the one requested plus a rail of related items. The target's own
+    id appears MORE THAN ONCE — on a compact card that has no description, and
+    on the full PDP object that does. Walking out from
+    `marketplace_listing_title` and taking the first id match returns the card,
+    and the description then reads as missing. That is exactly what happened on
+    the first probe of this feature; measured on two separate live pages.
+
+    `listing_id` is an integrity check, not a lookup: the enclosing object's own
+    id must match the item we asked for, so a layout change that relocated the
+    key fails closed instead of attributing a stranger's text to a listing.
+    """
+    if not html:
+        return None
+    for m in re.finditer(re.escape(_FB_DESC_KEY) + r'\s*:', html):
+        blob = _fb_json_object_at(html, m.start())
+        if not blob:
+            continue
+        try:
+            obj = json.loads(blob)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if listing_id and str(obj.get('id') or '') != str(listing_id):
+            continue
+        raw = obj.get('redacted_description')
+        if isinstance(raw, dict):
+            text = raw.get('text')
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            # null — a seller who left the body blank. Not an error.
+            text = None
+        if text and str(text).strip():
+            return str(text).strip()
+    return None
+
+
+def _term_wants_description(term_cfg):
+    """
+    True only when a description could actually change this term's outcome.
+
+    Description scanning costs one item-page fetch per NEW listing, so paying it
+    for a term with no include and no exclude keyword buys nothing — the body
+    would be fetched, matched against an empty keyword set, and discarded.
+    """
+    cfg = term_cfg or {}
+    return (any(k and str(k).strip() for k in (cfg.get('exclusions') or []))
+            or any(k and str(k).strip() for k in (cfg.get('includes') or [])))
+
+
+def _fb_item_delay_sec():
+    """
+    Pause between item-page fetches, mirroring FB_TERM_DELAY_SEC for terms.
+
+    Description scanning is uncapped by Bryan's decision, so a first scan — when
+    known_links is empty and everything is new — can queue every match at once.
+    The largest first burst on record is 24 Facebook listings. Twenty-four
+    back-to-back navigations is exactly the shape of request that got a login
+    wall served last session, and Facebook runs on the residential proxy
+    production shares, so the reputation cost is real rather than a test
+    artifact. Coverage is unchanged either way; only the spacing differs.
+    """
+    try:
+        return float(os.getenv('FB_ITEM_DELAY_SEC', '0.75'))
+    except ValueError:
+        return 0.75
+
+
+def _fb_fetch_description(session, link, log_callback=None, user_id=None, debug=False):
+    """
+    One item page, one navigation, on an already-open lean browser.
+
+    Measured 2026-08-29 against live listings: the marginal navigation costs
+    3.9s and ~170KB once the session is up. The first one also pays the ~7s
+    Chromium launch, which the term loop has already amortised.
+
+    Only NEW listings reach here (the caller's known_links check runs first), and
+    steady state is small: 47 of the last 67 Facebook scans found exactly one
+    new listing, and 90% found three or fewer.
+
+    Returns None both when the page was blocked and when the seller left the
+    body blank, so the two are logged distinctly — a scraper returning nothing
+    must say which it was.
+    """
+    listing_id = _fb_listing_id_from_link(link)
+    if not listing_id:
+        return None
+    # Item pages serve the description over plain HTTP too (measured 2026-10-12:
+    # HTTP 200, 1.2MB, redacted_description parsed), so descriptions drop the
+    # browser as well. `session` stays as the fallback and is only touched —
+    # and therefore only LAUNCHED — if the browserless fetch fails, so a healthy
+    # scrape never starts Chromium at all.
+    html = ''
+    if _fb_browserless_enabled():
+        html, ok = _fb_browserless_fetch(
+            _fb_item_url(listing_id), listing_id, log_callback, user_id, debug)
+        if not ok:
+            html = ''
+    if not html:
+        try:
+            html = session.fetch(_fb_item_url(listing_id))
+        except Exception as e:
+            _emit("[facebook desc] %s: fetch failed: %s: %s"
+                  % (listing_id, type(e).__name__, str(e)[:120]))
+            return None
+    # _fb_html_is_blocked emits the page size and what was missing. The title
+    # key it looks for on the lean path is present on item pages too (~22
+    # occurrences), so it discriminates a wall from a real page here as well.
+    if _fb_html_is_blocked(html, lean=True):
+        if debug and log_callback:
+            log_callback(user_id,
+                         "Facebook description: item %s looks blocked, not empty "
+                         "— keyword filters fell back to the title for it." % listing_id,
+                         'info')
+        return None
+    desc = _fb_description_from_item_html(html, listing_id)
+    if desc is None and debug and log_callback:
+        log_callback(user_id,
+                     "Facebook description: item %s has no body text (page fetched "
+                     "fine, seller left it blank)." % listing_id, 'info')
+    return desc
+
+
 def _fb_collect_from_json(html_text):
     """
     Listings from the inline Relay JSON, in the shape _fb_collect_from_html returns.
@@ -4998,6 +6382,112 @@ def _fb_cookie_config():
         return None, None
 
 
+def _fb_browserless_enabled():
+    """
+    Fetch Facebook over plain HTTP instead of launching Chromium.
+
+    Measured 2026-10-09/12 against live Marketplace, through the same residential
+    proxy the browser path uses:
+
+        search page   HTTP 200, ~647KB, ~2s, 13-14 rows parsed   (3/3 terms)
+        item page     HTTP 200, ~1.2MB, 4.4s, description parsed
+
+    Both return the SAME server-rendered listing JSON the lean browser path
+    already reads, so _fb_collect_from_json and _fb_description_from_item_html
+    parse them unchanged — this adds no new parser, it removes a browser.
+
+    Why it matters more than the bytes suggest: Facebook was the LAST platform
+    still launching Chromium in steady state (Craigslist is plain HTTP, OfferUp
+    is GraphQL, Mercari is a curl_cffi replay). Removing it means a scrape
+    worker is Python and a document rather than Python and eleven Chrome
+    processes, which is what sets SCRAPE_PEAK_MB_PER_WORKER at 206MB and
+    therefore how many users a box can scan at once. On Render it also drops a
+    15-20s browser launch from every scrape.
+
+    ON by default because the browser path remains underneath as a fallback: if
+    the browserless fetch is blocked on two exits, the original code runs
+    exactly as before. Set FB_BROWSERLESS=0 to force the old behaviour.
+    """
+    return _env_flag('FB_BROWSERLESS', True)
+
+
+def _fb_browserless_headers():
+    """
+    What a real navigation sends. Facebook serves the listing JSON to this; the
+    bare User-Agent the first probes used also worked, but sending the full set
+    costs nothing and removes an obvious tell.
+    """
+    return {
+        'User-Agent': _patchright_clean_ua(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
+
+def _fb_browserless_get(url, proxy_override=None):
+    """One Facebook page over HTTP. Returns '' on any failure — never raises."""
+    try:
+        from curl_cffi import requests as cffi
+    except ImportError:
+        return ''
+    proxies = None
+    px = proxy_override or _get_proxy('facebook')
+    if px:
+        n = _normalize_proxy(px)
+        proxies = {'http': n, 'https': n}
+    try:
+        r = cffi.get(
+            url, headers=_fb_browserless_headers(), proxies=proxies,
+            impersonate=(os.getenv('FB_TLS_IMPERSONATE') or 'chrome').strip(),
+            timeout=int(os.getenv('FB_HTTP_TIMEOUT_SEC', '45')),
+        )
+    except Exception as e:
+        # IPRoyal's pool contains exits that cannot reach facebook.com at all —
+        # measured: CONNECT tunnel 504 on three consecutive draws while the same
+        # tunnel served other hosts fine. That is a rotation case, not an error
+        # worth surfacing, so the caller retries on a fresh session.
+        _emit("[facebook http] %s: %s" % (type(e).__name__, str(e)[:110]), 'info')
+        return ''
+    # NOTE: this is the DECODED body, while the Playwright counter measures what
+    # actually crossed the wire. Facebook gzips heavily, so the browserless
+    # figure reads several times larger than the browser's for the same page and
+    # the two are not comparable. Recorded anyway because relative movement
+    # within the browserless path is still useful.
+    _record_bytes('facebook', len(r.content or b''))
+    if r.status_code != 200:
+        _emit("[facebook http] HTTP %s" % r.status_code, 'info')
+        return ''
+    return r.text or ''
+
+
+def _fb_browserless_fetch(url, label='', log_callback=None, user_id=None, debug=False):
+    """
+    Browserless fetch with ONE rotation, mirroring the browser path's policy.
+
+    Returns (html, ok). ok=False means the caller should fall back to the
+    browser; two independent exits failing points at the request rather than
+    the IP, and a third draw is unlikely to help.
+    """
+    html = _fb_browserless_get(url)
+    if not _fb_html_is_blocked(html, lean=True):
+        return html, True
+    rotated = _rotate_sticky_session(os.getenv('FB_PROXY_URL'))
+    if rotated:
+        if debug and log_callback:
+            log_callback(user_id,
+                         "Facebook%s: no listing JSON on this exit — retrying "
+                         "once on a fresh proxy session (still no browser)."
+                         % (" '%s'" % label if label else ''), 'info')
+        html = _fb_browserless_get(url, proxy_override=rotated)
+        if not _fb_html_is_blocked(html, lean=True):
+            return html, True
+    return html, False
+
+
 class _FbLeanSession:
     """
     One browser and one context, reused across every term in a user's scrape.
@@ -5022,19 +6512,29 @@ class _FbLeanSession:
         self._pw = None
         self._browser = None
         self._ctx = None
+        self._slot = None
         self._proxy = proxy_override
         self._settle_ms = _fb_lean_settle_ms()
 
     def _open(self):
         from playwright.sync_api import sync_playwright
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(**_pw_launch_kwargs('facebook'))
-        storage_state, plain_cookies = _fb_cookie_config()
-        self._ctx = _pw_new_context(
-            self._browser, stealth=True, platform='facebook',
-            storage_state=storage_state, proxy_override=self._proxy,
-            block_scripts=True,
-        )
+        # Hold a process-wide browser slot for as long as this browser is open
+        # (released in close()), so this fallback can never run alongside
+        # another browser on a small box.
+        self._slot = _browser_slot()
+        self._slot.__enter__()
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(**_pw_launch_kwargs('facebook'))
+            storage_state, plain_cookies = _fb_cookie_config()
+            self._ctx = _pw_new_context(
+                self._browser, stealth=True, platform='facebook',
+                storage_state=storage_state, proxy_override=self._proxy,
+                block_scripts=True,
+            )
+        except Exception:
+            self.close()
+            raise
         if plain_cookies:
             try:
                 self._ctx.add_cookies(plain_cookies)
@@ -5092,7 +6592,7 @@ class _FbLeanSession:
                 pass
 
     def close(self):
-        for obj, name in ((self._ctx, 'context'), (self._browser, 'browser')):
+        for obj in (self._ctx, self._browser):
             if obj is not None:
                 try:
                     obj.close()
@@ -5104,6 +6604,9 @@ class _FbLeanSession:
             except Exception:
                 pass
         self._ctx = self._browser = self._pw = None
+        slot, self._slot = self._slot, None
+        if slot is not None:
+            slot.__exit__(None, None, None)
 
     def __enter__(self):
         return self
@@ -5178,6 +6681,7 @@ def _fb_fetch_with_playwright(url, proxy_override=None, lean=False):
     return html or ''
 
 
+@_uses_browser
 def _fb_fetch_once(url, proxy_override=None, lean=False):
     """
     One Playwright fetch of a Facebook Marketplace search page.
@@ -5318,11 +6822,11 @@ def _fb_fetch_once(url, proxy_override=None, lean=False):
 
 def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exclusions,
                              ai_enabled, ai_strictness, debug=False, log_callback=None,
-                             known_links=None):
+                             known_links=None, scan_description=False):
     listings = []
     _set_active_log(user_id, log_callback)
     if log_callback:
-        log_callback(user_id, 'Waking up Facebook Marketplace (Playwright)...', 'info')
+        log_callback(user_id, 'Waking up Facebook Marketplace...', 'info')
 
     try:
         max_age_days = int(os.getenv('FB_MAX_LISTING_AGE_DAYS', '45'))
@@ -5368,6 +6872,9 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
     user_coords = _zip_to_latlon(zip_code)
     skipped_far = 0
     skipped_stale = 0
+    desc_fetched = 0
+    desc_missing = 0
+    skipped_desc = 0
     if search_radius and not user_coords and log_callback:
         log_callback(
             user_id,
@@ -5379,6 +6886,22 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
     # lean path: it made each fetch cheap in bytes but every term still paid a
     # full Chromium launch, which then dominated the time. See _FbLeanSession.
     session = _FbLeanSession() if lean else None
+
+    # An item page wants scripts blocked exactly like the search feed, so the
+    # lean session is reused as-is: one more navigation on a browser that is
+    # already open and already paid for. On the DOM path there is no such
+    # session, so open one lazily — a scan that never needs a description never
+    # launches it, and one extra browser for the whole scrape still beats the
+    # browser-per-listing mistake OfferUp's posted-date path used to make.
+    _own_desc_session = []
+
+    def _desc_session():
+        if session is not None:
+            return session
+        if not _own_desc_session:
+            _own_desc_session.append(_FbLeanSession())
+        return _own_desc_session[0]
+
     try:
         for term in search_terms.keys():
             if not is_user_active(user_id):
@@ -5397,46 +6920,103 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                 else:
                     url = f'https://www.facebook.com/marketplace/{fb_region}/search/?query={q}'
 
-                html = session.fetch(url) if session else _fb_fetch_with_playwright(url)
-                rotated = None
-                if _fb_html_is_blocked(html, lean=lean):
-                    # A block is usually the exit IP, not the page. Retry once on a
-                    # fresh sticky session before calling it a failure — this is the
-                    # difference between an intermittently broken platform and a
-                    # reliable one.
-                    rotated = _rotate_sticky_session(os.getenv('FB_PROXY_URL'))
-                    if rotated:
-                        if log_callback:
-                            log_callback(
-                                user_id,
-                                f"Facebook '{term}': nothing rendered on this exit IP — "
-                                "retrying once on a fresh proxy session.",
-                                'info',
-                            )
-                        if session:
-                            # Rebuild the shared browser on the new exit IP. Every
-                            # later term in this scrape then reuses it, so a
-                            # rotation costs one relaunch, not one per term.
-                            session.rotate(rotated)
-                            html = session.fetch(url)
+                # Browserless first. This is the same listing JSON the lean
+                # browser path reads, so everything downstream is unchanged —
+                # see _fb_browserless_enabled for why this is the single
+                # biggest lever on how many users a box can scan at once.
+                html, browserless_ok = '', False
+                # Shared scanning (SEARCH_CACHE_ENABLED, off by default). A
+                # Facebook search is a function of (region slug, term) and nothing
+                # per-user, so users in one metro tracking the same term share ONE
+                # request through the single sticky exit — which the multi-user
+                # load test showed is THE ceiling at ~100 users (one IP, one
+                # request every ~2.75s). Parsed rows are cached (a few KB), never
+                # the ~1MB page. Only with a known region: without the slug,
+                # results follow the proxy's IP and are not shareable.
+                fb_rows, fb_shared = None, False
+                fb_key = (search_cache.key_for('facebook', term, region=fb_region)
+                          if fb_region else None)
+                if fb_key is not None:
+                    fb_rows = search_cache.get(fb_key)
+                    fb_shared = fb_rows is not None
+                if fb_rows is None and _fb_browserless_enabled():
+                    # Process-wide: one Facebook request at a time through the
+                    # shared sticky exit, FB_TERM_DELAY_SEC apart (see _paced).
+                    with _paced('facebook', cached=(
+                            (lambda: search_cache.get(fb_key)) if fb_key is not None
+                            else None)) as slot:
+                        if slot['hit'] is not None:
+                            fb_rows, fb_shared = slot['hit'], True
                         else:
-                            html = _fb_fetch_with_playwright(url, proxy_override=rotated)
+                            html, browserless_ok = _fb_browserless_fetch(
+                                url, term, log_callback, user_id, debug)
+                    if browserless_ok:
+                        parsed = _fb_collect_from_json(html)
+                        if parsed:
+                            fb_rows = parsed
+                            if fb_key is not None:
+                                search_cache.put(fb_key, parsed)   # no-op when disabled
+                if fb_rows is not None:
+                    browserless_ok = True
 
-                if lean and _fb_html_is_blocked(html, lean=True) and lean_fallback:
-                    # Two exits produced no listing JSON. Before reporting a failure,
-                    # spend one full render: it is the only way to tell "Facebook
-                    # changed the payload" (fixable) from "this term genuinely has no
-                    # results" (not). Costs ~1.6MB, so it must stay the exception —
-                    # if this fires routinely, the lean parser needs updating, not
-                    # more retries.
-                    _emit("[facebook] lean fetch found no listing JSON — "
-                          "falling back to a full render once")
-                    html = _fb_fetch_with_playwright(url, proxy_override=rotated)
-                    lean_this_term = False
+                if browserless_ok:
+                    # Always the JSON payload, whatever FB_LEAN_FETCH says:
+                    # an HTTP fetch never renders a DOM, so _fb_collect_from_html
+                    # would find no anchors and silently return zero rows.
+                    lean_this_term = True
+                    if debug and log_callback:
+                        log_callback(user_id,
+                                     f"Facebook '{term}': "
+                                     + ("served from a shared scan (no request)" if fb_shared
+                                        else "fetched without a browser"),
+                                     'info')
                 else:
-                    lean_this_term = lean
+                    html = session.fetch(url) if session else _fb_fetch_with_playwright(url)
+                    rotated = None
+                    if _fb_html_is_blocked(html, lean=lean):
+                        # A block is usually the exit IP, not the page. Retry once on a
+                        # fresh sticky session before calling it a failure — this is the
+                        # difference between an intermittently broken platform and a
+                        # reliable one.
+                        rotated = _rotate_sticky_session(os.getenv('FB_PROXY_URL'))
+                        if rotated:
+                            if log_callback:
+                                log_callback(
+                                    user_id,
+                                    f"Facebook '{term}': nothing rendered on this exit IP — "
+                                    "retrying once on a fresh proxy session.",
+                                    'info',
+                                )
+                            if session:
+                                # Rebuild the shared browser on the new exit IP. Every
+                                # later term in this scrape then reuses it, so a
+                                # rotation costs one relaunch, not one per term.
+                                session.rotate(rotated)
+                                html = session.fetch(url)
+                            else:
+                                html = _fb_fetch_with_playwright(url, proxy_override=rotated)
 
-                if _fb_html_is_blocked(html, lean=lean_this_term):
+                    if lean and _fb_html_is_blocked(html, lean=True) and lean_fallback:
+                        # Two exits produced no listing JSON. Before reporting a failure,
+                        # spend one full render: it is the only way to tell "Facebook
+                        # changed the payload" (fixable) from "this term genuinely has no
+                        # results" (not). Costs ~1.6MB, so it must stay the exception —
+                        # if this fires routinely, the lean parser needs updating, not
+                        # more retries.
+                        _emit("[facebook] lean fetch found no listing JSON — "
+                              "falling back to a full render once")
+                        # Close the lean browser FIRST: the full render launches
+                        # its own, and two on one box (~206MB + ~455MB) is the OOM
+                        # this whole budget exists to prevent. The session reopens
+                        # lazily if a later term needs it.
+                        if session:
+                            session.close()
+                        html = _fb_fetch_with_playwright(url, proxy_override=rotated)
+                        lean_this_term = False
+                    else:
+                        lean_this_term = lean
+
+                if fb_rows is None and _fb_html_is_blocked(html, lean=lean_this_term):
                     if log_callback:
                         log_callback(
                             user_id,
@@ -5450,7 +7030,10 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                         )
                     continue
 
-                raw_items = (_fb_collect_from_json(html) if lean_this_term
+                # Rows already parsed (fresh browserless fetch or shared scan) are
+                # used as-is; only the browser fallback still parses here.
+                raw_items = (fb_rows if fb_rows is not None
+                             else _fb_collect_from_json(html) if lean_this_term
                              else _fb_collect_from_html(html))
                 if debug and log_callback:
                     how = 'lean JSON' if lean_this_term else 'Playwright'
@@ -5483,7 +7066,18 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                         meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                         if not meets_threshold:
                             continue
-                        if is_excluded(title, price, exclusions, search_terms, matched_term):
+                        # Pass 1. When this listing is going to have its body
+                        # fetched, the INCLUDE half has to wait for it — a
+                        # keyword the title lacks may well be in the description,
+                        # which is the whole point of the feature. The EXCLUDE
+                        # half still runs now: a title that is already excluded
+                        # can never be rescued by a description, so it is dropped
+                        # before anything pays for a navigation. See is_excluded's
+                        # check_includes.
+                        want_desc = bool(scan_description) and _term_wants_description(
+                            search_terms.get(matched_term))
+                        if is_excluded(title, price, exclusions, search_terms, matched_term,
+                                       check_includes=not want_desc):
                             continue
                         if not check_image_with_ai(
                             item.get('image_url'), ai_enabled, ai_strictness,
@@ -5507,6 +7101,35 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                                     skipped_far += 1
                                     continue
 
+                        # Pass 2, and deliberately the LAST filter. Every
+                        # cheaper test — price, title exclusions, Vision,
+                        # distance — has already run, so a navigation is only
+                        # ever bought for a listing that would otherwise be
+                        # reported. Vision at ~1.3s ahead of this at ~3.9s is the
+                        # cheaper order, not an oversight.
+                        if want_desc:
+                            # Space out consecutive item pages, but never delay
+                            # the first — a typical scan fetches exactly one
+                            # (47 of the last 67 scans found a single new
+                            # listing) and should pay nothing for pacing.
+                            if desc_fetched or desc_missing:
+                                _item_delay = _fb_item_delay_sec()
+                                if _item_delay > 0:
+                                    time.sleep(_item_delay)
+                            description = _fb_fetch_description(
+                                _desc_session(), link, log_callback, user_id, debug)
+                            if description:
+                                desc_fetched += 1
+                            else:
+                                # Blocked or genuinely blank — _fb_fetch_description
+                                # logs which. Filtering falls back to title-only for
+                                # this listing rather than dropping it outright.
+                                desc_missing += 1
+                            if is_excluded(title, price, exclusions, search_terms,
+                                           matched_term, description=description):
+                                skipped_desc += 1
+                                continue
+
                         listings.append({
                             'title': title,
                             'price': price,
@@ -5523,16 +7146,13 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                         })
                     except Exception:
                         continue
-                # Politeness pause between terms, same reasoning as OfferUp's:
-                # on the lean path a term is one ~110KB document fetch, not a
-                # 2MB render, so 2s per term was a large share of the total.
-                # Configurable so it can be raised if blocks reappear.
-                try:
-                    fb_term_delay = float(os.getenv('FB_TERM_DELAY_SEC', '0.75'))
-                except ValueError:
-                    fb_term_delay = 0.75
-                if fb_term_delay > 0:
-                    time.sleep(fb_term_delay)
+                # Politeness gap between terms. Browserless fetches are paced
+                # PROCESS-WIDE inside _paced('facebook') — that is what keeps
+                # concurrent scrapes from multiplying the rate through the one
+                # sticky exit. A term that fell back to the browser was not, so
+                # it keeps the original per-term gap.
+                if not browserless_ok:
+                    time.sleep(_pace_gap('facebook'))
             except Exception as e:
                 if log_callback:
                     log_callback(
@@ -5541,23 +7161,38 @@ def scrape_facebook_for_user(user_id, zip_code, search_radius, search_terms, exc
                         'error',
                     )
 
+        warn_descriptions_unavailable('Facebook', desc_fetched, desc_missing,
+                                      log_callback, user_id)
         if debug and log_callback:
             far_note = f' ({skipped_far} beyond {search_radius} mi)' if skipped_far else ''
             stale_note = f' ({skipped_stale} older than {max_age_days}d)' if skipped_stale else ''
+            desc_note = ''
+            if desc_fetched or desc_missing or skipped_desc:
+                desc_note = (f' (descriptions: {desc_fetched} read'
+                             + (f', {desc_missing} unavailable' if desc_missing else '')
+                             + (f', {skipped_desc} filtered out on body keywords' if skipped_desc else '')
+                             + ')')
             log_callback(user_id,
-                         f'Facebook complete: {len(listings)} candidate matches{far_note}{stale_note}',
+                         f'Facebook complete: {len(listings)} candidate matches'
+                         f'{far_note}{stale_note}{desc_note}',
                          'info')
         return listings
     finally:
         if session is not None:
             session.close()
+        for _own in _own_desc_session:
+            try:
+                _own.close()
+            except Exception:
+                pass
 
 
 # ===========================
 # OFFERUP SCRAPER
 # ===========================
 def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, exclusions, ai_enabled, ai_strictness,
-                            debug=False, log_callback=None, known_links=None):
+                            debug=False, log_callback=None, known_links=None,
+                            scan_description=False):
     listings = []
     _set_active_log(user_id, log_callback)
 
@@ -5579,6 +7214,9 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
     # Coordinates drive both the GraphQL search location and the distance filter.
     user_coords = _zip_to_latlon(zip_code)
     skipped_far = 0
+    desc_fetched = 0
+    desc_missing = 0
+    skipped_desc = 0
     if not user_coords and log_callback:
         log_callback(
             user_id,
@@ -5587,25 +7225,19 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
             'error',
         )
 
-    # Politeness pause between terms. Was 12s, set when every term meant a full
-    # ~400KB page render and hammering that looked abusive. A term is now a
-    # single ~4KB GraphQL call, so 12s of sleep per term dwarfed the work itself:
-    # 10 terms spent ~108s waiting to do ~30s of fetching. Lowered to 3s, still
-    # slower than a human clicking through results, and still tunable — raise it
-    # if OfferUp starts returning the "turn off your proxy" page.
-    try:
-        offerup_term_delay = float(os.getenv('OFFERUP_TERM_DELAY_SEC', '3'))
-    except ValueError:
-        offerup_term_delay = 3.0
+    # Politeness gap between OfferUp requests: OFFERUP_TERM_DELAY_SEC (3s). Was
+    # 12s when every term was a full ~400KB render; a term is now one small
+    # GraphQL call. It is now enforced PROCESS-WIDE by _paced('offerup') around
+    # each fetch below, not slept per scrape — so N concurrent scrapes no longer
+    # hit OfferUp N times as often (its antibot is rate-based). Raise it if
+    # OfferUp starts returning the "turn off your proxy" page.
 
     try:
-        for term_index, term in enumerate(search_terms.keys()):
+        for term in search_terms.keys():
             if not is_user_active(user_id):
                 if debug and log_callback:
                     log_callback(user_id, "OfferUp stopped by user.", "info")
                 return listings
-            if term_index and offerup_term_delay > 0:
-                time.sleep(offerup_term_delay)
             try:
                 sort_param = (os.getenv('OFFERUP_SORT', '-posted') or '-posted').strip()
                 url = 'https://offerup.com/search/?' + urlencode({
@@ -5641,32 +7273,61 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 # param and client-side override is ignored), and the payload is
                 # ~30KB of JSON instead of ~400KB of HTML.
                 gql_items = None
+                gql_ok = False
                 if user_coords and _env_flag('OFFERUP_USE_GRAPHQL', True):
                     # Default to a direct connection. Location now travels in
                     # the query, so the proxy buys nothing here — and it
                     # actively breaks the call: DataImpulse terminates TLS,
                     # which the API rejects (ERR_CERT_AUTHORITY_INVALID).
-                    gql_items, gql_err = _offerup_fetch_via_graphql(
-                        term, user_coords[0], user_coords[1],
-                        force_no_proxy=_env_flag('OFFERUP_GRAPHQL_NO_PROXY', True))
+                    # Shared scanning (SEARCH_CACHE_ENABLED, off by default): the
+                    # feed is a function of (term, ~11km of coordinates) and
+                    # nothing per-user, so users tracking the same term nearby
+                    # share one request. OfferUp's antibot is rate-based, so
+                    # making fewer requests is the only headroom there is — at
+                    # ~100 users this is the difference between keeping up and
+                    # falling behind (multi-user load test, 2026-11-02).
+                    ou_key = search_cache.key_for('offerup', term,
+                                                  lat=user_coords[0], lon=user_coords[1])
+                    ou_hit = search_cache.get(ou_key)
+                    if ou_hit is not None:
+                        gql_items, gql_err = ou_hit, None
+                    else:
+                        with _paced('offerup', cached=lambda: search_cache.get(ou_key)) as slot:
+                            if slot['hit'] is not None:
+                                gql_items, gql_err = slot['hit'], None
+                            else:
+                                gql_items, gql_err = _offerup_fetch_via_graphql(
+                                    term, user_coords[0], user_coords[1],
+                                    force_no_proxy=_env_flag('OFFERUP_GRAPHQL_NO_PROXY', True))
+                                if not gql_err and gql_items:
+                                    search_cache.put(ou_key, gql_items)
                     if gql_err:
                         _emit(f"[offerup] graphql failed ({gql_err}) — falling back to HTML")
                         gql_items = None
-                    elif debug and log_callback:
-                        log_callback(
-                            user_id,
-                            f"OfferUp '{term}': {len(gql_items)} rows via GraphQL "
-                            f"at {user_coords[0]:.3f},{user_coords[1]:.3f}",
-                            'info',
-                        )
+                    else:
+                        gql_ok = True
+                        if debug and log_callback:
+                            log_callback(
+                                user_id,
+                                f"OfferUp '{term}': {len(gql_items)} rows via GraphQL "
+                                f"at {user_coords[0]:.3f},{user_coords[1]:.3f}",
+                                'info',
+                            )
 
                 if gql_items:
                     items = gql_items
                     html = ''
+                elif gql_ok:
+                    # The browser-free call SUCCEEDED and returned nothing — a real
+                    # empty result for this term, not a block. Launching a browser
+                    # to "retry" would reintroduce the Chromium-per-term cost this
+                    # path exists to remove, so stop here with no rows.
+                    html = ''
                 else:
                     while attempt < max(1, stealth_tries):
                         attempt += 1
-                        html = _offerup_fetch_with_playwright(url, stealth=True)
+                        with _paced('offerup'):
+                            html = _offerup_fetch_with_playwright(url, stealth=True)
                         if not _offerup_html_is_blocked(html):
                             break
                         if _offerup_is_geo_blocked(html):
@@ -5725,7 +7386,8 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         else:
                             os.environ.pop('OFFERUP_PROXY_URL', None)
                         try:
-                            alt_html = _offerup_fetch_with_playwright(url, stealth=True)
+                            with _paced('offerup'):
+                                alt_html = _offerup_fetch_with_playwright(url, stealth=True)
                         finally:
                             if prev is None:
                                 os.environ.pop('OFFERUP_PROXY_URL', None)
@@ -5741,7 +7403,8 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                                 "retrying on the direct connection.",
                                 'info',
                             )
-                        direct_html = _offerup_fetch_with_playwright(url, stealth=True, force_no_proxy=True)
+                        with _paced('offerup'):
+                            direct_html = _offerup_fetch_with_playwright(url, stealth=True, force_no_proxy=True)
                         if not _offerup_html_is_blocked(direct_html):
                             html = direct_html
                         elif _offerup_is_geo_blocked(direct_html) and log_callback:
@@ -5778,7 +7441,16 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         if known_links and link in known_links: continue
                         meets_threshold, matched_term, max_price = check_price_threshold(title, price, search_terms)
                         if not meets_threshold: continue
-                        if is_excluded(title, price, exclusions, search_terms, matched_term): continue
+                        # Pass 1. As on Facebook, the INCLUDE half waits for the
+                        # body when we are going to fetch one — is_excluded runs
+                        # here, before the item page. The EXCLUDE half still runs
+                        # now, because a title already excluded can never be
+                        # rescued by its description.
+                        want_desc = bool(scan_description) and _term_wants_description(
+                            search_terms.get(matched_term))
+                        if is_excluded(title, price, exclusions, search_terms, matched_term,
+                                       check_includes=not want_desc):
+                            continue
 
                         image_url = item.get('image_url')
 
@@ -5788,11 +7460,47 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         term_exclusions=(search_terms.get(matched_term) or {}).get('exclusions')):
                             continue
 
+                        # The feed carries no date (ModularFeedListing has no such
+                        # field), so the item page is the only source for both of
+                        # these — and it is ONE page. Deliberately after Vision:
+                        # ~1.3s of image check is cheaper than a ~236KB fetch, so
+                        # running it first shrinks how many pages get bought.
                         listed_at = item.get('listed_at')
+                        description = None
+                        want_posted = (listed_at is None
+                                       and _env_flag('OFFERUP_FETCH_ITEM_POSTED', False))
+                        if want_posted or want_desc:
+                            fetched_at, description = _offerup_item_details(
+                                link, offerup_detail_delay,
+                                want_posted=want_posted, want_description=want_desc)
+                            if want_posted:
+                                listed_at = fetched_at
+                            if want_desc:
+                                if description:
+                                    desc_fetched += 1
+                                else:
+                                    # Blocked, removed, or a seller who wrote
+                                    # nothing. Filtering falls back to title-only
+                                    # for this listing rather than dropping it.
+                                    desc_missing += 1
                         if listed_at is None:
-                            listed_at = _offerup_listed_at_from_item_page(link, offerup_detail_delay)
+                            # OfferUp's search API carries no post date, and the
+                            # item page that does (postDate) is Cloudflare-walled —
+                            # unreachable without a browser. So there is no true
+                            # posted time to read browser-free. Stamp FIRST-SEEN so
+                            # every OfferUp row still has a date element and the age
+                            # filter and dashboard have something to show. It is the
+                            # time we first scraped the listing, not when it was
+                            # posted, and is labelled that way downstream.
+                            listed_at = datetime.now(timezone.utc)
                         listed_for_age = listed_at.isoformat() if isinstance(listed_at, datetime) else listed_at
                         if listed_for_age and not _is_recent_timestamp(listed_for_age, max_age_days):
+                            continue
+
+                        # Pass 2, now that the body is in hand.
+                        if want_desc and is_excluded(title, price, exclusions, search_terms,
+                                                     matched_term, description=description):
+                            skipped_desc += 1
                             continue
 
                         # OfferUp ignores its own radius param (5 vs 200 returns
@@ -5820,7 +7528,10 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         })
                     except:
                         continue
-                time.sleep(3)
+                # (A hard-coded time.sleep(3) used to sit here, after EVERY term
+                # including the last — on top of the 3s gap above. Measured in the
+                # multi-user load test 2026-11-02: 30s of a 125s 10-term scan was
+                # this sleep alone. Pacing is now process-wide in _paced.)
             except:
                 pass
     except Exception as e:
@@ -5831,9 +7542,19 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 f"OfferUp unavailable: {e.__class__.__name__}: {detail}.",
                 "error"
             )
+    warn_descriptions_unavailable('OfferUp', desc_fetched, desc_missing,
+                                  log_callback, user_id)
     if debug and log_callback:
         far_note = f' ({skipped_far} beyond {search_radius} mi)' if skipped_far else ''
-        log_callback(user_id, f"OfferUp complete: {len(listings)} candidate matches{far_note}", "info")
+        desc_note = ''
+        if desc_fetched or desc_missing or skipped_desc:
+            desc_note = (f' (descriptions: {desc_fetched} read'
+                         + (f', {desc_missing} unavailable' if desc_missing else '')
+                         + (f', {skipped_desc} filtered out on body keywords' if skipped_desc else '')
+                         + ')')
+        log_callback(user_id,
+                     f"OfferUp complete: {len(listings)} candidate matches{far_note}{desc_note}",
+                     "info")
     return listings
 
 
@@ -5902,6 +7623,13 @@ def _stamp_user_scrape_complete(user_id, duration_ms):
 
 def scrape_for_user(user_config, log_callback=None, debug=False):
     user_id = user_config['user_id']
+    # Claim the user across EVERY instance before doing anything. Losing the
+    # claim is not an error — another worker has them — so this returns quietly
+    # rather than logging something the user would read as a failure.
+    if not claim_user_for_scrape(user_id):
+        print(f"  [lease] {str(user_id)[:8]} is being scraped elsewhere — skipping",
+              flush=True)
+        return 0
     set_user_scraping(user_id, True)
     started = time.time()
     _set_active_log(user_id, log_callback)
@@ -5938,9 +7666,15 @@ def scrape_for_user(user_config, log_callback=None, debug=False):
                 )
             _stamp_user_scrape_complete(user_id, duration_ms)
         set_user_scraping(user_id, False)
+        release_user_scrape_claim(user_id)
 
 
 def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
+    # Wall clock for THIS scrape, so the per-platform breakdown below can show
+    # what is left over once the four marketplaces are accounted for.
+    _impl_started = time.time()
+    _platform_ms = {}
+    _platform_status = {}
     user_id = user_config['user_id']
     zip_code = user_config['zip_code']
     # Per-scrape, so the figure reported at the end is this run's traffic.
@@ -6033,6 +7767,10 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     notify_prefs = get_user_notification_prefs(user_id)
     seen_listings = get_seen_listings(user_id)
     blocked_links, blocked_fingerprints = get_blocked_links_and_fingerprints(user_id)
+    # Links already alerted within the retention window — the dedup that outlives
+    # the 7-day `listings` purge, so a still-live Facebook/OfferUp listing is not
+    # re-alerted week after week. Treated exactly like an already-held link below.
+    alerted_links = get_alerted_links(user_id)
 
     # Handed to every scraper so a listing we already hold is discarded on sight,
     # BEFORE the expensive per-item work: Vision runs ~1.3s per image and
@@ -6042,7 +7780,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     # in steady state — on a 5-minute cadence nearly every candidate is one we
     # have already seen, so the old order paid nearly the full cost of a first
     # scrape to find almost nothing.
-    known_links = seen_listings | blocked_links
+    known_links = seen_listings | blocked_links | alerted_links
 
     recent_sigs = get_recent_listing_signatures(user_id)
     recent_fp_to_prices = {}
@@ -6108,7 +7846,7 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             listing['title_fingerprint'] = fp
             price = float(listing.get('price') or 0)
 
-            if link in seen_listings or link in blocked_links:
+            if link in seen_listings or link in blocked_links or link in alerted_links:
                 stats['seen_or_link'] += 1
                 continue
             if fp and fp in blocked_fingerprints:
@@ -6148,10 +7886,12 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         if not to_save:
             return
         inserted_links = save_listings_bulk(user_id, to_save)
+        newly_alerted = []
         for listing in to_save:
             if listing['link'] not in inserted_links:
                 continue
             new_listings.append(listing)
+            newly_alerted.append(listing)
             stats['saved'] += 1
             if log_callback:
                 log_callback(
@@ -6159,6 +7899,12 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
                     f"New match: {listing['title'][:40]} — ${listing['price']}",
                     "success"
                 )
+        # Record what we just alerted on, and mirror it into the in-memory set so a
+        # LATER platform in this same scrape cannot re-alert the identical link
+        # before the next scrape reads the table back.
+        if newly_alerted:
+            record_alerted_listings(user_id, newly_alerted)
+            alerted_links.update(l['link'] for l in newly_alerted)
 
     # Each platform is its own job so one failure cannot take the others with it.
     platform_jobs = []
@@ -6179,26 +7925,103 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
             if log_callback:
                 log_callback(user_id, f"Scrape stopped by user before {label}.", "info")
             break
+        _plat_started = time.time()
+        # Default to ok; the except branch downgrades it. Set BEFORE the try so
+        # the finally can always read it.
+        _plat_status = 'ok'
         try:
             batch = fn(user_id, zip_code, user_config['search_radius'], search_terms,
                        exclusions, user_config['ai_enabled'], user_config['ai_strictness'],
-                       debug, log_callback, known_links=known_links)
+                       debug, log_callback, known_links=known_links,
+                       # Already Pro-clamped and master-switched in
+                       # get_active_users(). Every platform takes the argument so
+                       # this dispatch stays uniform; Facebook is the only one
+                       # that acts on it so far (Craigslist/OfferUp/Mercari next).
+                       scan_description=bool(user_config.get('scan_description')))
         except Exception as e:
             # One marketplace failing is not the scrape failing. Report it and
             # keep whatever the others found.
+            _plat_status = 'failed: %s' % type(e).__name__
             print(f"  ❌ [{user_id[:8]}] {label} failed: {type(e).__name__}: {e}", flush=True)
             if log_callback:
                 log_callback(user_id,
                              f"{label} failed ({type(e).__name__}) — continuing with "
                              "your other marketplaces.", 'error')
             batch = []
+        finally:
+            # Recorded in `finally` so a platform that FAILS still reports the
+            # time it burned. A marketplace that takes 90s to time out is
+            # exactly the kind of cost that needs to show up here, and only
+            # timing the success path would hide it.
+            _platform_ms[label] = _platform_ms.get(label, 0) + int(
+                (time.time() - _plat_started) * 1000)
+            _platform_status[label] = (_plat_status, len(batch or []))
         # Saved here, before the next platform runs, so a later stall cannot
         # discard it.
         _persist(batch)
         _log_memory(label, log_callback, user_id)
 
+    # WHICH MARKETPLACES ACTUALLY RAN.
+    #
+    # "Scan complete. No new matches found." is ambiguous: it reads identically
+    # whether all four were searched and found nothing, or one of them threw and
+    # was never searched at all. With accounts being shared that ambiguity is the
+    # difference between "no deals today" and "it is broken and nobody told me".
+    # Enabled platforms that did NOT run are reported in red.
+    if log_callback and platform_jobs:
+        _ran, _failed = [], []
+        for _label, _ in platform_jobs:
+            _st, _n = _platform_status.get(_label, ('did not run', 0))
+            (_ran if _st == 'ok' else _failed).append(
+                ('%s %d' % (_label, _n)) if _st == 'ok' else ('%s (%s)' % (_label, _st)))
+        if _ran:
+            log_callback(user_id,
+                         'Marketplaces scanned: ' + ', '.join(_ran) + ' ' + '—' +
+                         ' counts are candidate matches before de-duplication.',
+                         'info')
+        if _failed:
+            log_callback(user_id,
+                         'Marketplaces NOT scanned: ' + ', '.join(_failed) + ' ' +
+                         '—' + ' results below are missing these.',
+                         'error')
+
+    # WHERE THE TIME WENT.
+    #
+    # Production scrapes were measured at 184-247s for a SINGLE search term,
+    # and nothing recorded which marketplace was responsible — so the only
+    # lever anyone could reach for was "add workers", which needs RAM. The
+    # arithmetic that matters is workers >= users * duration / interval, so
+    # halving this number is worth exactly as much as doubling the box, and
+    # far cheaper. This line is what makes that decomposable instead of
+    # guessed at.
+    #
+    # Printed as well as logged: the dashboard console is per-user and
+    # retained 48h, while the Render log is where you look after the fact.
+    if _platform_ms:
+        _total_ms = int((time.time() - _impl_started) * 1000)
+        _accounted = sum(_platform_ms.values())
+        _parts = sorted(_platform_ms.items(), key=lambda kv: kv[1], reverse=True)
+        _fmt = ', '.join(
+            '%s %.0fs (%.0f%%)' % (name, ms / 1000.0,
+                                   (ms * 100.0 / _total_ms) if _total_ms else 0)
+            for name, ms in _parts)
+        _other = max(0, _total_ms - _accounted)
+        _line = ("Scan timing: %.0fs total — %s, other %.0fs (%.0f%%)"
+                 % (_total_ms / 1000.0, _fmt, _other / 1000.0,
+                    (_other * 100.0 / _total_ms) if _total_ms else 0))
+        # ASCII only: a Windows console is cp1252 and a non-encodable
+        # character here raises UnicodeEncodeError from inside the scrape.
+        print("  [timing] [%s] %s" % (user_id[:8], _line), flush=True)
+        if debug and log_callback:
+            log_callback(user_id, _line, 'info')
+
     if new_listings:
-        _notify_scrape_digest(user_id, new_listings, notify_prefs, log_callback)
+        # An empty seen_listings means this user has never had a listing saved,
+        # so every match here is new by definition rather than by discovery.
+        # That is the 187-listing email, and it is worth SAYING rather than
+        # silently capping and leaving the user to wonder.
+        _notify_scrape_digest(user_id, new_listings, notify_prefs, log_callback,
+                              first_scan=not seen_listings)
 
     if debug and log_callback:
         log_callback(
@@ -6231,6 +8054,92 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
 # ===========================
 # MAIN LOOP
 # ===========================
+# Continuous-dispatch state for main(). One persistent pool for the process; the
+# in-flight map is what stops a user who is queued (not yet marked scraping) from
+# being dispatched a second time on the next cycle.
+_DISPATCH_POOL = None
+_IN_FLIGHT = {}                  # user_id -> Future (queued or running)
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _dispatch_pool(size):
+    global _DISPATCH_POOL
+    if _DISPATCH_POOL is None:
+        _DISPATCH_POOL = ThreadPoolExecutor(max_workers=max(1, size),
+                                            thread_name_prefix='scrape')
+    return _DISPATCH_POOL
+
+
+def _in_flight_count():
+    with _IN_FLIGHT_LOCK:
+        return len(_IN_FLIGHT)
+
+
+def _reap_finished_scrapes():
+    """Forget finished scrapes; return how many new listings they found."""
+    found = 0
+    with _IN_FLIGHT_LOCK:
+        for uid, fut in list(_IN_FLIGHT.items()):
+            if not fut.done():
+                continue
+            del _IN_FLIGHT[uid]
+            try:
+                found += fut.result() or 0
+            except Exception as e:
+                # _run_one already handles per-user failures; this is only for
+                # something raised outside it.
+                print(f"  ❌ worker future failed: {e}", flush=True)
+    return found
+
+
+def _scrape_concurrency_cap():
+    """
+    How many scrapes may run at once: SCRAPE_MAX_WORKERS, clamped to what this
+    box's RAM can hold (memory_capped_workers). Bounded by MEMORY, not CPU —
+    queueing is survivable; an OOM kill takes the whole process, and with it the
+    API, down. The clamp matters because the default of 3 only shows up as a
+    problem once two users are due at the same moment.
+    """
+    try:
+        max_workers = max(1, int(os.getenv('SCRAPE_MAX_WORKERS', '3')))
+    except ValueError:
+        max_workers = 3
+    mem_cap = memory_capped_workers()
+    if mem_cap is not None and max_workers > mem_cap:
+        print(f"  ⚠ SCRAPE_MAX_WORKERS={max_workers} but this box holds "
+              f"{mem_cap} concurrent scrape(s) — running {mem_cap}. "
+              f"Users queue instead of the process being OOM-killed.", flush=True)
+        return mem_cap
+    return max_workers
+
+
+def _pick_to_start(due, cap):
+    """
+    The most-overdue due users not already in flight, up to the free slots.
+    Call _reap_finished_scrapes() first, or slots freed by scrapes that just
+    finished are not reusable until the next cycle. Only main() dispatches, so
+    picking and then starting cannot race.
+    """
+    with _IN_FLIGHT_LOCK:
+        free = cap - len(_IN_FLIGHT)
+        out = []
+        for cfg in sorted(due, key=lambda c: c.get('_due_since') or 0.0):
+            if len(out) >= free:
+                break
+            if cfg['user_id'] not in _IN_FLIGHT:
+                out.append(cfg)
+        return out
+
+
+def _start_scrapes(cfgs, run_one, cap):
+    """Hand these users to the persistent pool. Returns how many started."""
+    pool = _dispatch_pool(cap)
+    with _IN_FLIGHT_LOCK:
+        for cfg in cfgs:
+            _IN_FLIGHT[cfg['user_id']] = pool.submit(run_one, cfg)
+    return len(cfgs)
+
+
 def main(log_callback=None, health_callback=None):
     if log_callback is None:
         def default_log(uid, msg, ltype="info"):
@@ -6241,7 +8150,21 @@ def main(log_callback=None, health_callback=None):
     print("PIXELFLIP MASTER CLOCK SCRAPER", flush=True)
     print("(Craigslist, OfferUp, Mercari via Playwright; Facebook Marketplace on Pro tier)", flush=True)
     print("=" * 60, flush=True)
+    # Printed once per boot. Read this before changing SCRAPE_MAX_WORKERS: if the
+    # source is not a cgroup, the memory cap is meaningless and the setting is
+    # the only thing standing between this box and an OOM that takes Flask — and
+    # therefore the dashboard — down with the scraper.
+    print(memory_detection_report(), flush=True)
     sys.stdout.flush()
+
+    # Warm the User-Agent probe ONCE, before any scrape (or pace lock) exists.
+    # Browserless Facebook sends this UA on every request and the first call may
+    # launch a browser to read it; doing it here keeps that launch off every
+    # scrape's clock and out of every lock (see the lock-order note at _paced).
+    try:
+        _patchright_clean_ua()
+    except Exception:
+        pass
 
     cycle = 0
 
@@ -6306,13 +8229,14 @@ def main(log_callback=None, health_callback=None):
                 uid = user['user_id']
                 if is_user_scraping(uid):
                     continue
-                last_scraped = float(user['last_scraped_ts']) if user['last_scraped_ts'] else 0.0
                 tier = _tier_from_db_row(user)
+                if tier == 'inactive':
+                    # Armed with no paid plan: never scan it for free.
+                    _disarm_unpaid(uid)
+                    continue
                 user_cfg = {**dict(user), 'plan_tier': tier}
                 user_cfg['buyer_include_local'] = bool(user.get('buyer_include_local', True))
                 user_cfg['buyer_include_shipping'] = bool(user.get('buyer_include_shipping', True))
-                interval_min = _effective_check_interval_minutes_for_user(user_cfg)
-                interval_seconds = int(interval_min) * 60
 
                 # Cadence is per TERM on every tier now, so this is the whole
                 # gate — a user is due as soon as ANY of their terms is. It used
@@ -6332,6 +8256,14 @@ def main(log_callback=None, health_callback=None):
                     due_now, next_due_ts = due_terms_for_user(
                         terms_for_user, user_cfg, now=current_time)
                     term_due = bool(due_now)
+                    if due_now:
+                        # Most-overdue-first ordering for continuous dispatch, so a
+                        # small pool can never starve the users at the end of the
+                        # list behind ones that keep coming due again.
+                        user_cfg['_due_since'] = min(
+                            float(terms_for_user[t].get('last_scraped_ts') or 0.0)
+                            + term_interval_minutes(terms_for_user[t], user_cfg) * 60
+                            for t in due_now)
                 else:
                     # No terms is nothing to schedule. Waking the user anyway
                     # bought a full browser launch to discover there was no work.
@@ -6376,15 +8308,25 @@ def main(log_callback=None, health_callback=None):
                     _clear_scrape_stamp_for_retry(uid)
                     return 0
 
+            # Free the slots of scrapes that finished since the last cycle BEFORE
+            # dispatching, so they are reusable now rather than a cycle from now.
+            total_new += _reap_finished_scrapes()
+
             if due:
-                # Mercari once for everybody, BEFORE the pool fans out. The
-                # search API is user-independent, so N users sharing a term is N
-                # identical requests — and each one would otherwise open its own
-                # real-Chrome context at ~644MB. One browser per cycle here is
-                # what stops Mercari dictating SCRAPE_MAX_WORKERS.
+                # The concurrency cap, then WHO starts this cycle (continuous
+                # dispatch, below), so the Mercari prefetch covers exactly the
+                # users starting now rather than everyone who is due.
+                cap = _scrape_concurrency_cap()
+                to_start = _pick_to_start(due, cap)
+
+                # Mercari once for the users STARTING now, BEFORE they fan out.
+                # The search API is user-independent, so N users sharing a term
+                # is N identical requests — and each one would otherwise open its
+                # own real-Chrome context at ~644MB. Terms fetched within the
+                # cycle TTL are not fetched again (see mercari_prefetch_cycle).
                 try:
                     shared_terms = set()
-                    for cfg in due:
+                    for cfg in to_start:
                         plats = _coerce_platforms_dict(cfg.get('platforms'))
                         if not plats.get('mercari'):
                             continue
@@ -6405,63 +8347,33 @@ def main(log_callback=None, health_callback=None):
                             # and the actual failure was invisible without
                             # Render log access.
                             if log_callback:
-                                for cfg in due:
+                                for cfg in to_start:
                                     try:
                                         log_callback(cfg['user_id'],
                                                      f"Mercari unavailable: {mc_err[:160]}",
                                                      'error')
                                     except Exception:
                                         pass
-                        else:
+                        elif n:
                             print(f"  🛒 Mercari: {n} unique term(s) fetched once for "
-                                  f"{len(due)} user(s)", flush=True)
+                                  f"{len(to_start)} user(s)", flush=True)
                 except Exception as e:
                     # Never let the optimisation break the cycle; a failure here
                     # just means each user fetches for itself, as before.
                     print(f"  ⚠ Mercari prefetch skipped: {type(e).__name__}: {e}", flush=True)
 
-                # Bounded by MEMORY, not by CPU. Measured peak per concurrent
-                # scrape, 2026-08-11 (peak working set of the whole
-                # chrome-headless-shell process group):
-                #
-                #   lean path (FB_LEAN_FETCH=1)   206MB over 4 processes
-                #   DOM path  (renders Facebook)  455MB over 6 processes
-                #
-                # The DOM figure is why 512MB instances die: one scrape alone
-                # peaks at 455MB of a 512MB container that also holds Python and
-                # Flask. The ceiling is roughly (container RAM - 200MB) / peak,
-                # so 512MB is 1 worker either way, 2GB is 8 lean, 4GB is 18.
-                # Raise this only alongside RAM — queueing is survivable, an OOM
-                # kill takes the whole process down including the API.
-                try:
-                    max_workers = max(1, int(os.getenv('SCRAPE_MAX_WORKERS', '3')))
-                except ValueError:
-                    max_workers = 3
-                # Clamp to what the box can actually hold. The default of 3 is
-                # right for a 2GB machine and fatal on 512MB, and the difference
-                # only shows up once TWO users are due at the same moment — so
-                # without this the setting looks fine right up until the day it
-                # takes the service down.
-                mem_cap = memory_capped_workers()
-                workers = min(max_workers, len(due))
-                if mem_cap is not None and workers > mem_cap:
-                    print(f"  ⚠ SCRAPE_MAX_WORKERS={max_workers} but this box holds "
-                          f"{mem_cap} concurrent scrape(s) — running {mem_cap}. "
-                          f"Users queue instead of the process being OOM-killed.",
-                          flush=True)
-                    workers = mem_cap
-                print(f"  ▶ {len(due)} user(s) due — running {workers} at a time", flush=True)
-
-                with ThreadPoolExecutor(max_workers=workers,
-                                        thread_name_prefix='scrape') as pool:
-                    futures = [pool.submit(_run_one, cfg) for cfg in due]
-                    for fut in as_completed(futures):
-                        try:
-                            total_new += fut.result() or 0
-                        except Exception as e:
-                            # _run_one already handles per-user failures; this is
-                            # only for something raised outside it.
-                            print(f"  ❌ worker future failed: {e}", flush=True)
+                # CONTINUOUS DISPATCH (2026-11-02). This used to run the due users
+                # as a BATCH and block until every one finished before looking
+                # again, so a 5-minute term that came due mid-batch waited for the
+                # slowest scan in it while finished workers sat idle. Measured in
+                # the multi-user load test, 10 max-config Pro users: priority terms
+                # ran a median 189s late at 2 workers, 36s (p95 334s) at 3. Now
+                # each cycle hands newly-due users to a persistent pool and returns
+                # at once: a user starts as soon as a worker frees (within one
+                # cycle sleep), most-overdue first, never twice.
+                started = _start_scrapes(to_start, _run_one, cap)
+                print(f"  ▶ {len(due)} user(s) due — started {started}, "
+                      f"{_in_flight_count()}/{cap} scrape(s) running", flush=True)
 
             # How long before we look for due users again. This is ALSO the
             # worst-case delay between a user pressing START and their console

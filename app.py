@@ -3,6 +3,7 @@ from flask_cors import CORS
 import threading
 import time
 import os
+import sys
 import shutil
 import json
 import secrets
@@ -19,6 +20,15 @@ import stripe
 
 from dotenv import load_dotenv
 load_dotenv()
+
+try:
+    # Deploy self-check (version, config presence, live Stripe resolution).
+    # Optional on purpose: a missing file must never stop the API booting.
+    import boot_check
+except Exception as _bce:
+    boot_check = None
+    print(f"!! boot_check unavailable ({_bce}) — /health will not report version or config. "
+          f"Was boot_check.py committed?", flush=True)
 
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 
@@ -46,10 +56,8 @@ if _dsns:
 try:
     # is_user_scraping() applies the staleness guard; reading SCRAPING_USERS
     # directly would report a hung scrape as still running forever.
-    from scraper_multi_user import (SCRAPING_USERS, is_user_scraping, set_user_scraping,
-                                    coalesce_window_sec)
+    from scraper_multi_user import is_user_scraping, set_user_scraping, coalesce_window_sec
 except Exception:
-    SCRAPING_USERS = {}
     def is_user_scraping(_uid):
         return False
     def set_user_scraping(_uid, _active):
@@ -92,7 +100,8 @@ def _frontend_base_url(origin_header=None):
     return 'https://dashboard.pixelflip.app'
 
 
-def _send_email_change_code_email(to_email, code):
+def _send_plain_email(to_email, subject, text_body):
+    """One plain-text transactional email through Mailgun. Raises ValueError on failure."""
     mailgun_api_key = os.getenv('MAILGUN_API_KEY')
     mailgun_domain = os.getenv('MAILGUN_DOMAIN')
     mailgun_from = os.getenv('MAILGUN_FROM_EMAIL')
@@ -102,66 +111,73 @@ def _send_email_change_code_email(to_email, code):
         raise ValueError("Mailgun settings missing (MAILGUN_API_KEY/MAILGUN_DOMAIN/MAILGUN_FROM_EMAIL)")
 
     endpoint = f"{mailgun_base_url.rstrip('/')}/v3/{mailgun_domain}/messages"
+    resp = requests.post(
+        endpoint,
+        auth=("api", mailgun_api_key),
+        data={
+            "from": mailgun_from,
+            "to": [to_email],
+            "subject": subject,
+            "text": text_body,
+        },
+        timeout=20,
+    )
+    if resp.status_code >= 300:
+        try:
+            payload = resp.json()
+            message = payload.get("message") or payload.get("error") or resp.text
+        except Exception:
+            message = resp.text
+        raise ValueError(f"Mailgun send failed ({resp.status_code}): {message}")
+
+
+def _send_email_changed_notice(old_email, new_email):
+    """Tell the PREVIOUS address that the account email moved.
+
+    If a session is hijacked, the attacker can verify a code sent to an address
+    they own, so the code alone does not protect the account. This notice is the
+    real owner's only signal that it happened.
+    """
+    _send_plain_email(
+        old_email,
+        "Your PixelFlip email address was changed",
+        f"The email address on your PixelFlip account was changed to {new_email}.\n\n"
+        "If you made this change, no action is needed.\n\n"
+        "If you did NOT make this change, reply to this email or contact "
+        "support@pixelflip.app right away so we can secure your account.",
+    )
+
+
+def _server_error(where, e, status=500,
+                  message="Something went wrong on our side. Please try again."):
+    """Log the real exception server-side and return a generic message.
+
+    str(e) can carry SQL, hostnames or provider responses, none of which belong
+    in a browser — least of all on unauthenticated endpoints.
+    """
+    print(f"[{where}] {type(e).__name__}: {e}", flush=True)
+    return jsonify({"success": False, "error": message}), status
+
+
+_EMAIL_SEND_FAILED_MSG = "We couldn't send the email right now. Please try again in a few minutes."
+
+
+def _send_email_change_code_email(to_email, code):
     subject = "PixelFlip email change verification code"
     text_body = (
         f"Your PixelFlip verification code is: {code}\n\n"
         "This code expires in 10 minutes. If you did not request this, ignore this email."
     )
-
-    resp = requests.post(
-        endpoint,
-        auth=("api", mailgun_api_key),
-        data={
-            "from": mailgun_from,
-            "to": [to_email],
-            "subject": subject,
-            "text": text_body,
-        },
-        timeout=20,
-    )
-    if resp.status_code >= 300:
-        try:
-            payload = resp.json()
-            message = payload.get("message") or payload.get("error") or resp.text
-        except Exception:
-            message = resp.text
-        raise ValueError(f"Mailgun send failed ({resp.status_code}): {message}")
+    _send_plain_email(to_email, subject, text_body)
 
 
 def _send_password_reset_code_email(to_email, code):
-    mailgun_api_key = os.getenv('MAILGUN_API_KEY')
-    mailgun_domain = os.getenv('MAILGUN_DOMAIN')
-    mailgun_from = os.getenv('MAILGUN_FROM_EMAIL')
-    mailgun_base_url = os.getenv('MAILGUN_BASE_URL', 'https://api.mailgun.net')
-
-    if not all([mailgun_api_key, mailgun_domain, mailgun_from]):
-        raise ValueError("Mailgun settings missing (MAILGUN_API_KEY/MAILGUN_DOMAIN/MAILGUN_FROM_EMAIL)")
-
-    endpoint = f"{mailgun_base_url.rstrip('/')}/v3/{mailgun_domain}/messages"
     subject = "PixelFlip password reset code"
     text_body = (
         f"Your PixelFlip password reset code is: {code}\n\n"
         "This code expires in 10 minutes. If you did not request this, ignore this email."
     )
-
-    resp = requests.post(
-        endpoint,
-        auth=("api", mailgun_api_key),
-        data={
-            "from": mailgun_from,
-            "to": [to_email],
-            "subject": subject,
-            "text": text_body,
-        },
-        timeout=20,
-    )
-    if resp.status_code >= 300:
-        try:
-            payload = resp.json()
-            message = payload.get("message") or payload.get("error") or resp.text
-        except Exception:
-            message = resp.text
-        raise ValueError(f"Mailgun send failed ({resp.status_code}): {message}")
+    _send_plain_email(to_email, subject, text_body)
 
 
 def _ensure_email_change_table(cursor):
@@ -176,6 +192,191 @@ def _ensure_email_change_table(cursor):
         )
         """
     )
+    # Same brute-force controls as password_reset_requests (added after the
+    # table shipped, hence ALTER ... IF NOT EXISTS; idempotent on the live table).
+    cursor.execute(
+        "ALTER TABLE email_change_requests "
+        "ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0"
+    )
+    cursor.execute(
+        "ALTER TABLE email_change_requests "
+        "ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"
+    )
+
+
+# Wrong current-password tries allowed per user on /api/update-password before a
+# cool-off. In-process only (single gunicorn worker), which is enough to stop a
+# hijacked session from guessing; Supabase also rate-limits the sign-in call.
+PW_CHANGE_MAX_ATTEMPTS = 5
+PW_CHANGE_WINDOW_SEC = 15 * 60
+_pw_change_failures = {}          # user_id -> [monotonic timestamps of wrong tries]
+_pw_change_lock = threading.Lock()
+
+
+class _RateLimiter(object):
+    """In-process token bucket per key.
+
+    Enough for this deployment: gunicorn runs ONE worker (-w 1, see render.yaml),
+    so every request sees the same buckets. If that ever becomes several workers
+    or instances, each gets its own buckets and the effective limit multiplies —
+    still a ceiling, just a looser one.
+    """
+
+    def __init__(self, capacity, refill_per_sec, max_keys=5000):
+        self.capacity = float(capacity)
+        self.refill = float(refill_per_sec)
+        self.max_keys = max_keys
+        self._buckets = {}            # key -> [tokens, last_monotonic]
+        self._lock = threading.Lock()
+
+    def allow(self, key, now=None):
+        """(allowed, retry_after_seconds). A non-positive capacity disables it."""
+        if self.capacity <= 0:
+            return True, 0
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                if len(self._buckets) >= self.max_keys:
+                    # Bounded: drop the oldest-inserted half rather than grow forever.
+                    for k in list(self._buckets)[: self.max_keys // 2]:
+                        del self._buckets[k]
+                b = self._buckets[key] = [self.capacity, now]
+            tokens = min(self.capacity, b[0] + (now - b[1]) * self.refill)
+            b[1] = now
+            if tokens >= 1:
+                b[0] = tokens - 1
+                return True, 0
+            b[0] = tokens
+            wait = (1 - tokens) / self.refill if self.refill > 0 else 60
+            return False, max(1, int(wait + 0.999))
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# /api/status is polled every 2s per VISIBLE dashboard tab (hidden tabs pause)
+# and costs a pooled DB connection plus ~5 queries each time, from the same
+# 15-client pool the scraper needs. Refill 2/s per user covers four visible tabs
+# at 0.5/s each; burst 10 absorbs page loads. A runaway script is held to 2/s
+# and its excess gets 429s that never touch the database.
+_status_limiter = _RateLimiter(_env_float('STATUS_RATE_BURST', 10),
+                               _env_float('STATUS_RATE_PER_SEC', 2.0))
+# The reset-code request is unauthenticated and sends an email. The per-email 60s
+# throttle stops one inbox being flooded, but not one caller spraying many
+# addresses (Mailgun quota and sender reputation). 5 per 10 minutes per IP.
+_reset_request_limiter = _RateLimiter(_env_float('RESET_REQUEST_RATE_BURST', 5),
+                                      _env_float('RESET_REQUEST_RATE_PER_SEC', 5 / 600.0))
+
+
+def _client_ip():
+    """
+    Best-effort caller IP. Used only as a rate-limit key.
+
+    Render's onrender.com edge is Cloudflare (responses carry `Server:
+    cloudflare` and `CF-RAY`, checked 2026-11-12), and Cloudflare sets
+    CF-Connecting-IP itself, overwriting any value a client sends. True-Client-IP
+    is deliberately NOT read: outside Cloudflare Enterprise a client can supply
+    it. X-Forwarded-For is only a fallback for running without Cloudflare.
+    """
+    v = (request.headers.get('CF-Connecting-IP') or '').strip()
+    if v:
+        return v
+    xff = request.headers.get('X-Forwarded-For') or ''
+    first = xff.split(',')[0].strip()
+    return first or (request.remote_addr or 'unknown')
+
+
+def _rate_limited_response(retry_after, message="Too many requests. Please slow down."):
+    resp = jsonify({"success": False, "error": message, "rate_limited": True})
+    resp.status_code = 429
+    resp.headers['Retry-After'] = str(int(retry_after))
+    return resp
+
+
+def _pw_change_recent(user_id, now=None):
+    now = time.monotonic() if now is None else now
+    hits = [t for t in _pw_change_failures.get(user_id, ()) if now - t < PW_CHANGE_WINDOW_SEC]
+    if hits:
+        _pw_change_failures[user_id] = hits
+    else:
+        _pw_change_failures.pop(user_id, None)
+    return hits
+
+
+def _pw_change_locked(user_id):
+    with _pw_change_lock:
+        return len(_pw_change_recent(user_id)) >= PW_CHANGE_MAX_ATTEMPTS
+
+
+def _pw_change_record_failure(user_id):
+    with _pw_change_lock:
+        _pw_change_recent(user_id)
+        _pw_change_failures.setdefault(user_id, []).append(time.monotonic())
+
+
+def _pw_change_clear(user_id):
+    with _pw_change_lock:
+        _pw_change_failures.pop(user_id, None)
+
+
+def _current_user_email(auth_header):
+    """The signed-in user's current email, from Supabase. None if unavailable."""
+    resp = requests.get(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={"Authorization": auth_header, "apikey": SUPABASE_ANON_KEY},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        return None
+    return ((resp.json() or {}).get('email') or '').strip().lower() or None
+
+
+def _verify_current_password(auth_header, password):
+    """Check `password` against the signed-in account.
+
+    Returns 'ok', 'wrong', 'rate_limited' or 'error'. Uses Supabase's own
+    password sign-in, then revokes the session that sign-in created so the check
+    leaves no extra login behind.
+    """
+    email = _current_user_email(auth_header)
+    if not email:
+        return 'error'
+    resp = requests.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+        headers={"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"},
+        json={"email": email, "password": password},
+        timeout=15,
+    )
+    if resp.status_code == 200:
+        try:
+            probe_token = (resp.json() or {}).get('access_token')
+            if probe_token:
+                requests.post(
+                    f"{SUPABASE_URL}/auth/v1/logout?scope=local",
+                    headers={"Authorization": f"Bearer {probe_token}",
+                             "apikey": SUPABASE_ANON_KEY},
+                    timeout=10,
+                )
+        except Exception as e:
+            print(f"[update_password] could not revoke probe session: {e}", flush=True)
+        return 'ok'
+    if resp.status_code == 429:
+        return 'rate_limited'
+    if resp.status_code in (400, 401):
+        return 'wrong'
+    print(f"[update_password] password check returned HTTP {resp.status_code}", flush=True)
+    return 'error'
+
+
+# Password-reset abuse controls (see request_password_reset_code / reset_password_with_code):
+PW_RESET_EMAIL_THROTTLE_SEC = 60   # no second code email within this window
+PW_RESET_MAX_ATTEMPTS = 3          # wrong-code tries before the code dies + a lock
+PW_RESET_LOCK_MINUTES = 15         # how long the email is locked after that
 
 
 def _ensure_password_reset_table(cursor):
@@ -188,6 +389,18 @@ def _ensure_password_reset_table(cursor):
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """
+    )
+    # Added after the table shipped, so ALTER rather than only CREATE: a 6-digit
+    # code is trivial to brute-force without a cap, and the send path had no
+    # rate limit. attempts counts wrong tries; locked_until freezes the email
+    # after too many. Both IF NOT EXISTS so this is idempotent on the live table.
+    cursor.execute(
+        "ALTER TABLE password_reset_requests "
+        "ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0"
+    )
+    cursor.execute(
+        "ALTER TABLE password_reset_requests "
+        "ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"
     )
 
 
@@ -255,46 +468,90 @@ def _first_stripe_price_id_from_env(*keys):
 
 
 def _stripe_price_to_tier(price_id):
-    """Map Stripe Price id to basic | pro (defaults to pro if unknown)."""
-    if not price_id:
-        return 'pro'
-    pid = str(price_id).strip()
+    """
+    Map a Stripe Price id to 'basic' | 'pro'. Fails CLOSED, to Basic.
+
+    It used to fall back to Pro for any price it did not recognise — a missing
+    id, a price added in the Stripe dashboard but not to the env, a typo — so a
+    misconfiguration silently handed the dearest plan to Basic payers, and
+    nobody would ever complain. Now the unrecognised price grants Basic and
+    says so in the log; a Pro payer short-changed by it notices at once, which
+    is the failure that gets fixed. Fix: add the id to STRIPE_PRICE_PRO_ID or
+    STRIPE_PRICE_BASIC_ID (both take a comma-separated list, so an old and a new
+    price can coexist while subscribers migrate).
+
+    Basic is checked first, so an id listed under BOTH resolves down, too.
+    STRIPE_PRICE_ID is the single-plan-era price, which was Pro; checkout now
+    falls back to it for Pro only, so mapping it to Pro is unambiguous.
+    """
+    pid = str(price_id or '').strip()
     basic_ids = {x.strip() for x in os.getenv('STRIPE_PRICE_BASIC_ID', '').split(',') if x.strip()}
     pro_ids = {x.strip() for x in os.getenv('STRIPE_PRICE_PRO_ID', '').split(',') if x.strip()}
     legacy = os.getenv('STRIPE_PRICE_ID', '').strip()
-    if pid in basic_ids:
+    if pid and pid in basic_ids:
         return 'basic'
-    if pid in pro_ids:
+    if pid and pid in pro_ids:
         return 'pro'
-    if legacy and pid == legacy:
+    if pid and legacy and pid == legacy:
         return 'pro'
-    return 'pro'
+    print(f"[Stripe] UNRECOGNISED price id {pid or '(none)'!r} — granted BASIC. "
+          "If this is a Pro price, add it to STRIPE_PRICE_PRO_ID on Render.", flush=True)
+    return 'basic'
 
 
 def _effective_plan_tier(us):
+    """
+    The tier the API should enforce, resolving ambiguity DOWNWARD.
+
+    is_pro with no plan_tier means they paid for something the record does not
+    name. Returning 'pro' there handed the most expensive plan to any row
+    written by a path other than Stripe. Migration 017 made every legacy row
+    explicit; this governs new ambiguity only. 'inactive' would be the opposite
+    mistake — locking out someone who is actually paying.
+    """
     if not us:
         return 'inactive'
     pt = (us.get('plan_tier') or '').strip().lower()
     if pt in ('basic', 'pro'):
         return pt
     if us.get('is_pro'):
-        return 'pro'
+        return 'basic'
     return 'inactive'
+
+
+def _description_scan_enabled():
+    """
+    Master switch for the description-scanning feature as a whole.
+
+    OFF until ALL FOUR platforms can supply a description. Bryan's explicit
+    call: all-or-nothing, because a toggle that silently works on Craigslist and
+    does nothing on Facebook is worse than no toggle — the user cannot tell
+    whether their filter is being applied.
+
+    As of 2026-08-14 the plumbing, the Pro gate and the UI exist, but NOTHING
+    populates `description` yet, so this stays off and the control renders
+    locked. Flip DESCRIPTION_SCAN_ENABLED=1 once Facebook, Craigslist, OfferUp
+    and Mercari all feed it.
+    """
+    return _env_flag_true('DESCRIPTION_SCAN_ENABLED')
 
 
 def _plan_limits(tier):
     t = (tier or 'inactive').lower()
     if t == 'pro':
-        return {'max_search_terms': 10, 'ai_image_allowed': True, 'max_priority_terms': 3}
+        return {'max_search_terms': 10, 'ai_image_allowed': True, 'max_priority_terms': 3,
+                # Pro AND the feature switched on globally — see above.
+                'description_scan_allowed': _description_scan_enabled()}
     if t == 'basic':
-        return {'max_search_terms': 3, 'ai_image_allowed': False, 'max_priority_terms': 0}
+        return {'max_search_terms': 3, 'ai_image_allowed': False, 'max_priority_terms': 0,
+                'description_scan_allowed': False}
     try:
         # Pre-beta / trial: allow a few terms before checkout; set to 0 in production if you require payment first.
         inactive_cap = int(os.getenv('MAX_SEARCH_TERMS_INACTIVE', '3'))
     except ValueError:
         inactive_cap = 3
     return {'max_search_terms': max(0, inactive_cap), 'ai_image_allowed': False,
-            'max_priority_terms': 0}
+            'max_priority_terms': 0, 'description_scan_allowed': False}
 
 
 def _effective_limits(us):
@@ -600,17 +857,22 @@ def _apply_subscription_row(cursor, user_id, is_pro, period_end=None, cancel_at_
     cursor.execute(f"UPDATE user_settings SET {', '.join(sets)} WHERE user_id = %s", vals)
 
 
-def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, cancel_at_end, plan_tier='pro'):
+def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, cancel_at_end, plan_tier='basic'):
     """
     Upsert subscription after Checkout or webhook.
     plan_tier: basic | pro — controls AI image access and search-term limits.
     """
     platforms = json.dumps({"craigslist": True, "offerup": True, "mercari": True, "facebook": False})
-    plan_tier = (plan_tier or 'pro').lower()
+    plan_tier = (plan_tier or 'basic').lower()
     if plan_tier not in ('basic', 'pro'):
-        plan_tier = 'pro'
+        # Fail closed, as _stripe_price_to_tier does: never guess the dearer plan.
+        plan_tier = 'basic'
     is_pro = plan_tier == 'pro'
-    ai_on = is_pro
+    # Image filtering is unlocked for Pro but defaults OFF — the user opts in from
+    # the dashboard. A new Pro subscriber therefore starts with it off, and the
+    # ON CONFLICT path below deliberately does NOT touch ai_enabled, so a renewal
+    # or re-subscribe never overrides a choice the user already made.
+    ai_on = False
     cursor.execute(
         """
         INSERT INTO user_settings (
@@ -626,7 +888,6 @@ def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, c
         )
         ON CONFLICT (user_id) DO UPDATE SET
             is_pro = EXCLUDED.is_pro,
-            ai_enabled = EXCLUDED.ai_enabled,
             subscription_status = 'active',
             plan_tier = EXCLUDED.plan_tier,
             stripe_customer_id = EXCLUDED.stripe_customer_id,
@@ -735,6 +996,9 @@ def get_db_connection():
                 ensure_term_interval_column,
                 ensure_scraper_state_table,
                 ensure_term_include_table,
+                ensure_scan_description_column,
+                ensure_scrape_lease_column,
+                ensure_alerted_listings_table,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
@@ -745,6 +1009,9 @@ def get_db_connection():
             ensure_term_interval_column(conn)
             ensure_scraper_state_table(conn)
             ensure_term_include_table(conn)
+            ensure_scan_description_column(conn)
+            ensure_scrape_lease_column(conn)
+            ensure_alerted_listings_table(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -934,6 +1201,28 @@ def cleanup_old_listings():
                 conn.commit()
                 if deleted > 0:
                     print(f"🧹 Cleanup removed {deleted} old listings", flush=True)
+                # The persistent alert-dedup log outlives the 7-day listings purge
+                # on purpose (so a still-live listing is not re-alerted), but needs
+                # its own, longer bound — default 60 days, past Facebook's 45-day
+                # max. Its own try/commit so a failure here cannot undo the purge
+                # above or the log purge below.
+                try:
+                    try:
+                        retention = int(os.getenv('ALERTED_RETENTION_DAYS', '60'))
+                    except ValueError:
+                        retention = 60
+                    cursor.execute(
+                        "DELETE FROM alerted_listings "
+                        "WHERE first_alerted_at < NOW() - (%s * INTERVAL '1 day')",
+                        (retention,),
+                    )
+                    a_deleted = cursor.rowcount
+                    conn.commit()
+                    if a_deleted > 0:
+                        print(f"🧹 Cleanup removed {a_deleted} old alert records", flush=True)
+                except Exception as alert_err:
+                    conn.rollback()
+                    print(f"alerted_listings purge warning: {alert_err}", flush=True)
                 # Console lines are now rows, so they need retention too or the
                 # table grows without bound.
                 try:
@@ -987,42 +1276,100 @@ _scraper_thread = None
 _scraper_thread_started = False
 _cleanup_thread = None
 _cleanup_thread_started = False
+_threads_lock = threading.Lock()
+
+# The pid that imported this module. Under gunicorn --preload that is the MASTER
+# and requests are served by a forked worker with another pid; /health reports
+# the comparison so a preloaded deploy is visible instead of silent.
+_IMPORT_PID = os.getpid()
+
+# gunicorn imports the app itself, so its package is loaded in the master and in
+# every worker. Nothing else in this project imports it (and it cannot even be
+# imported on Windows), so this is a reliable "am I being served by gunicorn".
+_UNDER_GUNICORN = 'gunicorn' in sys.modules
+_deferred_threads_checked = False
+
 
 def _env_flag_true(name):
     return (os.getenv(name, '') or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-def ensure_scraper_thread_started():
-    """
-    When running under gunicorn, __main__ doesn't execute.
-    We optionally start the background scraper thread on import.
-
-    Set ENABLE_SCRAPER_THREAD=1 on Render if this web service should also run the scraper loop.
-    """
+def _start_scraper_thread():
+    """Start the scrape loop in THIS process (caller holds _threads_lock)."""
     global _scraper_thread, _scraper_thread_started
-    if _scraper_thread_started:
-        return
-    if os.getenv("ENABLE_SCRAPER_THREAD", "0") != "1":
-        return
-    _scraper_thread = threading.Thread(target=start_background_scraper, daemon=True)
+    _scraper_thread = threading.Thread(target=start_background_scraper, daemon=True,
+                                       name='scraper-loop')
     _scraper_thread.start()
     _scraper_thread_started = True
 
-ensure_scraper_thread_started()
+
+def ensure_scraper_thread_started():
+    """
+    Start the background scraper loop if ENABLE_SCRAPER_THREAD=1.
+
+    That flag is the switch for gunicorn, where __main__ never runs; `python
+    app.py` has its own switch in __main__. Idempotent and thread-safe.
+    """
+    with _threads_lock:
+        if _scraper_thread_started:
+            return
+        if os.getenv("ENABLE_SCRAPER_THREAD", "0") != "1":
+            return
+        _start_scraper_thread()
 
 
 def ensure_cleanup_thread_started():
     global _cleanup_thread, _cleanup_thread_started
-    if _cleanup_thread_started:
-        return
-    if os.getenv("ENABLE_CLEANUP_THREAD", "1") != "1":
-        return
-    _cleanup_thread = threading.Thread(target=cleanup_old_listings, daemon=True)
-    _cleanup_thread.start()
-    _cleanup_thread_started = True
+    with _threads_lock:
+        if _cleanup_thread_started:
+            return
+        if os.getenv("ENABLE_CLEANUP_THREAD", "1") != "1":
+            return
+        _cleanup_thread = threading.Thread(target=cleanup_old_listings, daemon=True,
+                                           name='listings-cleanup')
+        _cleanup_thread.start()
+        _cleanup_thread_started = True
 
 
-ensure_cleanup_thread_started()
+def _start_background_work():
+    ensure_scraper_thread_started()
+    ensure_cleanup_thread_started()
+    if boot_check is not None:
+        try:
+            boot_check.start()
+        except Exception as e:
+            print(f"[boot] self-check failed to start: {e}", flush=True)
+
+
+if _UNDER_GUNICORN:
+    # NOT at import. Render sets GUNICORN_CMD_ARGS="--preload ..." on every
+    # Python service by default, and gunicorn applies that env var even when
+    # the start command never says --preload (a command-line flag can add
+    # preload but not remove it; verified in gunicorn 23.0.0's load_config).
+    # Preloaded, this import runs in the MASTER: threads started here would
+    # scan from the master, invisible to the worker that serves /api/status,
+    # and would open pooled DB connections that the forked worker inherits.
+    # The first request — Render's own health check, seconds after boot — is
+    # always handled by a worker, preloaded or not, so start them there.
+    print(f"[boot] gunicorn detected (pid {_IMPORT_PID}): background threads start "
+          f"on the first request, inside the worker.", flush=True)
+else:
+    _start_background_work()
+
+
+@app.before_request
+def _start_deferred_background_work():
+    global _deferred_threads_checked
+    if not _UNDER_GUNICORN or _deferred_threads_checked:
+        return None
+    _deferred_threads_checked = True
+    _start_background_work()
+    if os.getpid() != _IMPORT_PID:
+        print(f"[boot] WARNING gunicorn preload is ON (imported in pid {_IMPORT_PID}, serving "
+              f"from pid {os.getpid()}). Threads were started in the worker, so scanning is "
+              f"fine, but preload doubles memory — set GUNICORN_CMD_ARGS without --preload.",
+              flush=True)
+    return None
 
 
 # ==========================================
@@ -1083,6 +1430,10 @@ def scraper_health(user_id):
 def get_status(user_id):
     if request.method == 'OPTIONS':
         return '', 200
+
+    allowed, retry_after = _status_limiter.allow(user_id)
+    if not allowed:
+        return _rate_limited_response(retry_after)
 
     conn = get_db_connection()
     if not conn: return jsonify({"error": "DB error"}), 500
@@ -1296,6 +1647,8 @@ def handle_settings(user_id):
                     "fastest_term_interval": _interval_floor_for_tier('inactive'),
                     "default_term_interval": DEFAULT_TERM_INTERVAL_MINUTES,
                     "ai_image_allowed": False,
+                    "scan_description": False,
+                    "description_scan_allowed": False,
                     "subscription_current_period_end": None,
                     "subscription_cancel_at_period_end": False,
                     "notifications": _normalize_notification_channels(None),
@@ -1337,6 +1690,11 @@ def handle_settings(user_id):
                 "fastest_term_interval": _interval_floor_for_tier(pt),
                 "default_term_interval": DEFAULT_TERM_INTERVAL_MINUTES,
                 "ai_image_allowed": ai_allowed,
+                # Reported as OFF for a tier that cannot use it, whatever the
+                # column says, so a downgraded account does not show a feature
+                # enabled that the scraper is ignoring.
+                "scan_description": bool(us.get('scan_description')) and limits['description_scan_allowed'],
+                "description_scan_allowed": limits['description_scan_allowed'],
                 "subscription_current_period_end": us.get('subscription_current_period_end'),
                 "subscription_cancel_at_period_end": bool(us.get('subscription_cancel_at_period_end')),
                 "notifications": _normalize_notification_channels(us.get('notification_channels')),
@@ -1363,6 +1721,14 @@ def handle_settings(user_id):
             want_ai = bool(data.get('ai_detection', False))
             if not limits['ai_image_allowed']:
                 want_ai = False
+
+            # Description scanning is Pro-only and clamped HERE, the same shape
+            # as ai_detection above: the UI disables the control, but a crafted
+            # POST must not be able to buy a Basic account an extra HTTP fetch
+            # per listing on three marketplaces.
+            want_desc = bool(data.get('scan_description', False))
+            if not limits.get('description_scan_allowed'):
+                want_desc = False
 
             prev_nc = None
             prev_phone = None
@@ -1403,18 +1769,19 @@ def handle_settings(user_id):
                 INSERT INTO user_settings (
                     user_id, zip_code, search_radius, platforms, ai_enabled,
                     check_interval_minutes, ai_strictness, notification_channels, contact_phone,
-                    buyer_include_local, buyer_include_shipping
+                    buyer_include_local, buyer_include_shipping, scan_description
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                     zip_code = EXCLUDED.zip_code, search_radius = EXCLUDED.search_radius, platforms = EXCLUDED.platforms,
                     ai_enabled = EXCLUDED.ai_enabled, check_interval_minutes = EXCLUDED.check_interval_minutes, ai_strictness = EXCLUDED.ai_strictness,
                     notification_channels = EXCLUDED.notification_channels, contact_phone = EXCLUDED.contact_phone,
-                    buyer_include_local = EXCLUDED.buyer_include_local, buyer_include_shipping = EXCLUDED.buyer_include_shipping;
+                    buyer_include_local = EXCLUDED.buyer_include_local, buyer_include_shipping = EXCLUDED.buyer_include_shipping,
+                    scan_description = EXCLUDED.scan_description;
             """, (
             user_id, data.get('zip_code', '95212'), data.get('distance', 25), json.dumps(plat),
             want_ai, check_iv, strict_text,
-            json.dumps(nc_json), phone, bl_buy, bs_buy))
+            json.dumps(nc_json), phone, bl_buy, bs_buy, want_desc))
 
             # REPLACE Search Terms
             # POST: Save both max and min to the database
@@ -1534,6 +1901,9 @@ def handle_settings(user_id):
             out['platforms'] = plat
             out['check_interval'] = check_iv
             out['ai_detection'] = want_ai
+            # Echo what was actually stored, not what was asked for — a Basic
+            # client that sent true needs its toggle to snap back off.
+            out['scan_description'] = want_desc
             out['notifications'] = nc_json
             out['contact_phone'] = phone or ''
             out['buyer_include_local'] = bl_buy
@@ -1542,7 +1912,7 @@ def handle_settings(user_id):
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('handle_settings', e)
     finally:
         cursor.close()
         conn.close()
@@ -1582,7 +1952,7 @@ def update_account_contact(user_id):
         return jsonify({"success": True, "contact_phone": phone or ""})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('update_account_contact', e)
     finally:
         cursor.close()
         conn.close()
@@ -1833,6 +2203,87 @@ def unsubscribe():
     return _pref_form(user_id, token, channels or dict(EMAIL_CATEGORIES))
 
 
+# ---------------------------------------------------------------------------
+# Capacity cap: how many accounts may have their scanner ON at once.
+#
+# The ceiling is the marketplaces, not this server. OfferUp is paced to one
+# search every ~3s for the whole process, and about a dozen maxed-out Pro
+# accounts fill that, whatever the instance size. The cap stops a burst of
+# sign-ups from making every existing customer's scans late.
+#
+# Change it with the MAX_ACTIVE_USERS env var (Render -> Environment; the
+# service restarts and the new value applies). 0 = no cap. Lowering it below
+# the number already scanning stops nobody: running scanners keep running, and
+# new STARTs wait until a spot frees up.
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_ACTIVE_USERS = 10
+# Arbitrary but fixed: every path that arms a scanner takes this advisory lock.
+_ARM_LOCK_KEY = 0x50464C41
+
+# Who holds a spot, counted the way the scheduler scans: scanner ON and a paid
+# plan, resolved exactly as _effective_plan_tier does. An armed row with no plan
+# is switched off by the scheduler, so it never holds a spot.
+_SQL_COUNT_SCANNING = """
+    SELECT COUNT(*) FROM user_settings
+    WHERE is_active = TRUE AND user_id <> %s
+      AND (LOWER(TRIM(COALESCE(plan_tier, ''))) IN ('basic', 'pro')
+           OR COALESCE(is_pro, FALSE))
+"""
+
+
+def _max_active_users():
+    raw = (os.getenv('MAX_ACTIVE_USERS') or '').strip()
+    if not raw:
+        return DEFAULT_MAX_ACTIVE_USERS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        print(f"MAX_ACTIVE_USERS={raw!r} is not a whole number; using "
+              f"{DEFAULT_MAX_ACTIVE_USERS}", flush=True)
+        return DEFAULT_MAX_ACTIVE_USERS
+
+
+def _checkout_capacity_block(user_id):
+    """
+    The at-capacity answer for a checkout, or None to let it proceed.
+
+    The worst outcome of a cap is taking someone's money and then refusing
+    their START, so a NEW subscriber is stopped here, before Stripe. An account
+    already on a plan (an upgrade) is never blocked. Fails OPEN on a database
+    error: losing a sale to a hiccup is worse than one account over the cap.
+    """
+    cap = _max_active_users()
+    if not cap:
+        return None
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT plan_tier, is_pro FROM user_settings WHERE user_id = %s;",
+                    (user_id,))
+        row = cur.fetchone()
+        if row and _effective_plan_tier({'plan_tier': row[0], 'is_pro': row[1]}) != 'inactive':
+            return None
+        cur.execute(_SQL_COUNT_SCANNING, (user_id,))
+        running = cur.fetchone()[0]
+        if running < cap:
+            return None
+        print(f"[capacity] checkout paused for {str(user_id)[:8]}: "
+              f"{running}/{cap} scanners on", flush=True)
+        return {
+            "error": (f"PixelFlip is full right now: all {cap} spots are taken, so new "
+                      "subscriptions are paused. Join the waitlist at pixelflip.app to "
+                      "hear when a spot opens."),
+            "code": "at_capacity", "active": running, "cap": cap,
+        }
+    except Exception as e:
+        print(f"[capacity] checkout check failed ({e}); allowing checkout", flush=True)
+        return None
+    finally:
+        conn.close()
+
+
 @app.route('/api/start', methods=['POST', 'OPTIONS'])
 @app.route('/api/start/', methods=['POST', 'OPTIONS'])
 @app.route('/start', methods=['POST', 'OPTIONS'])
@@ -1847,6 +2298,35 @@ def start_scraper(user_id):
     if not conn: return jsonify({"error": "DB error"}), 500
     try:
         cursor = conn.cursor()
+        cursor.execute("SELECT * FROM user_settings WHERE user_id = %s;", (user_id,))
+        found = cursor.fetchone()
+        us_row = dict(zip([d[0] for d in cursor.description], found)) if found else None
+        # Scanning IS the paid product. Without this, any account could arm with
+        # the MAX_SEARCH_TERMS_INACTIVE terms it may save before checkout. The
+        # scheduler also switches off armed rows with no plan (a subscription
+        # that lapsed while running); this is the half the user sees.
+        if _effective_plan_tier(us_row) == 'inactive':
+            conn.rollback()
+            return jsonify({"error": "Choose the Basic or Pro plan to start scanning.",
+                            "code": "plan_required"}), 402
+        cap = _max_active_users()
+        if cap and not (us_row or {}).get('is_active'):
+            # Serialise arming so two STARTs at the same moment cannot both take
+            # the last spot. Transaction-scoped: the commit or rollback below
+            # releases it.
+            cursor.execute("SELECT pg_advisory_xact_lock(%s);", (_ARM_LOCK_KEY,))
+            cursor.execute(_SQL_COUNT_SCANNING, (user_id,))
+            running = cursor.fetchone()[0]
+            if running >= cap:
+                conn.rollback()
+                print(f"[capacity] START refused for {str(user_id)[:8]}: "
+                      f"{running}/{cap} scanners on", flush=True)
+                return jsonify({
+                    "error": (f"PixelFlip is at capacity: all {cap} scanner spots are in "
+                              "use. Your searches are saved, so press START again later, "
+                              "or email support@pixelflip.app."),
+                    "code": "at_capacity", "active": running, "cap": cap,
+                }), 409
         # Conditional, so rowcount tells us whether this was a real OFF->ON
         # arming or a START pressed on a scanner that was already running.
         cursor.execute("UPDATE user_settings SET is_active = TRUE "
@@ -1910,7 +2390,7 @@ def start_scraper(user_id):
             pass
         return jsonify({"success": True, "status": "running"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error('start_scraper', e)
     finally:
         conn.close()
 
@@ -1957,7 +2437,7 @@ def stop_scraper(user_id):
             pass
         return jsonify({"success": True, "status": "stopped"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _server_error('stop_scraper', e)
     finally:
         conn.close()
 
@@ -2029,7 +2509,7 @@ def stripe_webhook():
                         is_pro = %s,
                         subscription_status = %s,
                         plan_tier = %s,
-                        ai_enabled = %s,
+                        ai_enabled = (ai_enabled AND %s),
                         subscription_current_period_end = %s,
                         subscription_cancel_at_period_end = %s,
                         stripe_subscription_id = COALESCE(%s, stripe_subscription_id)
@@ -2039,7 +2519,12 @@ def stripe_webhook():
                         is_pro,
                         'active' if entitled else 'inactive',
                         tier,
-                        is_pro,
+                        # Preserve the user's image-filter choice while entitled
+                        # (AND TRUE = unchanged); revoke it on downgrade/cancel
+                        # (AND FALSE = off), since it is a Pro-only feature. This
+                        # replaces forcing it ON for every Pro, which overrode the
+                        # user every renewal.
+                        entitled,
                         pe,
                         ca,
                         sub.get('id'),
@@ -2094,8 +2579,13 @@ def update_password(user_id):
     if request.method == 'OPTIONS':
         return '', 200
 
-    data = request.json
-    new_password = data.get('new_password')
+    data = request.get_json(silent=True) or {}
+    old_password = data.get('old_password') or ''
+    new_password = data.get('new_password') or ''
+    if not old_password or not new_password:
+        return jsonify({"success": False, "error": "Current and new password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"success": False, "error": "Password must be at least 8 characters"}), 400
 
     # We MUST get the token from the request to tell Supabase WHO is changing the password
     auth_header = request.headers.get('Authorization')
@@ -2110,6 +2600,23 @@ def update_password(user_id):
     }
 
     try:
+        # The dashboard always sent old_password, but nothing checked it: anyone
+        # holding a session (an unlocked laptop, a leaked token) could set a new
+        # password and lock the owner out. Verify it before changing anything.
+        if _pw_change_locked(user_id):
+            return jsonify({"success": False,
+                            "error": "Too many incorrect attempts. Try again in 15 minutes."}), 429
+        verdict = _verify_current_password(auth_header, old_password)
+        if verdict == 'wrong':
+            _pw_change_record_failure(user_id)
+            return jsonify({"success": False, "error": "Current password is incorrect"}), 400
+        if verdict == 'rate_limited':
+            return jsonify({"success": False,
+                            "error": "Too many attempts. Please wait a few minutes and try again."}), 429
+        if verdict != 'ok':
+            return jsonify({"success": False,
+                            "error": "Could not verify your current password. Please try again."}), 502
+
         print(f"🔑 Attempting password update for user: {user_id}")
 
         # Supabase API expects the password inside a JSON body
@@ -2125,9 +2632,13 @@ def update_password(user_id):
         print(f"📡 Supabase Response Code: {response.status_code}")
 
         if response.status_code == 200:
+            _pw_change_clear(user_id)
             return jsonify({"success": True})
         else:
-            error_data = response.json()
+            try:
+                error_data = response.json()
+            except Exception:
+                error_data = {}
             print(f"❌ Supabase Rejected: {error_data}")
             return jsonify({
                 "success": False,
@@ -2135,8 +2646,7 @@ def update_password(user_id):
             }), response.status_code
 
     except Exception as e:
-        print(f"🔥 Python Crash in update_password: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return _server_error('update_password', e)
 
 
 @app.route('/api/update-email', methods=['POST', 'OPTIONS'])
@@ -2163,7 +2673,9 @@ def update_email(user_id):
         _ensure_email_change_table(cursor)
         cursor.execute(
             """
-            SELECT new_email, code_hash, expires_at, (expires_at > NOW()) AS is_valid
+            SELECT new_email, code_hash, expires_at, attempts,
+                   (expires_at > NOW()) AS is_valid,
+                   (locked_until IS NOT NULL AND locked_until > NOW()) AS is_locked
             FROM email_change_requests
             WHERE user_id = %s
             LIMIT 1
@@ -2173,12 +2685,47 @@ def update_email(user_id):
         row = cursor.fetchone()
         if not row:
             return jsonify({"success": False, "error": "No verification request found"}), 400
+        if row.get('is_locked'):
+            conn.commit()
+            return jsonify({"success": False,
+                            "error": "Too many incorrect attempts. Request a new code and try again shortly."}), 429
         if row['new_email'] != new_email:
             return jsonify({"success": False, "error": "Email does not match requested address"}), 400
         if not row.get('is_valid'):
             return jsonify({"success": False, "error": "Verification code expired"}), 400
         if row['code_hash'] != code_hash:
-            return jsonify({"success": False, "error": "Invalid verification code"}), 400
+            # Same rule as password reset: at the cap, kill the code and lock, so
+            # the 6-digit space cannot be walked within the 10-minute window.
+            new_attempts = int(row.get('attempts') or 0) + 1
+            if new_attempts >= PW_RESET_MAX_ATTEMPTS:
+                cursor.execute(
+                    """
+                    UPDATE email_change_requests
+                    SET attempts = %s,
+                        locked_until = NOW() + (%s * INTERVAL '1 minute'),
+                        expires_at = NOW()
+                    WHERE user_id = %s
+                    """,
+                    (new_attempts, PW_RESET_LOCK_MINUTES, user_id),
+                )
+                conn.commit()
+                return jsonify({"success": False,
+                                "error": "Too many incorrect attempts. This code is no longer valid — request a new one."}), 429
+            cursor.execute(
+                "UPDATE email_change_requests SET attempts = %s WHERE user_id = %s",
+                (new_attempts, user_id),
+            )
+            conn.commit()
+            left = PW_RESET_MAX_ATTEMPTS - new_attempts
+            return jsonify({"success": False,
+                            "error": f"Invalid verification code. {left} attempt(s) left."}), 400
+
+        # Remember the address being replaced so its owner can be told.
+        try:
+            old_email = _current_user_email(request.headers.get('Authorization'))
+        except Exception as e:
+            print(f"[update_email] could not read current email: {e}", flush=True)
+            old_email = None
 
         # Prefer admin API (backend service role) for reliability.
         response = None
@@ -2228,9 +2775,15 @@ def update_email(user_id):
 
         cursor.execute("DELETE FROM email_change_requests WHERE user_id = %s", (user_id,))
         conn.commit()
+        if old_email and old_email != new_email:
+            try:
+                _send_email_changed_notice(old_email, new_email)
+            except Exception as e:
+                # The change itself succeeded; a failed notice must not undo it.
+                print(f"[update_email] change notice to previous address failed: {e}", flush=True)
         return jsonify({"success": True, "email": new_email})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return _server_error('update_email', e)
     finally:
         try:
             cursor.close()
@@ -2249,6 +2802,8 @@ def request_email_change(user_id):
     new_email = (data.get('new_email') or '').strip().lower()
     if not new_email:
         return jsonify({"success": False, "error": "Email is required"}), 400
+    if '@' not in new_email or '.' not in new_email.split('@')[-1]:
+        return jsonify({"success": False, "error": "Email format is invalid"}), 400
     code = f"{secrets.randbelow(1000000):06d}"
     code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
@@ -2259,15 +2814,41 @@ def request_email_change(user_id):
     try:
         cursor = conn.cursor()
         _ensure_email_change_table(cursor)
+
+        # Throttle + lockout before issuing anything. Without the throttle a
+        # signed-in account could use this to mail any address, repeatedly.
+        # The caller is authenticated and asking about their own account, so
+        # (unlike password reset) these refusals can say what happened.
         cursor.execute(
             """
-            INSERT INTO email_change_requests (user_id, new_email, code_hash, expires_at, created_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            SELECT (locked_until IS NOT NULL AND locked_until > NOW()) AS is_locked,
+                   (created_at > NOW() - (%s * INTERVAL '1 second'))    AS too_soon
+            FROM email_change_requests WHERE user_id = %s
+            """,
+            (PW_RESET_EMAIL_THROTTLE_SEC, user_id),
+        )
+        existing = cursor.fetchone()
+        if existing and existing[0]:
+            conn.commit()
+            return jsonify({"success": False,
+                            "error": "Too many incorrect attempts. Try again in 15 minutes."}), 429
+        if existing and existing[1]:
+            conn.commit()
+            return jsonify({"success": False,
+                            "error": "A code was just sent. Please wait a minute before requesting another."}), 429
+
+        cursor.execute(
+            """
+            INSERT INTO email_change_requests
+                (user_id, new_email, code_hash, expires_at, created_at, attempts, locked_until)
+            VALUES (%s, %s, %s, %s, NOW(), 0, NULL)
             ON CONFLICT (user_id) DO UPDATE SET
                 new_email = EXCLUDED.new_email,
                 code_hash = EXCLUDED.code_hash,
                 expires_at = EXCLUDED.expires_at,
-                created_at = NOW()
+                created_at = NOW(),
+                attempts = 0,
+                locked_until = NULL
             """,
             (user_id, new_email, code_hash, expires_at)
         )
@@ -2276,14 +2857,9 @@ def request_email_change(user_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        msg = str(e)
-        if "Mailgun send failed" in msg:
-            # Friendly troubleshooting hint for common Mailgun recipient/domain issues.
-            return jsonify({
-                "success": False,
-                "error": f"{msg}. Verify Mailgun domain DNS is active and recipient format is valid."
-            }), 400
-        return jsonify({"success": False, "error": msg}), 500
+        if "Mailgun send failed" in str(e):
+            return _server_error('request_email_change', e, 502, _EMAIL_SEND_FAILED_MSG)
+        return _server_error('request_email_change', e)
     finally:
         if cursor:
             cursor.close()
@@ -2308,24 +2884,25 @@ def create_checkout(user_id):
     data = request.get_json(silent=True) or {}
     plan = (data.get('plan') or 'pro').lower()
     if plan == 'basic':
-        price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID', 'STRIPE_PRICE_ID')
+        # No legacy fallback for Basic. STRIPE_PRICE_ID is the old single-plan
+        # price, which was Pro, and _stripe_price_to_tier maps it back to Pro —
+        # so charging it for a Basic checkout was exactly the Basic-payer-gets-
+        # Pro mismatch. A missing Basic price is now a visible error instead.
+        price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID')
     else:
         price_id = _first_stripe_price_id_from_env('STRIPE_PRICE_PRO_ID', 'STRIPE_PRICE_ID')
     basic_direct = _first_stripe_price_id_from_env('STRIPE_PRICE_BASIC_ID')
     pro_direct = _first_stripe_price_id_from_env('STRIPE_PRICE_PRO_ID')
     legacy = _first_stripe_price_id_from_env('STRIPE_PRICE_ID')
-    if legacy and not basic_direct and not pro_direct:
-        print(
-            "Stripe: STRIPE_PRICE_BASIC_ID and STRIPE_PRICE_PRO_ID are unset; "
-            "every checkout uses STRIPE_PRICE_ID. Set both price ids so Basic vs Pro map to different Stripe prices.",
-            flush=True,
-        )
     if not price_id:
-        return jsonify({
-            "error": "Stripe price not configured. Set STRIPE_PRICE_BASIC_ID and STRIPE_PRICE_PRO_ID (or legacy STRIPE_PRICE_ID).",
-        }), 500
+        env_key = 'STRIPE_PRICE_BASIC_ID' if plan == 'basic' else 'STRIPE_PRICE_PRO_ID'
+        print(f"[Stripe checkout] no price for plan={plan!r}: set {env_key}", flush=True)
+        return jsonify({"error": f"Stripe price not configured. Set {env_key}."}), 500
     if not stripe.api_key:
         return jsonify({"error": "STRIPE_SECRET_KEY not configured"}), 500
+    full = _checkout_capacity_block(user_id)
+    if full:
+        return jsonify(full), 409
     print(
         "[Stripe checkout] "
         f"plan={plan!r} resolved_price_id={price_id!r} "
@@ -2365,7 +2942,7 @@ def create_checkout(user_id):
         return jsonify({'url': checkout_session.url})
     except Exception as e:
         print(f"create_checkout: {e}", flush=True)
-        return jsonify(error=str(e)), 500
+        return _server_error('create_checkout', e)
 
 
 @app.route('/api/complete-checkout', methods=['POST', 'OPTIONS'])
@@ -2431,7 +3008,7 @@ def complete_checkout(user_id):
     except Exception as e:
         conn.rollback()
         print(f"complete_checkout db: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
+        return _server_error('complete_checkout', e)
     finally:
         cursor.close()
         conn.close()
@@ -2469,7 +3046,7 @@ def create_portal_session(user_id):
         return jsonify({"url": portal.url})
     except Exception as e:
         print(f"create_portal_session: {e}", flush=True)
-        return jsonify(error=str(e)), 500
+        return _server_error('create_portal_session', e)
     finally:
         cursor.close()
         conn.close()
@@ -2509,7 +3086,7 @@ def cancel_subscription_at_period_end(user_id):
     except Exception as e:
         conn.rollback()
         print(f"cancel_subscription: {e}", flush=True)
-        return jsonify(error=str(e)), 500
+        return _server_error('cancel_subscription_at_period_end', e)
     finally:
         cursor.close()
         conn.close()
@@ -2667,7 +3244,7 @@ def list_scraped_listings(user_id):
         return jsonify({"listings": out, "total": total, "limit": limit, "offset": offset})
     except Exception as e:
         print(f"listings: {e}", flush=True)
-        return jsonify(error=str(e)), 500
+        return _server_error('list_scraped_listings', e)
     finally:
         cursor.close()
         conn.close()
@@ -2753,6 +3330,10 @@ def request_password_reset_code():
     email = (data.get('email') or '').strip().lower()
     if not email or '@' not in email:
         return jsonify({"success": False, "error": "Valid email is required"}), 400
+    allowed, retry_after = _reset_request_limiter.allow(_client_ip())
+    if not allowed:
+        return _rate_limited_response(
+            retry_after, "Too many reset requests from this network. Please try again later.")
     code = f"{secrets.randbelow(1000000):06d}"
     code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
@@ -2763,14 +3344,42 @@ def request_password_reset_code():
     try:
         cursor = conn.cursor()
         _ensure_password_reset_table(cursor)
+
+        # Rate limit + lockout BEFORE issuing or sending anything. Every branch
+        # returns the same success-shaped body as the normal path, so none of
+        # this reveals whether the email exists or is currently locked.
         cursor.execute(
             """
-            INSERT INTO password_reset_requests (email, code_hash, expires_at, created_at)
-            VALUES (%s, %s, %s, NOW())
+            SELECT (locked_until IS NOT NULL AND locked_until > NOW()) AS is_locked,
+                   (created_at > NOW() - (%s * INTERVAL '1 second'))    AS too_soon
+            FROM password_reset_requests WHERE email = %s
+            """,
+            (PW_RESET_EMAIL_THROTTLE_SEC, email),
+        )
+        existing = cursor.fetchone()
+        if existing and existing[0]:
+            # Temporarily locked after too many wrong codes — do not send a new
+            # one or reset the lock; let it expire on its own.
+            conn.commit()
+            return jsonify({"success": True})
+        if existing and existing[1]:
+            # A code was emailed within the throttle window — refuse to send a
+            # second so the endpoint can't be used to flood an inbox or Mailgun.
+            conn.commit()
+            return jsonify({"success": True})
+
+        # Fresh code: reset the attempt counter and clear any stale lock.
+        cursor.execute(
+            """
+            INSERT INTO password_reset_requests
+                (email, code_hash, expires_at, created_at, attempts, locked_until)
+            VALUES (%s, %s, %s, NOW(), 0, NULL)
             ON CONFLICT (email) DO UPDATE SET
                 code_hash = EXCLUDED.code_hash,
                 expires_at = EXCLUDED.expires_at,
-                created_at = NOW()
+                created_at = NOW(),
+                attempts = 0,
+                locked_until = NULL
             """,
             (email, code_hash, expires_at)
         )
@@ -2780,10 +3389,11 @@ def request_password_reset_code():
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        msg = str(e)
-        if "Mailgun send failed" in msg:
-            return jsonify({"success": False, "error": f"{msg}. Verify Mailgun configuration."}), 400
-        return jsonify({"success": False, "error": msg}), 500
+        # Unauthenticated endpoint: never echo exception text (it can name the
+        # DB host, SQL or Mailgun's response) to whoever is calling.
+        if "Mailgun send failed" in str(e):
+            return _server_error('request_password_reset_code', e, 502, _EMAIL_SEND_FAILED_MSG)
+        return _server_error('request_password_reset_code', e)
     finally:
         if cursor:
             cursor.close()
@@ -2813,7 +3423,9 @@ def reset_password_with_code():
         _ensure_password_reset_table(cursor)
         cursor.execute(
             """
-            SELECT email, code_hash, expires_at, (expires_at > NOW()) AS is_valid
+            SELECT email, code_hash, attempts,
+                   (expires_at > NOW()) AS is_valid,
+                   (locked_until IS NOT NULL AND locked_until > NOW()) AS is_locked
             FROM password_reset_requests
             WHERE email = %s
             LIMIT 1
@@ -2823,11 +3435,42 @@ def reset_password_with_code():
         row = cursor.fetchone()
         if not row:
             return jsonify({"success": False, "error": "No reset request found"}), 400
+        if row.get('is_locked'):
+            # Too many wrong tries already — the code is dead and the email is in
+            # its cool-off. Make them request a new one.
+            conn.commit()
+            return jsonify({"success": False,
+                            "error": "Too many incorrect attempts. Request a new code and try again shortly."}), 429
         if not row.get('is_valid'):
             return jsonify({"success": False, "error": "Verification code expired"}), 400
         code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
         if row['code_hash'] != code_hash:
-            return jsonify({"success": False, "error": "Invalid verification code"}), 400
+            # Count the miss. At the cap, lock the email AND kill the code (expire
+            # it now) so even a later correct guess cannot use it — a 6-digit code
+            # is otherwise brute-forceable.
+            new_attempts = int(row.get('attempts') or 0) + 1
+            if new_attempts >= PW_RESET_MAX_ATTEMPTS:
+                cursor.execute(
+                    """
+                    UPDATE password_reset_requests
+                    SET attempts = %s,
+                        locked_until = NOW() + (%s * INTERVAL '1 minute'),
+                        expires_at = NOW()
+                    WHERE email = %s
+                    """,
+                    (new_attempts, PW_RESET_LOCK_MINUTES, email),
+                )
+                conn.commit()
+                return jsonify({"success": False,
+                                "error": "Too many incorrect attempts. This code is no longer valid — request a new one."}), 429
+            cursor.execute(
+                "UPDATE password_reset_requests SET attempts = %s WHERE email = %s",
+                (new_attempts, email),
+            )
+            conn.commit()
+            left = PW_RESET_MAX_ATTEMPTS - new_attempts
+            return jsonify({"success": False,
+                            "error": f"Invalid verification code. {left} attempt(s) left."}), 400
 
         user = _admin_lookup_supabase_user_by_email(email)
         if not user:
@@ -2861,7 +3504,7 @@ def reset_password_with_code():
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return _server_error('reset_password_with_code', e)
     finally:
         if cursor:
             cursor.close()
@@ -2925,7 +3568,7 @@ def mark_listing_feedback(user_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('mark_listing_feedback', e)
     finally:
         cursor.close()
         conn.close()
@@ -2948,7 +3591,7 @@ def clear_all_scraped_listings(user_id):
         return jsonify({"success": True, "deleted": int(n)})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('clear_all_scraped_listings', e)
     finally:
         cursor.close()
         conn.close()
@@ -2994,7 +3637,7 @@ def push_subscribe(user_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('push_subscribe', e)
     finally:
         cursor.close()
         conn.close()
@@ -3024,7 +3667,7 @@ def push_unsubscribe(user_id):
         return jsonify({"success": True})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('push_unsubscribe', e)
     finally:
         cursor.close()
         conn.close()
@@ -3074,7 +3717,7 @@ def push_test(user_id):
             return jsonify({"success": False, "error": err or 'send failed'}), 502
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return _server_error('push_test', e)
     finally:
         cursor.close()
         conn.close()
@@ -3131,7 +3774,7 @@ def tour_progress(user_id):
         return jsonify({"success": True, "seen": (row or {}).get('has_seen_tour') or {}})
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        return _server_error('tour_progress', e)
     finally:
         cursor.close()
         conn.close()
@@ -3160,7 +3803,10 @@ def health_check():
             cur.close()
             status["checks"]["database"] = "ok"
         except Exception as e:
-            status["checks"]["database"] = f"error: {e}"
+            # Public endpoint: the exception text can carry the DB host. Log it,
+            # expose only its type.
+            print(f"[health] database check failed: {e}", flush=True)
+            status["checks"]["database"] = f"error: {type(e).__name__}"
             status["status"] = "degraded"
             code = 503
         finally:
@@ -3181,7 +3827,79 @@ def health_check():
     else:
         status["checks"]["scraper_last_cycle"] = "not yet recorded"
 
+    # Deploy facts, so "is the new code live and actually scanning?" can be
+    # answered from outside (tools/launch_check.py) — the free tier has no
+    # shell. Informational only: none of this changes the status code, which
+    # Render's health check and UptimeRobot key on.
+    try:
+        status["version"] = (boot_check.version_info() if boot_check is not None
+                             else {"commit": None})
+        status["version"]["server"] = ((request.environ.get('SERVER_SOFTWARE') or '')
+                                       .split('/')[0].lower() or 'unknown')
+        thread = _scraper_thread
+        status["checks"]["scraper_thread"] = ('running' if thread is not None and thread.is_alive()
+                                              else 'dead' if thread is not None
+                                              else 'not started')
+        status["checks"]["gunicorn_preload"] = bool(_UNDER_GUNICORN and os.getpid() != _IMPORT_PID)
+        if boot_check is not None:
+            status["checks"].update(boot_check.health_summary())
+        # Only with a working database: the token lives there, and a DB that is
+        # down must not also make the health check slow (Render times it out).
+        if status["checks"].get("database") == "ok":
+            status["checks"]["mercari_token"] = _cached_mercari_token_health()
+    except Exception as e:
+        status["checks"]["version_error"] = type(e).__name__
+
     return jsonify(status), code
+
+
+_MERCARI_HEALTH_TTL_SEC = 300
+_mercari_health_cache = {'at': 0.0, 'value': None}
+
+
+def _cached_mercari_token_health():
+    """
+    Mercari token state for /health, read at most every 5 minutes.
+
+    /health is hit by Render every few seconds; the token changes every few
+    days. Exposing it lets an uptime monitor alert on "expired" — the failure
+    that went unnoticed for weeks in October.
+    """
+    now = time.time()
+    if (_mercari_health_cache['value'] is not None
+            and now - _mercari_health_cache['at'] < _MERCARI_HEALTH_TTL_SEC):
+        return _mercari_health_cache['value']
+    try:
+        from scraper_multi_user import _mercari_token_state
+        state, exp = _mercari_token_state()
+        value = {"state": state}
+        if exp:
+            value["expires_at"] = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(timespec='minutes')
+            value["hours_left"] = round((exp - now) / 3600.0, 1)
+    except Exception as e:
+        value = {"state": "unknown", "error": type(e).__name__}
+    _mercari_health_cache.update(at=now, value=value)
+    return value
+
+
+def _main_scraper_decision():
+    """
+    What `python app.py` does about the scrape loop: 'disabled', 'explicit-off',
+    'already' or 'start'.
+
+    An explicit ENABLE_SCRAPER_THREAD=0 used to be ignored here, so a local run
+    "with the scraper off" quietly scanned the PRODUCTION database (the local
+    .env points at it) and emailed real users. Unset still means start, because
+    production ran `python app.py` with nothing set until render.yaml moved it
+    to gunicorn — changing that default would silently stop its scanner.
+    """
+    if _env_flag_true('DISABLE_SCRAPER_THREAD'):
+        return 'disabled'
+    if _scraper_thread_started:
+        return 'already'
+    if (os.getenv('ENABLE_SCRAPER_THREAD') or '').strip().lower() in ('0', 'false', 'no', 'off'):
+        return 'explicit-off'
+    return 'start'
 
 
 def _preflight_or_die(port):
@@ -3255,11 +3973,14 @@ if __name__ == '__main__':
     # both processes run the scrape loop, every user gets scraped twice, and
     # each interval is burned twice. That is the ghost-scrape failure again, now
     # split across two services where no in-process guard can detect it.
-    if _env_flag_true('DISABLE_SCRAPER_THREAD'):
+    decision = _main_scraper_decision()
+    if decision == 'disabled':
         print("Scraper thread disabled (DISABLE_SCRAPER_THREAD=1) — API only. "
               "The scrape loop is expected to run in a separate worker service.",
               flush=True)
-    elif _scraper_thread_started:
+    elif decision == 'explicit-off':
+        print("Scraper thread disabled (ENABLE_SCRAPER_THREAD=0) — API only.", flush=True)
+    elif decision == 'already':
         # ensure_scraper_thread_started() already runs at import time and starts
         # the loop when ENABLE_SCRAPER_THREAD=1. Starting another here would give
         # this single process TWO scraper threads competing over the same users.
@@ -3268,7 +3989,8 @@ if __name__ == '__main__':
               "(that flag is for gunicorn; it is not needed with `python app.py`).",
               flush=True)
     else:
-        scraper_thread = threading.Thread(target=start_background_scraper, daemon=True)
-        scraper_thread.start()
+        with _threads_lock:
+            if not _scraper_thread_started:
+                _start_scraper_thread()
 
     app.run(host='0.0.0.0', port=port, debug=False)

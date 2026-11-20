@@ -52,11 +52,19 @@ def _format_batch_email_body(listings, item_template, header_template):
     header = (header_template or '').format(count=n)
     if not header:
         header = f'PixelFlip found {n} new listing{"s" if n != 1 else ""} this scan:\n'
+    # Capped for the same reason the HTML digest is: this is the fallback used
+    # when the template raises, and an uncapped fallback would reintroduce the
+    # 187-listing email precisely when something has already gone wrong.
+    from email_templates import digest_max_items
+    shown = listings[:digest_max_items()]
     blocks = []
-    for i, listing in enumerate(listings, 1):
+    for i, listing in enumerate(shown, 1):
         block = _format_listing_message(item_template, listing).strip()
         blocks.append(f'--- Match {i} of {n} ---\n{block}')
-    return header.rstrip() + '\n\n' + '\n\n'.join(blocks)
+    body = header.rstrip() + '\n\n' + '\n\n'.join(blocks)
+    if n > len(shown):
+        body += '\n\n... and %d more in the app.' % (n - len(shown))
+    return body
 
 
 def _format_batch_sms_body(listings, item_template):
@@ -194,7 +202,8 @@ def send_web_push(subscription, title, body, url=None):
         return False, str(e)[:200]
 
 
-def dispatch_scrape_digest_notifications(user_id, listings, prefs, user_email=None, push_sub=None):
+def dispatch_scrape_digest_notifications(user_id, listings, prefs, user_email=None,
+                                         push_sub=None, first_scan=False):
     """
     One email and/or one SMS and/or one Web Push per scrape when new listings were saved.
     `listings` is a non-empty list of listing dicts from the same scan.
@@ -260,7 +269,7 @@ def dispatch_scrape_digest_notifications(user_id, listings, prefs, user_email=No
             try:
                 from email_templates import build_listing_digest_email, build_unsubscribe_url
                 subject_html, html_body, text_body = build_listing_digest_email(
-                    listings, user_id, user_email=to_mail,
+                    listings, user_id, user_email=to_mail, first_scan=first_scan,
                 )
                 ok, err = send_mailgun_email(
                     to_mail, subject_html, text_body,

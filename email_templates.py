@@ -17,7 +17,7 @@ import hashlib
 import hmac
 import ipaddress
 import os
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import urlencode, urlparse
 
 BRAND_PRIMARY = '#764ba2'
 BRAND_SECONDARY = '#667eea'
@@ -164,11 +164,57 @@ def _listing_card(listing):
       </table>'''
 
 
-def build_listing_digest_email(listings, user_id, user_email=None):
-    """Build the new-match digest. Returns (subject, html, text)."""
+def _digest_headline(n, plural, first_scan):
+    if first_scan:
+        return ('PixelFlip - %d match%s on your first scan' % (n, plural))
+    return ('PixelFlip - %d new match%s from your saved searches' % (n, plural))
+
+
+def _digest_subhead(n, plural, shown, first_scan):
+    if first_scan:
+        # Say why it is big AND that it will not repeat. Without the second half
+        # the user has no reason to expect anything different tomorrow.
+        extra = (' - showing the first %d' % len(shown)) if n > len(shown) else ''
+        return ('Your first scan matched %d listing%s%s. From now on you will '
+                'only hear about genuinely new ones.'
+                % (n, '' if n == 1 else 's', extra))
+    if n > len(shown):
+        return '%d new match%s - showing the first %d' % (n, plural, len(shown))
+    return '%d new match%s from your saved searches' % (n, plural)
+
+
+def digest_max_items():
+    """
+    How many listings a single email may show.
+
+    Bryan received ONE email containing 187 listings, six minutes after arming
+    the scanner. The SMS path had capped itself at 8 since it was written; both
+    email paths rendered every match. 187 entries is unreadable whatever caused
+    it, so the cap is on the email itself rather than on first scans alone.
+    """
+    try:
+        return max(1, int(os.getenv('NOTIFY_EMAIL_MAX_ITEMS', '20')))
+    except (TypeError, ValueError):
+        return 20
+
+
+def build_listing_digest_email(listings, user_id, user_email=None, first_scan=False):
+    """
+    Build the new-match digest. Returns (subject, html, text).
+
+    `first_scan` changes the framing, not the content. A first scan legitimately
+    matches everything, because known_links is empty and every listing is new —
+    so the honest thing is to say so. Told nothing, a new user reasonably reads
+    a wall of matches as the scanner malfunctioning, and it is the very first
+    thing a shared account shows a friend.
+    """
     n = len(listings)
     plural = '' if n == 1 else 'es'
-    subject = f'PixelFlip: {n} new match{plural}'
+    cap = digest_max_items()
+    shown = listings[:cap]
+    hidden = max(0, n - len(shown))
+    subject = (f'PixelFlip: {n} match{plural} on your first scan' if first_scan
+               else f'PixelFlip: {n} new match{plural}')
 
     app_url = _app_url()
     unsub_url = build_unsubscribe_url(user_id)
@@ -186,7 +232,13 @@ def build_listing_digest_email(listings, user_id, user_email=None):
         if cheapest else 'Fresh matches from your saved searches.'
     )
 
-    cards = ''.join(_listing_card(l) for l in listings)
+    cards = ''.join(_listing_card(l) for l in shown)
+    if hidden:
+        cards += (
+            '<div style="font-family:%s;font-size:13px;color:#718096;'
+            'text-align:center;padding:4px 0 14px;">'
+            '&hellip; and %d more in the app</div>' % (FONT_STACK, hidden)
+        )
 
     address_block = (
         f'<div style="margin-top:10px;color:#A0AEC0;">{_esc(address)}</div>'
@@ -221,7 +273,7 @@ def build_listing_digest_email(listings, user_id, user_email=None):
                           color:#FFFFFF;letter-spacing:-0.4px;">PixelFlip</div>
               <div style="font-family:{FONT_STACK};font-size:13px;color:rgba(255,255,255,0.88);
                           margin-top:5px;">
-                {n} new match{plural} from your saved searches
+                {_digest_subhead(n, plural, shown, first_scan)}
               </div>
             </td>
           </tr>
@@ -270,8 +322,8 @@ def build_listing_digest_email(listings, user_id, user_email=None):
 </body>
 </html>'''
 
-    lines = [f'PixelFlip — {n} new match{plural} from your saved searches', '']
-    for i, l in enumerate(listings, 1):
+    lines = [_digest_headline(n, plural, first_scan), '']
+    for i, l in enumerate(shown, 1):
         meta = ' · '.join(p for p in (l.get('platform') or '', l.get('location') or '') if p)
         lines += [
             f"{i}. {l.get('title') or ''}",
@@ -279,6 +331,8 @@ def build_listing_digest_email(listings, user_id, user_email=None):
             f"   {l.get('link') or ''}",
             '',
         ]
+    if hidden:
+        lines += [f'... and {hidden} more in the app.', '']
     lines += [
         f'Open your dashboard: {app_url}',
         '',

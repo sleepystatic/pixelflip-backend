@@ -1,0 +1,124 @@
+# =============================================================================
+# PixelFlip backend — Render Blueprint: ONE FREE web service.
+#                                          *** REVIEW BEFORE APPLYING ***
+#
+# One service does everything: the API (gunicorn) and the scraper loop, which
+# runs as a background thread inside the same process. $0/month. Every claim
+# below about Render's behaviour is from Render's docs, checked 2026-11-02.
+#
+#  1. ADOPTS YOUR EXISTING SERVICE. Same name as today, so Render "attempts to
+#     apply the Blueprint's configuration to that existing service" rather than
+#     creating a new one. In the Blueprint preview, confirm it says UPDATE, not
+#     CREATE, before you click Apply. Applying replaces the service's build and
+#     start commands with the ones below (that is the gunicorn move).
+#
+#  2. SECRETS STAY WHERE THEY ARE. Render "preserves existing environment
+#     variables, even if you omit them from the Blueprint file", so the
+#     DATABASE_URL, Stripe, Supabase, Mailgun, proxy, VAPID... values already on
+#     the service are untouched, and none of them appear here. Only the
+#     non-secret switches below are set by this file (and they OVERWRITE any
+#     existing value for the same key on apply).
+#
+#  3. PYTHON is pinned by .python-version (3.12 -> latest 3.12 patch). Render
+#     reads that file (or PYTHON_VERSION); it does not read runtime.txt.
+#
+#  4. FREE-TIER LIMITS that matter here:
+#       - 0.1 CPU / 512MB. Measured: scraping uses ~0.1s CPU per 10-term scan and
+#         a dashboard poll ~0.4ms, so CPU is not the constraint at 10 users.
+#       - 750 instance-hours per WORKSPACE per month. One always-on service uses
+#         720-744. A second free service in the same workspace would run both
+#         out of hours mid-month and Render suspends them until the 1st.
+#       - Render "might restart a Free web service at any time" and spins it
+#         down after 15 min without inbound traffic (UptimeRobot prevents that).
+#       - Render "may suspend a Free web service with an unusually high volume
+#         of service-initiated traffic". A scraper IS service-initiated traffic.
+#         The process-wide pacing keeps the volume flat as users grow, but this
+#         is the free tier's real risk — see the upgrade note at the bottom.
+# =============================================================================
+
+services:
+  - type: web
+    name: pixelflip-backend          # must match the existing service to adopt it
+    runtime: python
+    plan: free                       # omit this and a NEW service defaults to paid
+    branch: main
+    # The full build: Playwright Chromium + patchright for the browser FALLBACKS.
+    # Steady state is browser-free; the fallbacks must exist for when a proxy
+    # exit or the Mercari token goes bad.
+    buildCommand: "bash render-build.sh"
+    # One gunicorn worker = exactly one scraper loop. The thread starts inside
+    # the worker on its first request (Render's health check), never in the
+    # master. 8 threads serve the API concurrently.
+    #
+    # NEVER --preload, and Render ADDS it: every Python service gets a default
+    # GUNICORN_CMD_ARGS="--preload --access-logfile - --bind=0.0.0.0:10000"
+    # (Render docs, default environment variables), and gunicorn applies that
+    # variable even though the flags below never say --preload — a command-line
+    # flag can add preload but cannot switch it off (verified in gunicorn
+    # 23.0.0's load_config). Preload imports the app in the master: on 512MB a
+    # second copy of the whole scraper in memory.
+    #
+    # The `env GUNICORN_CMD_ARGS=...` prefix replaces the variable for this
+    # process no matter how Render ranks its defaults against service env vars
+    # (its docs do not say). The envVars entry below is the fallback if this
+    # command is ever edited. /health reports "gunicorn_preload" and the boot log
+    # prints GUNICORN_CMD_ARGS, so a wrong value is visible either way.
+    startCommand: "env GUNICORN_CMD_ARGS=--log-level=info gunicorn -w 1 --threads 8 -k gthread --timeout 120 -b 0.0.0.0:$PORT app:app"
+    healthCheckPath: /health
+    envVars:
+      # Fallback for the start-command prefix above (see the comment there).
+      - key: GUNICORN_CMD_ARGS
+        value: "--log-level=info"
+      # The scraper runs in THIS process. Under gunicorn only ENABLE matters
+      # (DISABLE_SCRAPER_THREAD is read by `python app.py` alone).
+      - key: ENABLE_SCRAPER_THREAD
+        value: "1"
+      - key: ENABLE_CLEANUP_THREAD
+        value: "1"
+      # render-build.sh installs browsers here; the runtime must look in the same
+      # place or it searches where the build never wrote.
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "/opt/render/project/src/.playwright"
+      # This box cannot mint a Mercari token (capture peaks ~1GB); the GitHub
+      # Action does it.
+      - key: MERCARI_ALLOW_CAPTURE
+        value: "0"
+      # Load-bearing for capacity: it is what keeps the browser fallback ~206MB.
+      - key: FB_LEAN_FETCH
+        value: "1"
+      # At most one live browser process-wide, so a fallback can never OOM the
+      # API on 512MB. memory_capped_workers() budgets exactly this many.
+      - key: BROWSER_MAX_CONCURRENT
+        value: "1"
+      # Concurrent scrapes. Sized by the multi-user load test (tests/README,
+      # 2026-11-02): with continuous dispatch, 10 users (5 Pro + 5 Basic) at 2
+      # workers ran priority terms a median 6s late (p95 46s). It is also what
+      # 512MB holds: (512 - 200 reserve - 1 x 206 browser) / 40MB = 2.
+      - key: SCRAPE_MAX_WORKERS
+        value: "2"
+      # How many accounts may have their scanner ON at once (app.py,
+      # _max_active_users). START answers "at capacity" past it, and checkout
+      # pauses for NEW subscribers so nobody pays for a spot they cannot use.
+      # Raise it here or in the dashboard's Environment tab; 0 = no cap.
+      - key: MAX_ACTIVE_USERS
+        value: "10"
+      # Puts the per-platform memory readings in the Live Console during the
+      # measurement window; they replace the 40MB/scrape estimate. Remove after.
+      - key: LOG_MEMORY_ALWAYS
+        value: "1"
+      # --- Post-measurement tuning (hold until you have the Scan timing: lines):
+      #       DESCRIPTION_SCAN_ENABLED=1
+      #       SCRAPE_COALESCE_WINDOW_SEC
+      #       SEARCH_CACHE_ENABLED=1   (shared scanning — switch on before ~30 users)
+      # --- Set from the BUILD LOG (render-build.sh prints which):
+      #       MERCARI_CHROME_PATH=<path>   or   MERCARI_BUNDLED_CHROMIUM=1
+
+# =============================================================================
+# WHEN TO PAY, AND FOR WHAT
+# -----------------------------------------------------------------------------
+# The paid web/worker split buys ISOLATION (a scrape crash cannot take the
+# dashboard down), not capacity. Do it once paying customers would notice an
+# outage. The first paid step that actually removes a limit is changing `plan`
+# above from `free` to `0.5c-512mb` (Render's starter instance): 5x the CPU, no
+# spin-down, and out of the free tier's suspension policy for outbound traffic.
+# =============================================================================
