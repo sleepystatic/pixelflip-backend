@@ -25,7 +25,7 @@ is not a test you can run.
 | `smoke_pro_gate.py` | description scanning is Pro-only at **both** gates (API/save and scrape time); title and description are separate haystacks; both inside one scrape |
 | `smoke_fb_description.py` | Facebook `redacted_description` extraction, id pinning, two-pass include/exclude, zero fetches when it cannot change the outcome |
 | `smoke_cl_description.py` | Craigslist `#postingbody`, boilerplate stripping, non-mutating soup copy, warning when `CRAIGSLIST_FETCH_DETAIL=0` |
-| `smoke_ou_description.py` | OfferUp date+body from **one** fetch, identity scoping, legacy posted-date path unchanged |
+| `smoke_ou_description.py` | OfferUp descriptions via its listing-details API (since 2026-11-23, over a fake session): OfferUp's own operation trimmed to id/description/postDate (nothing about the seller), direct connection, paced with the search, cached so a listing is looked up once; 403 drops the session and opens a breaker of its own; a reply about another listing fails closed; blank body = answered; end to end: body-only include, distance checked before any lookup, zero lookups without keywords, the real post date feeds the age filter, refused = red line, switched off = info line, past the per-scan lookup cap a listing waits for the next scan rather than being decided on its title. The walled item-page fallback runs only if `ou_item_*.html` fixtures exist |
 | `smoke_mc_description.py` | Mercari `ItemDetail:<id>` extraction, JSON-LD fallback, `og:description` rejected, fail-closed on redirect |
 | `smoke_mc_proxy_route.py` | Mercari item pages probe direct once per scrape, reuse the probe, honour `MERCARI_ITEM_PROXY` |
 | `smoke_multiuser.py` | browser-free memory budget (`memory_capped_workers`), two concurrent users isolated, one failing user cannot take the other down |
@@ -42,6 +42,14 @@ is not a test you can run.
 | `smoke_account_security.py` | password change verifies the CURRENT password (5 misses → 429); email change: 60s resend throttle, 3 wrong codes kill the code and lock, the OLD address is notified; reset endpoints never echo exception text; `/api/status` per-user and reset-mailer per-IP rate limits; no 5xx anywhere echoes `str(e)` |
 | `smoke_boot.py` | `python app.py` honours `ENABLE_SCRAPER_THREAD=0`; under gunicorn the threads start on the first request in the serving process (Render injects `--preload`); `/health` version/server/thread/preload/billing/warnings/Mercari fields; boot report never prints a secret; `verify_stripe` reports bad ids instead of crashing |
 | `smoke_launch_check.py` | `tools/launch_check.py` offline: nslookup TXT parsing, two-SPF-records = FAIL, DMARC, relative logo on a NESTED page = FAIL, old-code `/health` = FAIL, test Stripe key / dead thread / expired Mercari token = FAIL |
+| `smoke_trial.py` | 3-day free trial: normalisers (Gmail aliases, IPv6 /64, address formats), no trial offered for a used account / former customer / seen email, IP or device; after checkout a reused card or billing address, a prepaid card or no card ends the trial; webhook + return trip settle once; unverifiable trial = webhook 500; paid checkouts never blocked and remembered; no second subscription; cancel keeps is_pro |
+| `smoke_includes.py` | include keywords: word boundaries ('blue' is not Bluetooth), OR semantics, empty = no filter, exclusions outrank includes, per-term scoping, separate title/description haystacks, the two-pass check_includes=False flow |
+| `smoke_coalesce.py` | coalescing window config, the sweep and its exact bound, countdown to held terms, floors inside the sweep, /api/status uses the scheduler's window |
+| `smoke_term_intervals.py` | scraper-side per-term clamp (forged 5 on Basic scans at 10, slower choice wins), app/scraper/dashboard tables equal, /api/status countdown clamps the same way |
+| `smoke_app_intervals.py` | settings save: per-tier menus, off-menu values fall back, the 3-term cap, terms already at 5 outrank newly raised ones, old `priority` clients |
+| `smoke_ctx_persist.py` | Mercari token store (in memory, never the real DB): JWT exp is the gate, renew margin (incl. the workflow's 4.5 days), age cap only when exp is unreadable, structural validation, state for the console |
+| `smoke_mercari_capture.py` | capture_mercari_token.py exit codes (the GitHub Action's), and per scrape: replay first, MERCARI_ALLOW_CAPTURE=0 never launches Chrome, cooldown not re-armed, bundled-Chromium retry, cooldown armed on double failure |
+| `smoke_stop_and_wall.py` | through the real scan function: STOP sends no digest for what was already found (a quick Stop+Start still alerts), marketplaces skipped by a STOP are an info line not a red "NOT scanned"; OfferUp item pages are never requested by default and the breaker stops after two refusals when they are enabled |
 
 ## Multi-user load test (manual — not part of `run_all`)
 
@@ -58,6 +66,19 @@ standard term ran, worker utilisation, duplicate alerts, and the request rate
 each marketplace saw. Takes a few real minutes; set `SEARCH_CACHE_ENABLED=1` in
 the environment to measure shared scanning.
 
+## Start/stop chaos test (manual — not part of `run_all`)
+
+```bash
+.venv\Scripts\python.exe tests\loadtest_startstop.py            # 6 users, 2 workers
+.venv\Scripts\python.exe tests\loadtest_startstop.py --seed 7 --users 8
+```
+
+The REAL scheduler, lease and abort paths with a mutable armed state: a chaos thread stops users
+mid-scan, flips random users and does rapid Stop+Start, then leaves everyone on. Checks: never two
+scans of one user at once, no marketplace work for a user who was off the whole time, no alert
+digest while a scanner is off, everyone scanned again after re-arming, no duplicate alerts, every
+lease released, no completion stamp for a stopped scan, no unfaked SQL or errors. ~2 real minutes.
+
 ## Exit codes
 
 `0` pass, `1` fail, `3` skipped for a missing fixture. `run_all.py` treats a
@@ -68,7 +89,10 @@ that fails. For the same reason, a suite that exits `0` without printing its
 ## Fixtures
 
 `tests/fixtures/*.html` are real pages captured from live marketplaces. Suites
-parse them offline and deterministically.
+parse them offline and deterministically. `offerup_listing_graphql.json` is the
+exception: it has the exact shape of OfferUp's reply to the trimmed listing
+lookup (observed 2026-11-23), with synthetic text, because the real reply is a
+stranger's listing.
 
 Refresh only when a platform changes its markup and a suite fails for real:
 

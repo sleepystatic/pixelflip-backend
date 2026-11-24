@@ -34,6 +34,14 @@ def bootstrap():
     """
     os.environ.setdefault('ENABLE_SCRAPER_THREAD', '0')
     os.environ['ENABLE_CLEANUP_THREAD'] = '0'
+    # Never run migrations from a test. The local .env points at PRODUCTION, and
+    # smoke_scrape_lease uses the real database: on 2026-11-20 the ensure chain
+    # applied migration 018 there before the code that uses it had shipped.
+    os.environ['SCHEMA_ENSURE'] = '0'
+    # Never ask OfferUp for a listing's details from a test. Since 2026-11-23 an
+    # OfferUp scan with description keywords looks listings up LIVE; the suites
+    # that test the lookup switch it back on over a fake session.
+    os.environ['OFFERUP_LISTING_API'] = '0'
     os.chdir(REPO)
     try:
         from dotenv import load_dotenv

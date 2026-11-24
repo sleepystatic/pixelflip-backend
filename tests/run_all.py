@@ -44,6 +44,14 @@ SUITES = [
     'smoke_account_security.py',
     'smoke_boot.py',
     'smoke_launch_check.py',
+    'smoke_trial.py',
+    'smoke_includes.py',
+    'smoke_coalesce.py',
+    'smoke_term_intervals.py',
+    'smoke_app_intervals.py',
+    'smoke_ctx_persist.py',
+    'smoke_mercari_capture.py',
+    'smoke_stop_and_wall.py',
 ]
 
 

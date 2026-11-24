@@ -340,6 +340,12 @@ def get_db_connection():
             time.sleep(wait)
     if conn is None:
         raise last_err if last_err else Exception('Database connection failed')
+    from db_schema import schema_ensure_enabled
+    if not schema_ensure_enabled():
+        # SCHEMA_ENSURE=0 (the test harness sets it): never apply migrations from
+        # a test run. smoke_scrape_lease uses the REAL database, and on 2026-11-20
+        # this chain applied migration 018 to production days before it shipped.
+        return conn
     try:
         from db_schema import (ensure_buyer_delivery_columns, ensure_listing_uniqueness_per_user,
                                ensure_priority_term_columns, ensure_term_interval_column,
@@ -382,6 +388,11 @@ def get_db_connection():
         # scraper's own connection must guarantee the table — same reason as the
         # rest of this chain.
         ensure_alerted_listings_table(conn)
+        # Migration 018 adds user_settings columns. The scraper never reads them,
+        # but the rule for user_settings columns is "ensure in BOTH chains": the
+        # scraper thread can reach the database before app.py's chain has run.
+        from db_schema import ensure_trial_tracking
+        ensure_trial_tracking(conn)
     except Exception as schema_err:
         print(f"Schema ensure (buyer prefs) warning: {schema_err}", flush=True)
     return conn
@@ -4716,9 +4727,244 @@ def _parse_offerup_last_updated_ago(text):
     return datetime.now(timezone.utc) - delta
 
 
+# OfferUp item pages sit behind a Cloudflare JS challenge (403 to curl_cffi since
+# ~2026-10). OfferUp's antibot is RATE-based and process-wide, so asking for a
+# walled item page once per new listing — which description scanning does — is
+# a stream of refusals that counts against the same budget the SEARCH needs.
+# After OFFERUP_ITEM_WALL_FAILS refusals in a row, stop asking for
+# OFFERUP_ITEM_WALL_COOLDOWN_SEC (6h); one success closes it again. While open,
+# listings fall back to title-only (the console already says so).
+#
+# The listing-details API (_offerup_listing_via_graphql) has its own breaker of
+# the same shape: it is a different gate, and one shutting must not switch the
+# other off. Its cooldown is shorter (1h) because it is the route that normally
+# works — a retry costs one small request.
+_OU_ITEM_WALL = {'fails': 0, 'until': 0.0, 'what': 'item pages',
+                 'cool_env': 'OFFERUP_ITEM_WALL_COOLDOWN_SEC', 'cool_def': 21600}
+_OU_LISTING_WALL = {'fails': 0, 'until': 0.0, 'what': 'listing-detail lookups',
+                    'cool_env': 'OFFERUP_LISTING_WALL_COOLDOWN_SEC', 'cool_def': 3600}
+_OU_ITEM_WALL_LOCK = threading.Lock()
+
+
+def offerup_item_pages_enabled():
+    """
+    OFF by default (2026-11-23). The item pages have been walled since ~2026-10,
+    and a live 5-user probe showed that even two refused item pages left the
+    browser-free SEARCH answering 403 for the rest of the run, sending every
+    OfferUp term to the slow browser fallback (38-40s per Pro scan). So nothing
+    asks for them unless OFFERUP_ITEM_PAGES=1 — e.g. to test whether OfferUp has
+    lifted the wall — and the breaker below still guards that.
+    """
+    return _env_flag('OFFERUP_ITEM_PAGES', False)
+
+
+def _ou_item_wall_open(wall=None):
+    wall = _OU_ITEM_WALL if wall is None else wall
+    with _OU_ITEM_WALL_LOCK:
+        return time.time() < wall['until']
+
+
+def _ou_item_wall_record(ok, why='', wall=None):
+    wall = _OU_ITEM_WALL if wall is None else wall
+    with _OU_ITEM_WALL_LOCK:
+        if ok:
+            wall.update(fails=0, until=0.0)
+            return
+        wall['fails'] += 1
+        cool_def = wall.get('cool_def', 21600)
+        try:
+            limit = max(1, int(os.getenv('OFFERUP_ITEM_WALL_FAILS', '2')))
+            cool = max(60, int(os.getenv(wall.get('cool_env', 'OFFERUP_ITEM_WALL_COOLDOWN_SEC'),
+                                         str(cool_def))))
+        except ValueError:
+            limit, cool = 2, cool_def
+        if wall['fails'] >= limit and time.time() >= wall['until']:
+            wall['until'] = time.time() + cool
+            print('[offerup] %s refused %d times in a row (%s) - not requesting '
+                  'them again for %s; descriptions fall back to titles'
+                  % (wall.get('what', 'item pages'), wall['fails'], why,
+                     '%dh' % (cool // 3600) if cool >= 3600 else '%dmin' % (cool // 60)),
+                  flush=True)
+
+
+# ---------------------------------------------------------------------------
+# OfferUp listing details over OfferUp's own GraphQL API (2026-11-23).
+#
+# offerup.com's logged-out web client asks /api/graphql for a listing with the
+# operation GetListingDetailByListingId when a visitor clicks a search result.
+# Observed in a real browser on 2026-11-23: HTTP 200, JSON, `description` and
+# `postDate` under data.listing, no challenge, no login. The item PAGE is
+# Cloudflare-walled; this is the request the site itself makes instead, on the
+# same endpoint and browser-free session as the search (_offerup_curl_session).
+#
+# We send that operation trimmed to the three fields we read. OfferUp's own
+# document also asks for the seller's profile, photos and location; we have no
+# use for a seller's name, and the trimmed reply is a few hundred bytes instead
+# of ~8KB (an item page was ~236KB).
+#
+# NOT YET SEEN FROM RENDER: on 2026-11-23 Bryan's home IP was refused by
+# OfferUp's security for the search AND this lookup alike (an "Access blocked"
+# page), so the browser-free request itself was only proven on the search path.
+# The breaker above keeps an unverified route cheap: two refusals in a row and
+# it stops asking for an hour.
+# ---------------------------------------------------------------------------
+_OU_LISTING_QUERY = (
+    'query GetListingDetailByListingId($listingId: ID!) {\n'
+    '  listing(listingId: $listingId) {\n'
+    '    listingId\n'
+    '    description\n'
+    '    postDate\n'
+    '  }\n'
+    '}'
+)
+
+# listingId -> (stored_at, postDate_raw, description). The same listing is
+# looked up again and again: by every user tracking that term nearby, and by
+# the same user on EVERY scan when its body is what filtered it out — a dropped
+# listing is never saved, so known_links cannot skip it, and without this one
+# rejected listing would cost a request every few minutes for as long as it
+# stayed up. Only answers about the listing asked for are stored, never a
+# refusal (the search cache's rule: a cached failure spreads to everyone).
+_OU_DETAIL_CACHE = {}
+_OU_DETAIL_LOCK = threading.Lock()
+_OU_DETAIL_CACHE_MAX = 4000
+
+
+def offerup_listing_api_enabled():
+    """ON by default. OFFERUP_LISTING_API=0 stops every description lookup."""
+    return _env_flag('OFFERUP_LISTING_API', True)
+
+
+def _ou_detail_cache_get(listing_id):
+    """(postDate_raw, description) or None."""
+    try:
+        ttl = float(os.getenv('OFFERUP_DETAIL_CACHE_TTL_SEC', '21600'))
+    except ValueError:
+        ttl = 21600.0
+    with _OU_DETAIL_LOCK:
+        hit = _OU_DETAIL_CACHE.get(listing_id)
+        if not hit:
+            return None
+        if time.time() - hit[0] > ttl:
+            del _OU_DETAIL_CACHE[listing_id]
+            return None
+        return hit[1], hit[2]
+
+
+def _ou_detail_cache_put(listing_id, post_raw, description):
+    with _OU_DETAIL_LOCK:
+        _OU_DETAIL_CACHE[listing_id] = (time.time(), post_raw, description)
+        if len(_OU_DETAIL_CACHE) > _OU_DETAIL_CACHE_MAX:
+            # Oldest first, down to 90% so this is not a sort on every put.
+            excess = len(_OU_DETAIL_CACHE) - int(_OU_DETAIL_CACHE_MAX * 0.9)
+            for k in sorted(_OU_DETAIL_CACHE, key=lambda k2: _OU_DETAIL_CACHE[k2][0])[:excess]:
+                del _OU_DETAIL_CACHE[k]
+
+
+def _offerup_listing_via_graphql(listing_id):
+    """
+    (answered, postDate_raw, description) for one OfferUp listing.
+
+    answered=False means no usable answer — switched off, breaker open, refused,
+    malformed, or an answer about some OTHER listing (fails closed: a stranger's
+    text must never filter this listing). answered=True with description '' or
+    None means OfferUp answered and the seller wrote nothing.
+    """
+    if not listing_id or not offerup_listing_api_enabled():
+        return False, None, None
+    hit = _ou_detail_cache_get(listing_id)
+    if hit is not None:
+        return True, hit[0], hit[1]
+    if _ou_item_wall_open(_OU_LISTING_WALL):
+        return False, None, None
+    try:
+        from curl_cffi import requests as cffi
+    except ImportError:
+        return False, None, None
+
+    # The search's connection: direct unless OFFERUP_GRAPHQL_NO_PROXY=0, since a
+    # TLS-terminating proxy breaks this API (see scrape_offerup_for_user).
+    proxies = None
+    if not _env_flag('OFFERUP_GRAPHQL_NO_PROXY', True):
+        px = _get_proxy('offerup')
+        if px:
+            n = _normalize_proxy(px)
+            proxies = {'http': n, 'https': n}
+    impersonate = (os.getenv('OFFERUP_TLS_IMPERSONATE') or 'chrome').strip()
+    try:
+        timeout = int(os.getenv('OFFERUP_HTTP_TIMEOUT_SEC', '30'))
+    except ValueError:
+        timeout = 30
+    body = {'operationName': 'GetListingDetailByListingId',
+            'variables': {'listingId': listing_id}, 'query': _OU_LISTING_QUERY}
+
+    # Paced WITH the search, on the same process-wide lock and gap: OfferUp's
+    # antibot counts requests, not request types, so a lookup takes its turn
+    # instead of adding to the rate. The cache is re-checked once the lock is
+    # held, so users queued behind each other for one listing pay for it once.
+    with _paced('offerup', cached=lambda: _ou_detail_cache_get(listing_id)) as slot:
+        if slot['hit'] is not None:
+            return True, slot['hit'][0], slot['hit'][1]
+        try:
+            s, _ = _offerup_curl_session(cffi, impersonate, proxies, timeout)
+            r = s.post('https://offerup.com/api/graphql', json=body, proxies=proxies,
+                       timeout=timeout,
+                       headers={'content-type': 'application/json', 'accept': '*/*',
+                                'origin': 'https://offerup.com', 'referer': 'https://offerup.com/'})
+            _record_bytes('offerup', len(r.content or b''))
+        except Exception as e:
+            _offerup_drop_curl_session()
+            _ou_item_wall_record(False, type(e).__name__, wall=_OU_LISTING_WALL)
+            return False, None, None
+
+    if r.status_code != 200:
+        # As on the search: a refused session is likely flagged, so the next
+        # request (search or lookup) re-warms from scratch.
+        _offerup_drop_curl_session()
+        _ou_item_wall_record(False, 'HTTP %s' % r.status_code, wall=_OU_LISTING_WALL)
+        return False, None, None
+    try:
+        payload = json.loads(r.text or '{}')
+        listing = (payload.get('data') or {}).get('listing')
+    except Exception:
+        _ou_item_wall_record(False, 'unparseable reply', wall=_OU_LISTING_WALL)
+        return False, None, None
+    if not isinstance(listing, dict) or str(listing.get('listingId') or '') != str(listing_id):
+        # Includes a schema change (GraphQL errors, data.listing null): it would
+        # fail identically for every listing, so it trips the breaker too.
+        why = 'no listing in reply'
+        if payload.get('errors'):
+            why = 'graphql errors: ' + json.dumps(payload['errors'])[:120]
+        _ou_item_wall_record(False, why, wall=_OU_LISTING_WALL)
+        return False, None, None
+    _ou_item_wall_record(True, wall=_OU_LISTING_WALL)
+    desc = listing.get('description')
+    desc = desc.strip() if isinstance(desc, str) else ''
+    post_raw = listing.get('postDate') if isinstance(listing.get('postDate'), str) else None
+    _ou_detail_cache_put(listing_id, post_raw, desc)
+    return True, post_raw, desc
+
+
+def _parse_ou_post_date(raw):
+    """OfferUp's ISO postDate -> aware datetime, or None."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def _offerup_item_details(link, polite_delay_sec, want_posted=False, want_description=False):
     """
     The post date AND/OR the body text for one OfferUp listing, from ONE fetch.
+
+    SINCE 2026-11-23 THAT FETCH IS OFFERUP'S LISTING-DETAILS API (a few hundred
+    bytes; see _offerup_listing_via_graphql), and the item page described below
+    is only a fallback that stays off unless OFFERUP_ITEM_PAGES=1. On the API
+    path the date is returned whenever OfferUp sends one, and a seller's blank
+    body is '' rather than None.
 
     Returns (listed_at, description); either may be None. It used to return only
     the date and throw the parsed payload away, which meant description scanning
@@ -4761,12 +5007,25 @@ def _offerup_item_details(link, polite_delay_sec, want_posted=False, want_descri
         return None, None
     if not link or '/item/' not in link:
         return None, None
+    item_id = link.rstrip('/').rsplit('/', 1)[-1]
+
+    # First choice since 2026-11-23: the listing-details API, i.e. the request
+    # OfferUp's own page makes (see _offerup_listing_via_graphql). The post date
+    # rides along at no extra cost, so it is returned whenever OfferUp sends one.
+    # A blank body comes back as '' (the seller wrote nothing), distinct from
+    # None (no answer), so a scan can tell "empty" from "unavailable".
+    answered, post_raw, body = _offerup_listing_via_graphql(item_id)
+    if answered:
+        return _parse_ou_post_date(post_raw), ((body or '') if want_description else None)
+
+    # The item page, only when explicitly re-enabled (walled since ~2026-10).
+    if not offerup_item_pages_enabled() or _ou_item_wall_open():
+        return None, None
     try:
         from curl_cffi import requests as cffi
     except ImportError:
         return None, None
 
-    item_id = link.rstrip('/').rsplit('/', 1)[-1]
     proxies = None
     px = _get_proxy('offerup')
     if px:
@@ -4783,10 +5042,13 @@ def _offerup_item_details(link, polite_delay_sec, want_posted=False, want_descri
         _record_bytes('offerup', len(r.content or b''))
         time.sleep(max(0.0, polite_delay_sec))
         if r.status_code != 200:
+            _ou_item_wall_record(False, 'HTTP %s' % r.status_code)
             return None, None
         m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
         if not m:
+            _ou_item_wall_record(False, 'challenge page (no __NEXT_DATA__)')
             return None, None
+        _ou_item_wall_record(True)
         data = json.loads(m.group(1))
     except Exception:
         return None, None
@@ -7217,6 +7479,12 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
     desc_fetched = 0
     desc_missing = 0
     skipped_desc = 0
+    deferred_desc = 0
+    ou_lookups = 0
+    try:
+        ou_lookup_cap = max(0, int(os.getenv('OFFERUP_DESC_LOOKUPS_PER_SCAN', '10')))
+    except ValueError:
+        ou_lookup_cap = 10
     if not user_coords and log_callback:
         log_callback(
             user_id,
@@ -7460,52 +7728,12 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                         term_exclusions=(search_terms.get(matched_term) or {}).get('exclusions')):
                             continue
 
-                        # The feed carries no date (ModularFeedListing has no such
-                        # field), so the item page is the only source for both of
-                        # these — and it is ONE page. Deliberately after Vision:
-                        # ~1.3s of image check is cheaper than a ~236KB fetch, so
-                        # running it first shrinks how many pages get bought.
-                        listed_at = item.get('listed_at')
-                        description = None
-                        want_posted = (listed_at is None
-                                       and _env_flag('OFFERUP_FETCH_ITEM_POSTED', False))
-                        if want_posted or want_desc:
-                            fetched_at, description = _offerup_item_details(
-                                link, offerup_detail_delay,
-                                want_posted=want_posted, want_description=want_desc)
-                            if want_posted:
-                                listed_at = fetched_at
-                            if want_desc:
-                                if description:
-                                    desc_fetched += 1
-                                else:
-                                    # Blocked, removed, or a seller who wrote
-                                    # nothing. Filtering falls back to title-only
-                                    # for this listing rather than dropping it.
-                                    desc_missing += 1
-                        if listed_at is None:
-                            # OfferUp's search API carries no post date, and the
-                            # item page that does (postDate) is Cloudflare-walled —
-                            # unreachable without a browser. So there is no true
-                            # posted time to read browser-free. Stamp FIRST-SEEN so
-                            # every OfferUp row still has a date element and the age
-                            # filter and dashboard have something to show. It is the
-                            # time we first scraped the listing, not when it was
-                            # posted, and is labelled that way downstream.
-                            listed_at = datetime.now(timezone.utc)
-                        listed_for_age = listed_at.isoformat() if isinstance(listed_at, datetime) else listed_at
-                        if listed_for_age and not _is_recent_timestamp(listed_for_age, max_age_days):
-                            continue
-
-                        # Pass 2, now that the body is in hand.
-                        if want_desc and is_excluded(title, price, exclusions, search_terms,
-                                                     matched_term, description=description):
-                            skipped_desc += 1
-                            continue
-
                         # OfferUp ignores its own radius param (5 vs 200 returns
                         # identical results), so the distance slider is applied
-                        # here. Unknown cities are kept, as on Facebook.
+                        # here. Unknown cities are kept, as on Facebook. It runs
+                        # BEFORE the detail lookup below so a listing that is too
+                        # far away never costs one (since 2026-11-23; it used to
+                        # run after).
                         city = item.get('city')
                         distance_mi = None
                         if city and user_coords and search_radius:
@@ -7516,6 +7744,71 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                                 if distance_mi > float(search_radius):
                                     skipped_far += 1
                                     continue
+
+                        # The feed carries no date (ModularFeedListing has no such
+                        # field), so the listing's details are the only source
+                        # for both of these — and they are ONE request.
+                        # Deliberately after Vision and distance: each lookup
+                        # takes a turn in OfferUp's process-wide pacing.
+                        listed_at = item.get('listed_at')
+                        description = None
+                        want_posted = (listed_at is None
+                                       and _env_flag('OFFERUP_FETCH_ITEM_POSTED', False))
+                        if want_posted or want_desc:
+                            # At most ou_lookup_cap LIVE lookups per scan. Each
+                            # one holds OfferUp's process-wide lane for ~3s, so a
+                            # new user's first scan (dozens of candidates) would
+                            # otherwise stall every other user's OfferUp search
+                            # for minutes. Past the cap the listing WAITS: it is
+                            # not saved, so the next scan meets it again and
+                            # looks it up then — no listing is ever decided
+                            # without its body. Cache hits are free and never
+                            # count; nor does anything when no lookup would be
+                            # made (switched off / breaker open).
+                            _lid = link.rstrip('/').rsplit('/', 1)[-1]
+                            _live = (offerup_listing_api_enabled()
+                                     and not _ou_item_wall_open(_OU_LISTING_WALL)
+                                     and _ou_detail_cache_get(_lid) is None)
+                            if _live:
+                                if ou_lookup_cap and ou_lookups >= ou_lookup_cap:
+                                    deferred_desc += 1
+                                    continue
+                                ou_lookups += 1
+                            fetched_at, description = _offerup_item_details(
+                                link, offerup_detail_delay,
+                                want_posted=want_posted, want_description=want_desc)
+                            if listed_at is None and fetched_at is not None:
+                                # The real posting time came with the lookup at no
+                                # extra cost — better than the first-seen stamp.
+                                listed_at = fetched_at
+                            if want_desc:
+                                if description is not None:
+                                    # Read — even when the seller wrote nothing
+                                    # (''), which is not "unavailable".
+                                    desc_fetched += 1
+                                else:
+                                    # No answer (refused, breaker open, or
+                                    # switched off). Filtering falls back to
+                                    # title-only for this listing rather than
+                                    # dropping it.
+                                    desc_missing += 1
+                        if listed_at is None:
+                            # OfferUp's search API carries no post date; only a
+                            # detail lookup does, and most listings never need
+                            # one. Stamp FIRST-SEEN so every OfferUp row still has
+                            # a date element and the age filter and dashboard have
+                            # something to show. It is the time we first scraped
+                            # the listing, not when it was posted.
+                            listed_at = datetime.now(timezone.utc)
+                        listed_for_age = listed_at.isoformat() if isinstance(listed_at, datetime) else listed_at
+                        if listed_for_age and not _is_recent_timestamp(listed_for_age, max_age_days):
+                            continue
+
+                        # Pass 2, now that the body is in hand.
+                        if want_desc and is_excluded(title, price, exclusions, search_terms,
+                                                     matched_term, description=description):
+                            skipped_desc += 1
+                            continue
 
                         listings.append({
                             'title': title, 'price': price, 'link': link, 'platform': 'OfferUp',
@@ -7542,14 +7835,34 @@ def scrape_offerup_for_user(user_id, zip_code, search_radius, search_terms, excl
                 f"OfferUp unavailable: {e.__class__.__name__}: {detail}.",
                 "error"
             )
-    warn_descriptions_unavailable('OfferUp', desc_fetched, desc_missing,
-                                  log_callback, user_id)
+    if desc_missing and not (offerup_listing_api_enabled() or offerup_item_pages_enabled()):
+        # Both routes switched off on purpose (OFFERUP_LISTING_API=0), so it is
+        # said once per scan in plain words rather than in red as if it broke.
+        # When a route is ON but refusing, the red line below is the right one:
+        # the user must be able to tell their filters fell back to titles.
+        if log_callback:
+            log_callback(user_id,
+                         "OfferUp: description filters use listing titles only (description "
+                         "lookups are switched off). Your other marketplaces check "
+                         "descriptions as usual.", 'info')
+    else:
+        warn_descriptions_unavailable('OfferUp', desc_fetched, desc_missing,
+                                      log_callback, user_id)
+    if deferred_desc and log_callback:
+        log_callback(user_id,
+                     "OfferUp: %d more listing%s need%s a description check — %s on your "
+                     "next scan (OfferUp descriptions are checked %d per scan)."
+                     % (deferred_desc, '' if deferred_desc == 1 else 's',
+                        's' if deferred_desc == 1 else '',
+                        'it will be checked' if deferred_desc == 1 else 'they will be checked',
+                        ou_lookup_cap), 'info')
     if debug and log_callback:
         far_note = f' ({skipped_far} beyond {search_radius} mi)' if skipped_far else ''
         desc_note = ''
-        if desc_fetched or desc_missing or skipped_desc:
+        if desc_fetched or desc_missing or skipped_desc or deferred_desc:
             desc_note = (f' (descriptions: {desc_fetched} read'
                          + (f', {desc_missing} unavailable' if desc_missing else '')
+                         + (f', {deferred_desc} waiting for the next scan' if deferred_desc else '')
                          + (f', {skipped_desc} filtered out on body keywords' if skipped_desc else '')
                          + ')')
         log_callback(user_id,
@@ -7920,8 +8233,10 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         elif log_callback:
             log_callback(user_id, "Facebook Marketplace requires a Pro plan.", "info")
 
+    _stopped_by_user = False
     for label, fn in platform_jobs:
         if not is_user_active(user_id):
+            _stopped_by_user = True
             if log_callback:
                 log_callback(user_id, f"Scrape stopped by user before {label}.", "info")
             break
@@ -7968,16 +8283,29 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
     # was never searched at all. With accounts being shared that ambiguity is the
     # difference between "no deals today" and "it is broken and nobody told me".
     # Enabled platforms that did NOT run are reported in red.
+    # A STOP pressed during the last platform's results is only visible now.
+    if not _stopped_by_user and platform_jobs and not is_user_active(user_id, force=True):
+        _stopped_by_user = True
     if log_callback and platform_jobs:
-        _ran, _failed = [], []
+        _ran, _failed, _skipped = [], [], []
         for _label, _ in platform_jobs:
             _st, _n = _platform_status.get(_label, ('did not run', 0))
-            (_ran if _st == 'ok' else _failed).append(
-                ('%s %d' % (_label, _n)) if _st == 'ok' else ('%s (%s)' % (_label, _st)))
+            if _st == 'ok':
+                _ran.append('%s %d' % (_label, _n))
+            elif _st == 'did not run' and _stopped_by_user:
+                # Skipped because the user pressed STOP — not a failure. This used
+                # to print in red as "NOT scanned", which read like an outage.
+                _skipped.append(_label)
+            else:
+                _failed.append('%s (%s)' % (_label, _st))
         if _ran:
             log_callback(user_id,
                          'Marketplaces scanned: ' + ', '.join(_ran) + ' ' + '—' +
                          ' counts are candidate matches before de-duplication.',
+                         'info')
+        if _skipped:
+            log_callback(user_id,
+                         'Scan stopped by you ' + '—' + ' skipped: ' + ', '.join(_skipped) + '.',
                          'info')
         if _failed:
             log_callback(user_id,
@@ -8015,7 +8343,18 @@ def _scrape_for_user_impl(user_config, log_callback=None, debug=False):
         if debug and log_callback:
             log_callback(user_id, _line, 'info')
 
-    if new_listings:
+    if new_listings and not is_user_active(user_id, force=True):
+        # STOP means stop alerting, too. The chaos test (tests/loadtest_startstop.py,
+        # 2026-11-23) caught digests going out AFTER the user pressed Stop, for
+        # whatever the scan had found before it noticed. Checked live (force=True,
+        # not the 3s cache) right here, so a quick Stop+Start still gets its alerts.
+        # The listings stay saved and in the feed; only the notification is skipped.
+        if log_callback:
+            log_callback(user_id,
+                         f"Scanner stopped " + '—' + f" no alert sent for the {len(new_listings)} "
+                         f"listing{'s' if len(new_listings) != 1 else ''} found before you pressed "
+                         "Stop. They are in your feed.", 'info')
+    elif new_listings:
         # An empty seen_listings means this user has never had a listing saved,
         # so every match here is new by definition rather than by discovery.
         # That is the 187-listing email, and it is worth SAYING rather than

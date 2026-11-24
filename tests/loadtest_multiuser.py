@@ -45,6 +45,7 @@ os.environ.update({
     'ENABLE_SCRAPER_THREAD': '0', 'ENABLE_CLEANUP_THREAD': '0',
     'SCRAPE_MAX_WORKERS': str(args.workers),
     'DESCRIPTION_SCAN_ENABLED': '0', 'MERCARI_ALLOW_CAPTURE': '0',
+    'OFFERUP_LISTING_API': '0',          # replayed traffic only: never a live OfferUp lookup
     'FB_LEAN_FETCH': '1', 'OFFERUP_BROWSERLESS': '1',
     'AI_IMAGE_FILTER_PLATFORMS': '',
 })

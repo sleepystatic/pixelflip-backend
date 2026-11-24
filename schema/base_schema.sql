@@ -1,5 +1,5 @@
 -- PixelFlip base schema: a snapshot of PRODUCTION's public schema (structure only,
--- no rows). Generated 2026-11-13 20:50 UTC by tools/dump_schema.py from PostgreSQL 17.6.
+-- no rows). Generated 2026-11-23 18:00 UTC by tools/dump_schema.py from PostgreSQL 17.6.
 --
 -- USE: create a NEW, EMPTY Supabase project for development, open its SQL editor,
 -- paste this whole file and run it. It is one transaction (all or nothing) and is
@@ -18,6 +18,7 @@ BEGIN;
 CREATE SEQUENCE IF NOT EXISTS public.listings_feedback_id_seq AS bigint START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 9223372036854775807 CACHE 1;
 CREATE SEQUENCE IF NOT EXISTS public.listings_id_seq AS integer START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1;
 CREATE SEQUENCE IF NOT EXISTS public.scrape_logs_id_seq AS bigint START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 9223372036854775807 CACHE 1;
+CREATE SEQUENCE IF NOT EXISTS public.trial_claims_id_seq AS bigint START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 9223372036854775807 CACHE 1;
 CREATE SEQUENCE IF NOT EXISTS public.user_exclusions_id_seq AS integer START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1;
 CREATE SEQUENCE IF NOT EXISTS public.user_includes_id_seq AS integer START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1;
 CREATE SEQUENCE IF NOT EXISTS public.user_search_terms_id_seq AS integer START 1 INCREMENT 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1;
@@ -89,6 +90,20 @@ CREATE TABLE IF NOT EXISTS public.scraper_state (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT scraper_state_pkey PRIMARY KEY (key)
 );
+CREATE TABLE IF NOT EXISTS public.trial_claims (
+    id bigint DEFAULT nextval('public.trial_claims_id_seq'::regclass) NOT NULL,
+    user_id text NOT NULL,
+    subscription_id text,
+    checkout_session text,
+    email_hash text,
+    ip_hash text,
+    device_hash text,
+    card_fingerprint text,
+    address_hash text,
+    outcome text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT trial_claims_pkey PRIMARY KEY (id)
+);
 CREATE TABLE IF NOT EXISTS public.user_exclusions (
     id integer DEFAULT nextval('public.user_exclusions_id_seq'::regclass) NOT NULL,
     user_id text NOT NULL,
@@ -147,6 +162,9 @@ CREATE TABLE IF NOT EXISTS public.user_settings (
     has_seen_tour jsonb DEFAULT '{}'::jsonb NOT NULL,
     scan_description boolean DEFAULT false NOT NULL,
     scrape_claimed_until timestamp with time zone,
+    trial_used_at timestamp with time zone,
+    trial_outcome text,
+    subscription_trial_end bigint,
     CONSTRAINT user_settings_pkey PRIMARY KEY (user_id)
 );
 CREATE TABLE IF NOT EXISTS public.waitlist (
@@ -161,6 +179,7 @@ CREATE TABLE IF NOT EXISTS public.waitlist (
 ALTER SEQUENCE public.listings_feedback_id_seq OWNED BY public.listings_feedback.id;
 ALTER SEQUENCE public.listings_id_seq OWNED BY public.listings.id;
 ALTER SEQUENCE public.scrape_logs_id_seq OWNED BY public.scrape_logs.id;
+ALTER SEQUENCE public.trial_claims_id_seq OWNED BY public.trial_claims.id;
 ALTER SEQUENCE public.user_exclusions_id_seq OWNED BY public.user_exclusions.id;
 ALTER SEQUENCE public.user_includes_id_seq OWNED BY public.user_includes.id;
 ALTER SEQUENCE public.user_search_terms_id_seq OWNED BY public.user_search_terms.id;
@@ -177,6 +196,11 @@ CREATE INDEX IF NOT EXISTS idx_listings_user_fingerprint ON public.listings USIN
 CREATE INDEX IF NOT EXISTS idx_listings_user_id ON public.listings USING btree (user_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_created ON public.scrape_logs USING btree (created_at);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_user_ts ON public.scrape_logs USING btree (user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_address ON public.trial_claims USING btree (address_hash);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_card ON public.trial_claims USING btree (card_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_device ON public.trial_claims USING btree (device_hash);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_email ON public.trial_claims USING btree (email_hash);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_ip ON public.trial_claims USING btree (ip_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_user_exclusions_user_id ON public.user_exclusions USING btree (user_id);
 CREATE INDEX IF NOT EXISTS idx_user_exclusions_user_term ON public.user_exclusions USING btree (user_id, search_term);
 CREATE INDEX IF NOT EXISTS idx_user_includes_user_term ON public.user_includes USING btree (user_id, search_term);
@@ -185,6 +209,7 @@ CREATE INDEX IF NOT EXISTS idx_user_search_terms_user_priority ON public.user_se
 CREATE INDEX IF NOT EXISTS idx_user_settings_push_not_null ON public.user_settings USING btree (push_subscription) WHERE (push_subscription IS NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_user_settings_scrape_claim ON public.user_settings USING btree (scrape_claimed_until);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_user_link_unique ON public.listings_feedback USING btree (user_id, link);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trial_claims_subscription ON public.trial_claims USING btree (subscription_id);
 
 -- Row level security. Every table has it ON, with NO policies: the anon and
 -- authenticated roles (the public Supabase keys) see nothing, while the backend
@@ -196,6 +221,7 @@ ALTER TABLE public.listings_feedback ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.password_reset_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.scrape_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.scraper_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trial_claims ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_exclusions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_includes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_search_terms ENABLE ROW LEVEL SECURITY;

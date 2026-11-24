@@ -22,6 +22,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
+    # Free-trial eligibility + repeat-trial guard. Optional on purpose: if the
+    # file is missing the API still boots, and NO trial is offered (fail closed).
+    import trial_guard
+except Exception as _tge:
+    trial_guard = None
+    print(f"!! trial_guard unavailable ({_tge}) — free trials are OFF. "
+          f"Was trial_guard.py committed?", flush=True)
+
+try:
     # Deploy self-check (version, config presence, live Stripe resolution).
     # Optional on purpose: a missing file must never stop the API booting.
     import boot_check
@@ -532,6 +541,11 @@ def _description_scan_enabled():
     populates `description` yet, so this stays off and the control renders
     locked. Flip DESCRIPTION_SCAN_ENABLED=1 once Facebook, Craigslist, OfferUp
     and Mercari all feed it.
+
+    2026-11-23: all four now can. OfferUp was the last, through its
+    listing-details lookup (_offerup_listing_via_graphql), which is proven
+    against OfferUp's own page but not yet from Render. Switching this on is
+    Bryan's call.
     """
     return _env_flag_true('DESCRIPTION_SCAN_ENABLED')
 
@@ -834,27 +848,9 @@ def _billing_config_response():
         'price_pro_standard': _f('DISPLAY_PRICE_PRO_STANDARD', 19.99),
         'price_basic_prebeta': _f('DISPLAY_PRICE_BASIC_PREBETA', 4.99),
         'price_pro_prebeta': _f('DISPLAY_PRICE_PRO_PREBETA', 9.99),
+        # Free-trial length shown on the plan cards; 0 = no trial offered.
+        'trial_days': trial_guard.TRIAL_DAYS if trial_guard is not None else 0,
     }
-
-
-def _apply_subscription_row(cursor, user_id, is_pro, period_end=None, cancel_at_end=None, customer_id=None, sub_id=None):
-    """Keep is_pro, subscription_status, and Stripe ids in sync."""
-    sets = ["is_pro = %s", "subscription_status = %s"]
-    vals = [is_pro, 'active' if is_pro else 'inactive']
-    if customer_id:
-        sets.append("stripe_customer_id = %s")
-        vals.append(customer_id)
-    if sub_id:
-        sets.append("stripe_subscription_id = %s")
-        vals.append(sub_id)
-    if period_end is not None:
-        sets.append("subscription_current_period_end = %s")
-        vals.append(period_end)
-    if cancel_at_end is not None:
-        sets.append("subscription_cancel_at_period_end = %s")
-        vals.append(cancel_at_end)
-    vals.append(user_id)
-    cursor.execute(f"UPDATE user_settings SET {', '.join(sets)} WHERE user_id = %s", vals)
 
 
 def _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, period_end, cancel_at_end, plan_tier='basic'):
@@ -985,6 +981,9 @@ def get_db_connection():
         # The returned object proxies a real connection; .close() hands it back.
         from db_pool import get_pooled_connection
         conn = get_pooled_connection()
+        from db_schema import schema_ensure_enabled
+        if not schema_ensure_enabled():
+            return conn          # SCHEMA_ENSURE=0: tests never migrate a real database
         try:
             from db_schema import (
                 ensure_buyer_delivery_columns,
@@ -999,6 +998,7 @@ def get_db_connection():
                 ensure_scan_description_column,
                 ensure_scrape_lease_column,
                 ensure_alerted_listings_table,
+                ensure_trial_tracking,
             )
             ensure_buyer_delivery_columns(conn)
             ensure_push_subscription_column(conn)
@@ -1012,6 +1012,7 @@ def get_db_connection():
             ensure_scan_description_column(conn)
             ensure_scrape_lease_column(conn)
             ensure_alerted_listings_table(conn)
+            ensure_trial_tracking(conn)
         except Exception as schema_err:
             print(f"Schema ensure warning: {schema_err}", flush=True)
         return conn
@@ -1656,6 +1657,8 @@ def handle_settings(user_id):
                     "buyer_include_local": True,
                     "buyer_include_shipping": True,
                     "billing": _billing_config_response(),
+                    "trial_available": trial_guard is not None and trial_guard.account_eligible(None),
+                    "subscription_trial_end": None,
                 })
 
             strict_map = {'lenient': 1, 'balanced': 2, 'strict': 3}
@@ -1702,6 +1705,10 @@ def handle_settings(user_id):
                 "buyer_include_local": _user_settings_buyer_prefs(us)[0],
                 "buyer_include_shipping": _user_settings_buyer_prefs(us)[1],
                 "billing": _billing_config_response(),
+                # Account-level only: the email / IP / device checks run at
+                # checkout, and card / address after it (trial_guard).
+                "trial_available": trial_guard is not None and trial_guard.account_eligible(us),
+                "subscription_trial_end": us.get('subscription_trial_end'),
             })
 
         elif request.method == 'POST':
@@ -2217,15 +2224,18 @@ def unsubscribe():
 # new STARTs wait until a spot frees up.
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_ACTIVE_USERS = 10
-# Arbitrary but fixed: every path that arms a scanner takes this advisory lock.
-_ARM_LOCK_KEY = 0x50464C41
-
-# Who holds a spot, counted the way the scheduler scans: scanner ON and a paid
-# plan, resolved exactly as _effective_plan_tier does. An armed row with no plan
-# is switched off by the scheduler, so it never holds a spot.
-_SQL_COUNT_SCANNING = """
+# Who holds one of the MAX_ACTIVE_USERS spots: every account with a Stripe
+# subscription that is paid up or in its free trial (2026-11-20, Bryan's call).
+# It used to count scanners switched ON, so a subscriber who paused freed a spot
+# a newcomer could buy, and then got "full" when pressing Start again while
+# still paying. Now 10 spots = 10 subscriptions: pausing never costs a spot,
+# and the only gate is checkout, which pauses for newcomers once all are taken.
+# Accounts given a plan by hand (no Stripe subscription: test and comp
+# accounts) neither hold nor need a spot.
+_SQL_COUNT_SUBSCRIBED = """
     SELECT COUNT(*) FROM user_settings
-    WHERE is_active = TRUE AND user_id <> %s
+    WHERE user_id <> %s
+      AND COALESCE(TRIM(stripe_subscription_id), '') <> ''
       AND (LOWER(TRIM(COALESCE(plan_tier, ''))) IN ('basic', 'pro')
            OR COALESCE(is_pro, FALSE))
 """
@@ -2247,10 +2257,11 @@ def _checkout_capacity_block(user_id):
     """
     The at-capacity answer for a checkout, or None to let it proceed.
 
-    The worst outcome of a cap is taking someone's money and then refusing
-    their START, so a NEW subscriber is stopped here, before Stripe. An account
-    already on a plan (an upgrade) is never blocked. Fails OPEN on a database
-    error: losing a sale to a hiccup is worse than one account over the cap.
+    The cap counts subscriptions (_SQL_COUNT_SUBSCRIBED), so this is its only
+    gate: a NEW subscriber is stopped here, before Stripe, and every subscriber
+    can always START. An account already on a plan is never blocked. Fails OPEN
+    on a database error: losing a sale to a hiccup is worse than one account
+    over the cap.
     """
     cap = _max_active_users()
     if not cap:
@@ -2265,12 +2276,12 @@ def _checkout_capacity_block(user_id):
         row = cur.fetchone()
         if row and _effective_plan_tier({'plan_tier': row[0], 'is_pro': row[1]}) != 'inactive':
             return None
-        cur.execute(_SQL_COUNT_SCANNING, (user_id,))
+        cur.execute(_SQL_COUNT_SUBSCRIBED, (user_id,))
         running = cur.fetchone()[0]
         if running < cap:
             return None
         print(f"[capacity] checkout paused for {str(user_id)[:8]}: "
-              f"{running}/{cap} scanners on", flush=True)
+              f"{running}/{cap} spots subscribed", flush=True)
         return {
             "error": (f"PixelFlip is full right now: all {cap} spots are taken, so new "
                       "subscriptions are paused. Join the waitlist at pixelflip.app to "
@@ -2309,24 +2320,8 @@ def start_scraper(user_id):
             conn.rollback()
             return jsonify({"error": "Choose the Basic or Pro plan to start scanning.",
                             "code": "plan_required"}), 402
-        cap = _max_active_users()
-        if cap and not (us_row or {}).get('is_active'):
-            # Serialise arming so two STARTs at the same moment cannot both take
-            # the last spot. Transaction-scoped: the commit or rollback below
-            # releases it.
-            cursor.execute("SELECT pg_advisory_xact_lock(%s);", (_ARM_LOCK_KEY,))
-            cursor.execute(_SQL_COUNT_SCANNING, (user_id,))
-            running = cursor.fetchone()[0]
-            if running >= cap:
-                conn.rollback()
-                print(f"[capacity] START refused for {str(user_id)[:8]}: "
-                      f"{running}/{cap} scanners on", flush=True)
-                return jsonify({
-                    "error": (f"PixelFlip is at capacity: all {cap} scanner spots are in "
-                              "use. Your searches are saved, so press START again later, "
-                              "or email support@pixelflip.app."),
-                    "code": "at_capacity", "active": running, "cap": cap,
-                }), 409
+        # No capacity check here: the cap counts SUBSCRIPTIONS, so anyone who got
+        # past the plan gate above already holds a spot (see _SQL_COUNT_SUBSCRIBED).
         # Conditional, so rowcount tells us whether this was a real OFF->ON
         # arming or a START pressed on a scanner that was already running.
         cursor.execute("UPDATE user_settings SET is_active = TRUE "
@@ -2477,13 +2472,18 @@ def stripe_webhook():
             customer_id = sess.get('customer')
             sub_id = sess.get('subscription')
             if user_id and customer_id and sub_id:
-                sub = stripe.Subscription.retrieve(sub_id, expand=['items.data.price'])
+                sub = stripe.Subscription.retrieve(
+                    sub_id, expand=['items.data.price', 'default_payment_method'])
                 pe = sub.get('current_period_end')
                 ca = bool(sub.get('cancel_at_period_end'))
                 items = sub.get('items', {}).get('data') or []
                 price_id = items[0].get('price', {}).get('id') if items else None
                 tier = _stripe_price_to_tier(price_id)
                 _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca, plan_tier=tier)
+                # Repeat-trial guard: card, prepaid, billing address. Same
+                # transaction, so an unverifiable trial rolls the whole event
+                # back and Stripe redelivers it.
+                _settle_trial(cursor, user_id, sub, sess)
             conn.commit()
 
         elif etype == 'customer.subscription.updated':
@@ -2512,7 +2512,8 @@ def stripe_webhook():
                         ai_enabled = (ai_enabled AND %s),
                         subscription_current_period_end = %s,
                         subscription_cancel_at_period_end = %s,
-                        stripe_subscription_id = COALESCE(%s, stripe_subscription_id)
+                        stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
+                        subscription_trial_end = %s
                     WHERE user_id = %s
                     """,
                     (
@@ -2528,6 +2529,10 @@ def stripe_webhook():
                         pe,
                         ca,
                         sub.get('id'),
+                        # 'trialing' is entitled (subscription_status stays
+                        # 'active' for the dashboard); the end date is what lets
+                        # it say "free trial ends ...". Cleared once billing starts.
+                        sub.get('trial_end') if status == 'trialing' else None,
                         row['user_id'],
                     ),
                 )
@@ -2551,7 +2556,8 @@ def stripe_webhook():
                         ai_enabled = FALSE,
                         stripe_subscription_id = NULL,
                         subscription_current_period_end = NULL,
-                        subscription_cancel_at_period_end = FALSE
+                        subscription_cancel_at_period_end = FALSE,
+                        subscription_trial_end = NULL
                     WHERE user_id = %s
                     """,
                     (row['user_id'],)
@@ -2900,9 +2906,18 @@ def create_checkout(user_id):
         return jsonify({"error": f"Stripe price not configured. Set {env_key}."}), 500
     if not stripe.api_key:
         return jsonify({"error": "STRIPE_SECRET_KEY not configured"}), 500
+    account = _checkout_account(user_id)
+    if account and (account.get('stripe_subscription_id') or '').strip() \
+            and _effective_plan_tier(account) != 'inactive':
+        # Checkout always creates a NEW Stripe subscription, so a second one for
+        # a paying account would bill both. Plan changes go through the billing
+        # portal, which modifies the existing subscription.
+        return jsonify({"error": "You already have a subscription. Use Manage Billing to "
+                                 "change or cancel it.", "code": "already_subscribed"}), 409
     full = _checkout_capacity_block(user_id)
     if full:
         return jsonify(full), 409
+    offer, trial_kwargs, trial_note = _checkout_trial_decision(user_id, account, data)
     print(
         "[Stripe checkout] "
         f"plan={plan!r} resolved_price_id={price_id!r} "
@@ -2929,20 +2944,124 @@ def create_checkout(user_id):
     print(f"[Stripe checkout] discount={'coupon ' + prebeta_coupon if prebeta_coupon else 'promo-code field'}",
           flush=True)
 
+    metadata = {'user_id': user_id, 'plan': plan}
+    metadata.update(trial_kwargs.pop('metadata', {}))
+    email_kwargs = {'customer_email': account['email']} if (account or {}).get('email') else {}
     try:
         checkout_session = stripe.checkout.Session.create(
             mode='subscription',
             line_items=[{'price': price_id, 'quantity': 1}],
             client_reference_id=user_id,
-            metadata={'user_id': user_id, 'plan': plan},
+            metadata=metadata,
             success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{base}/?checkout=canceled",
             **discount_kwargs,
+            **email_kwargs,
+            **trial_kwargs,
         )
-        return jsonify({'url': checkout_session.url})
+        return jsonify({'url': checkout_session.url, 'trial_offered': offer,
+                        'trial_days': trial_guard.TRIAL_DAYS if offer else 0,
+                        'trial_note': trial_note})
     except Exception as e:
         print(f"create_checkout: {e}", flush=True)
         return _server_error('create_checkout', e)
+
+
+def _checkout_account(user_id):
+    """
+    What checkout needs to know about the account: plan, Stripe ids, whether a
+    trial was used, and the sign-in email. {} for an account with no settings
+    row yet; None when the database cannot be read (no trial is offered then).
+    """
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT plan_tier, is_pro, stripe_customer_id, stripe_subscription_id, "
+                    "trial_used_at FROM user_settings WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        keys = ('plan_tier', 'is_pro', 'stripe_customer_id', 'stripe_subscription_id', 'trial_used_at')
+        account = dict(zip(keys, row)) if row else {}
+        try:
+            cur.execute("SELECT email FROM auth.users WHERE id = %s::uuid", (user_id,))
+            er = cur.fetchone()
+            account['email'] = (er[0] or '').strip() if er else None
+        except Exception:
+            conn.rollback()
+            account['email'] = None
+        return account
+    except Exception as e:
+        print(f"[checkout] account read failed ({type(e).__name__}); no trial offered", flush=True)
+        return None
+    finally:
+        if cur is not None:
+            cur.close()
+        conn.close()
+
+
+def _checkout_trial_decision(user_id, account, data):
+    """
+    (offer, extra Session.create kwargs, note) for this checkout.
+
+    The signals known before Stripe (account, email, IP, device) are checked
+    here; card and billing address are checked after (_settle_trial). Any
+    failure means NO trial — never a blocked checkout.
+    """
+    if trial_guard is None or trial_guard.TRIAL_DAYS <= 0:
+        return False, {}, None
+    try:
+        signals = trial_guard.pre_checkout_signals(
+            email=(account or {}).get('email'), ip=_client_ip(),
+            device_id=(data or {}).get('device_id'))
+        eligible = account is not None and trial_guard.account_eligible(account)
+        hit = None
+        if eligible:
+            conn = get_db_connection()
+            if not conn:
+                raise RuntimeError('database unavailable')
+            cur = conn.cursor()
+            try:
+                hit = trial_guard.prior_match(cur, signals)
+                conn.rollback()
+            finally:
+                cur.close()
+                conn.close()
+        offer = eligible and hit is None
+        note = None
+        if account is not None and not offer:
+            note = "A free trial isn't available for this account, so billing starts today."
+            print(f"[trial] {str(user_id)[:8]}: no trial offered "
+                  f"({'matched ' + hit if hit else 'account already used one or was a customer'}; "
+                  f"signals {trial_guard.dumps_for_log(signals)})", flush=True)
+        return offer, trial_guard.checkout_kwargs(offer, signals), note
+    except Exception as e:
+        print(f"[trial] eligibility check failed ({type(e).__name__}); no trial offered", flush=True)
+        return False, {}, None
+
+
+def _settle_trial(cursor, user_id, sub, session):
+    """
+    Run the after-checkout trial checks (card, prepaid, billing address, and a
+    re-check of every earlier signal). A TRIAL that cannot be verified raises,
+    so the caller fails and Stripe retries; recording a paid, no-trial checkout
+    never blocks the customer.
+    """
+    if trial_guard is None:
+        return None
+    if (sub.get('status') or '') == 'trialing':
+        return trial_guard.settle_after_checkout(cursor, user_id, sub, session)
+    try:
+        cursor.execute('SAVEPOINT trial_record')
+        outcome = trial_guard.settle_after_checkout(cursor, user_id, sub, session)
+        cursor.execute('RELEASE SAVEPOINT trial_record')
+        return outcome
+    except Exception as e:
+        cursor.execute('ROLLBACK TO SAVEPOINT trial_record')
+        print(f"[trial] could not record checkout signals for {str(user_id)[:8]} "
+              f"({type(e).__name__}); customer unaffected", flush=True)
+        return None
 
 
 @app.route('/api/complete-checkout', methods=['POST', 'OPTIONS'])
@@ -2990,7 +3109,7 @@ def complete_checkout(user_id):
     if not customer_id or not sub_id:
         return jsonify({"error": "Missing customer or subscription"}), 400
 
-    sub = stripe.Subscription.retrieve(sub_id, expand=['items.data.price'])
+    sub = stripe.Subscription.retrieve(sub_id, expand=['items.data.price', 'default_payment_method'])
     pe = sub.get('current_period_end')
     ca = bool(sub.get('cancel_at_period_end'))
     items = sub.get('items', {}).get('data') or []
@@ -3000,17 +3119,27 @@ def complete_checkout(user_id):
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Database error"}), 500
+    cursor = None
     try:
         cursor = conn.cursor()
         _upsert_pro_subscription(cursor, user_id, customer_id, sub_id, pe, ca, plan_tier=tier)
+        # Same checks as the webhook; whichever arrives second gets the stored
+        # outcome back (settle_after_checkout is idempotent per subscription).
+        outcome = _settle_trial(cursor, user_id, sub, sess)
         conn.commit()
-        return jsonify({"success": True, "subscription_status": "active"})
+        return jsonify({
+            "success": True, "subscription_status": "active",
+            "trial_outcome": outcome,
+            "trial_end": sub.get('trial_end') if outcome == 'granted' else None,
+            "trial_message": trial_guard.describe(outcome) if trial_guard is not None else None,
+        })
     except Exception as e:
         conn.rollback()
         print(f"complete_checkout db: {e}", flush=True)
         return _server_error('complete_checkout', e)
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
         conn.close()
 
 
@@ -3075,11 +3204,15 @@ def cancel_subscription_at_period_end(user_id):
             return jsonify({"error": "No active subscription on file"}), 400
         stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
         sub = stripe.Subscription.retrieve(sub_id)
-        _apply_subscription_row(
-            cursor, user_id, _subscription_is_entitled(sub.get('status', '')),
-            period_end=sub.get('current_period_end'),
-            cancel_at_end=True,
-            sub_id=sub_id
+        # Only the cancel flag and the end date change here. This used to go
+        # through _apply_subscription_row, whose third argument is is_pro — so
+        # cancelling a BASIC plan wrote is_pro = TRUE. plan_tier still ruled,
+        # but the dashboard was told the account was Pro.
+        cursor.execute(
+            "UPDATE user_settings SET subscription_cancel_at_period_end = TRUE, "
+            "subscription_current_period_end = COALESCE(%s, subscription_current_period_end) "
+            "WHERE user_id = %s",
+            (sub.get('current_period_end'), user_id),
         )
         conn.commit()
         return jsonify({"success": True, "cancel_at_period_end": True})

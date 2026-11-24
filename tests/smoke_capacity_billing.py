@@ -6,9 +6,10 @@ Launch gates (2026-11-11), through the REAL Flask endpoints and helpers:
      never charges the legacy (Pro) STRIPE_PRICE_ID.
   2. An account with no paid plan cannot START, and the scheduler switches off
      one that is already armed (a subscription that lapsed while running).
-  3. MAX_ACTIVE_USERS caps how many scanners run at once: START answers 409 past
-     it, a scanner that is already on is never blocked, and checkout pauses for
-     NEW subscribers only, so nobody pays for a spot they cannot use.
+  3. MAX_ACTIVE_USERS caps SUBSCRIPTIONS (2026-11-20; it used to count scanners
+     switched on): checkout pauses for NEW subscribers once every spot is
+     subscribed, a subscriber can always START, and hand-granted accounts with no
+     Stripe subscription neither hold nor need a spot.
 
 In-memory stand-in for user_settings: no database, no Stripe, no email.
 """
@@ -57,8 +58,8 @@ class Cur(object):
             self.res = (row['plan_tier'], row['is_pro']) if row else None
         elif 'pg_advisory_xact_lock' in s:
             STATE['locks'] += 1
-        elif s.startswith('SELECT COUNT(*) FROM user_settings WHERE is_active = TRUE'):
-            self.res = (STATE['running'],)
+        elif s.startswith('SELECT COUNT(*) FROM user_settings'):
+            self.res = (STATE['running'],)          # = subscriptions holding a spot
         elif s.startswith('UPDATE user_settings SET is_active = TRUE'):
             row = ROWS[args[0]]
             if not row['is_active']:
@@ -189,7 +190,7 @@ t.ok("if tier == 'inactive':" in src and '_disarm_unpaid(uid)' in src,
      'main() routes inactive-tier rows to _disarm_unpaid before scheduling them')
 
 # ---------------------------------------------------------------------------
-t.section('3. MAX_ACTIVE_USERS caps running scanners')
+t.section('3. MAX_ACTIVE_USERS caps SUBSCRIPTIONS, not scanners switched on')
 os.environ['MAX_ACTIVE_USERS'] = ''
 t.eq(A._max_active_users(), 10, 'unset -> default 10')
 os.environ['MAX_ACTIVE_USERS'] = 'ten'
@@ -197,51 +198,40 @@ t.eq(A._max_active_users(), 10, 'garbage -> default 10, not a crash or no cap')
 os.environ['MAX_ACTIVE_USERS'] = '0'
 t.eq(A._max_active_users(), 0, '0 -> no cap')
 
+sql = ' '.join(A._SQL_COUNT_SUBSCRIBED.split())
+t.ok('stripe_subscription_id' in sql and 'is_active' not in sql,
+     'the cap counts Stripe subscriptions (trials included), not scanners that are on')
+
 os.environ['MAX_ACTIVE_USERS'] = '3'
+STATE['running'], STATE['locks'] = 3, 0                 # every spot subscribed
 account('p1')
-STATE['running'], STATE['locks'] = 2, 0
 r = start('p1')
-t.ok(r.status_code == 200 and ROWS['p1']['is_active'], '2 of 3 running -> START arms')
-t.eq(STATE['locks'], 1, 'arming took the advisory lock (no two STARTs share the last spot)')
+t.ok(r.status_code == 200 and ROWS['p1']['is_active'],
+     'every spot taken -> a subscriber who paused can still START (the old lock-out)')
+t.ok(not any(x.startswith('SELECT COUNT(*)') for x in STATE['sql']) and STATE['locks'] == 0,
+     '...START counts nothing and takes no lock any more')
+_src = inspect.getsource(A.start_scraper)
+t.ok('execute(_SQL_COUNT' not in _src and '_max_active_users()' not in _src,
+     'no capacity logic left in start_scraper')
 
-account('p2')
-STATE['running'], STATE['rollbacks'] = 3, 0
-r = start('p2')
-body = r.get_json()
-t.ok(r.status_code == 409 and body.get('code') == 'at_capacity' and body.get('cap') == 3,
-     '3 of 3 running -> 409 at_capacity')
-t.ok('START again later' in body.get('error', ''), '...with a message written for the user')
-t.ok(not armed_by_last_call() and not ROWS['p2']['is_active'] and STATE['rollbacks'] == 1,
-     '...arms nothing and releases the lock')
-
-account('on', is_active=True)
-STATE['locks'] = 0
-r = start('on')
-t.ok(r.status_code == 200 and STATE['locks'] == 0,
-     'a scanner that is already ON is never blocked or counted against itself')
-
-os.environ['MAX_ACTIVE_USERS'] = '0'
-account('p3')
-STATE['running'] = 500
-r = start('p3')
-t.ok(r.status_code == 200 and ROWS['p3']['is_active'], 'MAX_ACTIVE_USERS=0 -> no cap')
-
-# Checkout pauses for NEW subscribers only.
-os.environ['MAX_ACTIVE_USERS'] = '3'
 os.environ['STRIPE_PRICE_PRO_ID'] = 'price_pro'
 os.environ['STRIPE_PRICE_BASIC_ID'] = 'price_basic'
-STATE['running'] = 3
 del CREATED[:]
 r = checkout('buyer', 'pro')
 t.ok(r.status_code == 409 and r.get_json().get('code') == 'at_capacity' and not CREATED,
-     'full -> a NEW subscriber is stopped before Stripe (nothing charged)')
+     'every spot subscribed -> a NEW subscriber is stopped before Stripe (nothing charged)')
 account('upgrader', plan_tier='basic', is_pro=False)
 r = checkout('upgrader', 'pro')
-t.ok(r.status_code == 200 and CREATED, 'full -> an existing Basic upgrading to Pro is not blocked')
+t.ok(r.status_code == 200 and CREATED, 'an account already on a plan is never blocked by the cap')
 STATE['running'] = 2
 del CREATED[:]
 r = checkout('buyer', 'basic')
 t.ok(r.status_code == 200 and CREATED and CREATED[-1]['line_items'][0]['price'] == 'price_basic',
      'room left -> checkout proceeds at the Basic price')
+os.environ['MAX_ACTIVE_USERS'] = '0'
+STATE['running'] = 500
+del CREATED[:]
+r = checkout('buyer', 'basic')
+t.ok(r.status_code == 200 and CREATED, 'MAX_ACTIVE_USERS=0 -> no cap')
 
 t.done()

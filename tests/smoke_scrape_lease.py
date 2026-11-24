@@ -65,9 +65,11 @@ def force_set(seconds_from_now):
 
 
 try:
-    t.section('1. The column exists (ensure chain applied migration 016)')
-    # get_db_connection runs the ensure chain, which is how this lands in
-    # production — the .sql file is the readable record, not the mechanism.
+    t.section('1. The column exists (migration 016 is applied)')
+    # The harness sets SCHEMA_ENSURE=0, so this no longer runs the ensure chain
+    # against production (it applied migration 018 there early on 2026-11-20).
+    # The column has been in production since October; just check it is there.
+    t.eq(os.getenv('SCHEMA_ENSURE'), '0', 'test runs never apply migrations to a real database')
     conn = S.get_db_connection()
     conn.close()
     c = cx.cursor()

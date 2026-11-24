@@ -106,10 +106,36 @@ services:
       # measurement window; they replace the 40MB/scrape estimate. Remove after.
       - key: LOG_MEMORY_ALWAYS
         value: "1"
+      # Shared scanning (search_cache.py), on from launch (2026-11-20) rather
+      # than "before ~30 users": users searching the same term in the same area
+      # within 2 minutes share ONE marketplace request. Keys checked against the
+      # real requests: OfferUp = term + coordinates (~11km), Facebook = term +
+      # region slug, Mercari = term; price, radius and keywords are all applied
+      # per user AFTER the fetch, so sharing never changes anyone's results.
+      # Empty results are never cached (empty can mean blocked). Cost: a hit
+      # can be up to 2 minutes old; the next scan picks up anything newer.
+      - key: SEARCH_CACHE_ENABLED
+        value: "1"
+      # Pro description scanning — Bryan switched it on 2026-11-23, once all four
+      # marketplaces could feed it (his all-or-nothing rule): OfferUp through its
+      # listing-details lookup (the request offerup.com itself makes; paced with
+      # the search, cached 6h, max 10 per scan), Facebook/Mercari/Craigslist
+      # through their item pages. It unlocks the dashboard toggle for Pro; each
+      # Pro user still opts in, and only terms with include/exclude words fetch
+      # anything. COST: Facebook bodies come from a ~1.2MB (uncompressed) item
+      # page through the residential proxy, one per NEW matching listing — watch
+      # IPRoyal's dashboard after the first Pro users opt in.
+      # OfferUp's part is UNVERIFIED from Render: a red "OfferUp: descriptions
+      # unavailable" line, or "[offerup] listing-detail lookups refused" in the
+      # logs, means OfferUp refuses this server; then set OFFERUP_LISTING_API=0
+      # (OfferUp falls back to titles, said as plain info; the rest unaffected).
+      - key: DESCRIPTION_SCAN_ENABLED
+        value: "1"
       # --- Post-measurement tuning (hold until you have the Scan timing: lines):
-      #       DESCRIPTION_SCAN_ENABLED=1
       #       SCRAPE_COALESCE_WINDOW_SEC
-      #       SEARCH_CACHE_ENABLED=1   (shared scanning — switch on before ~30 users)
+      #   NOT lowering OfferUp pacing (OFFERUP_TERM_DELAY_SEC 3s): OfferUp throttles
+      #   on request rate and a block hits every user at once; at this size the
+      #   pacing costs nothing. Revisit only if OfferUp is measured as the bottleneck.
       # --- Set from the BUILD LOG (render-build.sh prints which):
       #       MERCARI_CHROME_PATH=<path>   or   MERCARI_BUNDLED_CHROMIUM=1
 

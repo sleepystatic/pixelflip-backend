@@ -14,22 +14,28 @@
 #   * the replay needs no cookies
 #   * it works from an IP other than the one that captured it
 #
-# WHY EVERY 3 DAYS, AND WHY EVERY RUN RENEWS
+# WHY DAILY, AND WHY A 4.5-DAY MARGIN
 # The token lives exactly 7 days. The script only captures when the stored one
 # is unusable, and by default "unusable" means within MERCARI_CTX_RENEW_MARGIN_SEC
-# of expiry: 300s. A run at 07:00 every 3 days almost never lands inside a
-# 5-minute window, so on that default every token would expire BEFORE a run
-# replaced it. A token captured on a cron day expires on a non-cron day, which
-# leaves Mercari dark ~2 days in every 9 even when no run ever fails.
+# of expiry: 300s — a window no schedule reliably hits. So this job treats a
+# token with less than 4.5 days left as due (env below): it renews roughly every
+# 2.5 days and always has days of slack.
 #
-# So this job renews whenever less than 4.5 days remain (env below). Runs are at
-# most 3 days apart, so the next regular run finds ~4 days left and renews.
-# That survives ONE failed run: the run after it still lands with ~1 day to
-# spare. Two failures in a row leave Mercari dark ~2 days, which is why a failed
-# capture fails the job (and emails) instead of passing quietly. Captures are
-# cheap on a runner, so renewing every run costs almost nothing.
+# It CHECKS daily (2026-11-23; it ran every 3 days before). GitHub does not
+# promise scheduled runs: the first one here (2026-11-22) started ~8 hours late,
+# and under load runs can be dropped. Every 3 days survived ONE lost run in the
+# best case and none in the worst (an off-schedule manual capture lands the
+# renewal on a single run). Daily survives several in a row. A day with nothing
+# to renew only installs Python packages and reads one row (~1 minute); Chrome
+# is installed only when a capture is actually needed.
 #
-# Mercari went dark for 14 days in Sept 2026 because nothing automated this.
+# A failed capture fails the job, and GitHub emails whoever last changed this
+# file. Mercari went dark for 14 days in Sept 2026 because nothing automated this.
+#
+# PUBLIC REPOSITORY CAVEAT: GitHub disables scheduled workflows in a public repo
+# after 60 days with no commits (it emails a warning first). Re-enable it from the
+# Actions tab, push any commit, or make the repo private (private repos are exempt
+# and this job fits easily in the free Actions minutes).
 #
 # SETUP (one time)
 #   Settings -> Secrets and variables -> Actions -> New repository secret:
@@ -41,9 +47,9 @@ name: Mercari token
 
 on:
   schedule:
-    # 07:00 UTC on days 1, 4, 7, ... 31. The 31st->1st gap is one day rather
-    # than three; that just means one extra no-op run at a month boundary.
-    - cron: '0 7 */3 * *'
+    # Daily at 06:17 UTC. Off the top of the hour on purpose: GitHub's scheduler
+    # is busiest at :00, which is where most delays and dropped runs happen.
+    - cron: '17 6 * * *'
   workflow_dispatch:        # so it can be run by hand after an outage
 
 # Two overlapping captures would race to write the same scraper_state row.
@@ -87,7 +93,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Is a capture needed?
+        id: state
+        # --check exits 0 = stored token good for >4.5 days, 1 = renew now,
+        # anything else (2 = no DATABASE_URL secret) = misconfigured: fail the job.
+        run: |
+          set +e
+          python capture_mercari_token.py --check
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            exit "$rc"
+          fi
+
       - name: Install Chrome for patchright
+        if: steps.state.outputs.needed == 'true'
         # patchright install chrome shells out to apt, which needs root. That is
         # why it cannot be done on Render's native runtime, but a runner has
         # sudo, so the straightforward path works here.
@@ -97,13 +121,8 @@ jobs:
           # erroring out if the Chrome channel is ever unavailable.
           patchright install chromium || true
 
-      - name: Report current token state
-        # Never fails the job: this is context for the log when the next step
-        # does something. Exit 1 here just means "a capture is needed", which
-        # with the renew margin above includes "expires within 4.5 days".
-        run: python capture_mercari_token.py --check || true
-
       - name: Capture and store the bearer
+        if: steps.state.outputs.needed == 'true'
         # Exits non-zero when a capture was needed and failed, so a broken proxy
         # or a Mercari change surfaces as a failed job and an email rather than
         # as Mercari quietly returning nothing a few days later.

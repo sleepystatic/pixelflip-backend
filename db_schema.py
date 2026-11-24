@@ -1,5 +1,17 @@
 """Lightweight schema helpers (idempotent DDL for local / prod without a migration runner)."""
+import os
 import threading
+
+
+def schema_ensure_enabled():
+    """
+    False when SCHEMA_ENSURE=0. The test harness sets that, because one suite
+    (smoke_scrape_lease) talks to the REAL database through the scraper's own
+    get_db_connection — and on 2026-11-20 that applied a brand-new migration
+    (018) to production before the code using it was deployed. Production and
+    `python app.py` leave it unset, so migrations still apply on first use.
+    """
+    return (os.getenv('SCHEMA_ENSURE') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
 
 _buyer_prefs_lock = threading.Lock()
 _buyer_prefs_applied = False
@@ -499,6 +511,63 @@ def ensure_push_subscription_column(conn):
             cur.execute(PUSH_SUBSCRIPTION_DDL)
             conn.commit()
             _push_applied = True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+
+_trial_lock = threading.Lock()
+_trial_applied = False
+
+# Migration 018 (2026-11-20): free trial + repeat-trial guard (trial_guard.py).
+# trial_claims holds one row per completed checkout with KEYED HASHES of the
+# signals that identify a person (email, IP, device, billing address) plus
+# Stripe's own card fingerprint — never the raw values.
+TRIAL_TRACKING_DDL = """
+ALTER TABLE user_settings
+  ADD COLUMN IF NOT EXISTS trial_used_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS trial_outcome TEXT,
+  ADD COLUMN IF NOT EXISTS subscription_trial_end BIGINT;
+
+CREATE TABLE IF NOT EXISTS trial_claims (
+    id               BIGSERIAL PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    subscription_id  TEXT,
+    checkout_session TEXT,
+    email_hash       TEXT,
+    ip_hash          TEXT,
+    device_hash      TEXT,
+    card_fingerprint TEXT,
+    address_hash     TEXT,
+    outcome          TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trial_claims_subscription ON trial_claims (subscription_id);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_email   ON trial_claims (email_hash);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_ip      ON trial_claims (ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_device  ON trial_claims (device_hash);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_card    ON trial_claims (card_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_trial_claims_address ON trial_claims (address_hash);
+-- Hashes only, but still nobody's business: no access through the public keys.
+ALTER TABLE trial_claims ENABLE ROW LEVEL SECURITY;
+"""
+
+
+def ensure_trial_tracking(conn):
+    """Apply migration 018 if it was not run yet (free trial + repeat-trial guard)."""
+    global _trial_applied
+    if _trial_applied:
+        return
+    with _trial_lock:
+        if _trial_applied:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(TRIAL_TRACKING_DDL)
+            conn.commit()
+            _trial_applied = True
         except Exception:
             conn.rollback()
             raise
